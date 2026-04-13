@@ -11,18 +11,24 @@
  *   5) 일일 통계 리셋 자정 자동 처리
  */
 
-const { MarketDataService } = require("./market-data-service");
-const { CalibrationEngine } = require("./calibration-engine");
-const { UpbitOrderService } = require("./upbit-order-service");
-const { MacroSignalEngine } = require("./macro-signal-engine");
-const { DataAggregationEngine } = require("./data-aggregation-engine");
-const { DashboardServer } = require("./dashboard-server");
+const { MarketDataService }    = require("./market-data-service");
+const { CalibrationEngine }    = require("./calibration-engine");
+const { UpbitOrderService }    = require("./upbit-order-service");
+const { MacroSignalEngine }    = require("./macro-signal-engine");
+const { DataAggregationEngine }= require("./data-aggregation-engine");
+const { DashboardServer }      = require("./dashboard-server");
+const { StrategyA }            = require("./strategy-a");
+const { StrategyB }            = require("./strategy-b");
 
 try { require("dotenv").config(); } catch {}
 
 const INITIAL_KRW = Number(process.env.INITIAL_CAPITAL || 100_000);
 const BOT_MODE    = process.env.BOT_MODE || "CALIBRATION";
-const DRY_RUN     = process.env.DRY_RUN  !== "false"; // 기본값: 실거래 안 함
+const DRY_RUN     = process.env.DRY_RUN  !== "false";
+
+// 자본 배분: A 60% / B 40%
+const CAPITAL_A = Math.floor(INITIAL_KRW * 0.60);
+const CAPITAL_B = Math.floor(INITIAL_KRW * 0.40);
 
 class TradingBot {
   constructor() {
@@ -41,9 +47,14 @@ class TradingBot {
       secretKey: process.env.UPBIT_SECRET_KEY,
     });
     this.macroEngine = new MacroSignalEngine(this.mds);
-    this.dataEngine = new DataAggregationEngine(this.mds);
+    this.dataEngine  = new DataAggregationEngine(this.mds);
 
-    // 실거래 포지션
+    // ── Strategy A/B ─────────────────────────────────
+    const opts = { orderService: this.orderService, dryRun: DRY_RUN };
+    this.strategyA = new StrategyA({ ...opts, macroEngine: this.macroEngine, initialCapital: CAPITAL_A });
+    this.strategyB = new StrategyB({ ...opts, initialCapital: CAPITAL_B });
+
+    // 실거래 포지션 (구 MDS 기반, 참조용 유지)
     this.livePosition = null;
 
     // 진입 중 잠금 (race condition 방지)
@@ -89,6 +100,12 @@ class TradingBot {
     this.dataEngine.start();
     this.mds.setDataEngine(this.dataEngine);
     console.log("[Bot] 데이터 집합 엔진 시작 (OI / L/S비율 / 테이커 / 신규상장 / 뉴스)");
+
+    // ── Strategy A/B 시작 ─────────────────────────────
+    this.strategyA.start();
+    console.log(`[Bot] Strategy A 시작 (1h 스윙) — 자본 ${CAPITAL_A.toLocaleString()}원`);
+    await this.strategyB.start();
+    console.log(`[Bot] Strategy B 시작 (신규상장) — 자본 ${CAPITAL_B.toLocaleString()}원`);
 
     // ── 시작 시 포지션 복구 ──────────────────────────
     if (!DRY_RUN && this.orderService.getSummary().hasApiKeys) {
@@ -351,6 +368,8 @@ class TradingBot {
     this.dashboard.stop();
     this.macroEngine.stop();
     this.dataEngine.stop();
+    this.strategyA.stop();
+    this.strategyB.stop();
 
     if (this.livePosition && !DRY_RUN && this.orderService.getSummary().hasApiKeys) {
       console.log("[Bot] 포지션 청산 중...");

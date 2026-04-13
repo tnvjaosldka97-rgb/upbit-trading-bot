@@ -83,6 +83,10 @@ class DashboardServer {
     const sim   = bot.mds?.state?.simulation;
     const cal   = bot.calibration?.getSummary();
     const snaps = (bot.mds?.state?.lastAnalysisSnapshots || []).slice(0, 6);
+
+    // Strategy A/B 요약
+    const sA = bot.strategyA?.getSummary() || null;
+    const sB = bot.strategyB?.getSummary() || null;
     const hist  = bot.mds?.state?.simulation?.history?.slice(0, 20) || [];
 
     const totalAsset = bot.mds?.getSimulationTotalAsset?.() || 0;
@@ -195,6 +199,14 @@ class DashboardServer {
       filterChecks,
       signalFactors,
       equityCurve,
+      strategyA: sA,
+      strategyB: sB,
+      // 합산 포트폴리오
+      portfolio: {
+        totalAsset: Math.round(totalAsset) + (sA?.totalAsset || 0) + (sB?.totalAsset || 0),
+        pnlA: sA?.pnlRate ?? 0,
+        pnlB: sB?.pnlRate ?? 0,
+      },
       history: hist.slice(0, 10).map(h => ({
         market: h.marketCode || h.market || "?",
         outcome: h.outcome,
@@ -422,6 +434,46 @@ body{font-family:-apple-system,'SF Pro Display',sans-serif;background:var(--bg);
   </div>
 </div>
 
+<!-- ─── 전략 패널 ─── -->
+<div id="strategy-bar" style="display:grid;grid-template-columns:1fr 1fr;gap:0;border-bottom:1px solid var(--border);flex-shrink:0">
+
+  <!-- Strategy A -->
+  <div style="padding:10px 16px;border-right:1px solid var(--border);background:var(--s1)">
+    <div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:6px">
+      <span style="font-size:.68rem;font-weight:700;color:var(--cyan);text-transform:uppercase;letter-spacing:.8px">Strategy A — 1h 스윙</span>
+      <span id="sa-wr" style="font-size:.68rem;color:var(--muted)">승률 —</span>
+    </div>
+    <div style="display:flex;gap:16px;align-items:center">
+      <div>
+        <div id="sa-pnl" style="font-size:1.3rem;font-weight:800;color:var(--green)">—</div>
+        <div id="sa-asset" style="font-size:.68rem;color:var(--muted)">—</div>
+      </div>
+      <div id="sa-pos" style="flex:1;font-size:.72rem;color:var(--muted);padding:6px 10px;background:var(--bg);border-radius:6px;border:1px solid var(--border)">
+        포지션 없음 — 신호 대기
+      </div>
+    </div>
+    <div id="sa-hist" style="display:flex;gap:4px;margin-top:6px;flex-wrap:wrap"></div>
+  </div>
+
+  <!-- Strategy B -->
+  <div style="padding:10px 16px;background:var(--s1)">
+    <div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:6px">
+      <span style="font-size:.68rem;font-weight:700;color:var(--purple);text-transform:uppercase;letter-spacing:.8px">Strategy B — 신규상장</span>
+      <span id="sb-monitor" style="font-size:.68rem;color:var(--muted)">—개 감시</span>
+    </div>
+    <div style="display:flex;gap:16px;align-items:center">
+      <div>
+        <div id="sb-pnl" style="font-size:1.3rem;font-weight:800;color:var(--green)">—</div>
+        <div id="sb-asset" style="font-size:.68rem;color:var(--muted)">—</div>
+      </div>
+      <div id="sb-detect" style="flex:1;font-size:.72rem;color:var(--muted);padding:6px 10px;background:var(--bg);border-radius:6px;border:1px solid var(--border)">
+        🔍 신규상장 감시 중...
+      </div>
+    </div>
+    <div id="sb-hist" style="display:flex;gap:4px;margin-top:6px;flex-wrap:wrap"></div>
+  </div>
+</div>
+
 <!-- ─── 메인 ─── -->
 <div class="main">
 
@@ -579,7 +631,9 @@ const {createChart, CandlestickSeries, LineSeries, ColorType, LineStyle, PriceLi
 const chartEl = document.getElementById("tv-chart");
 
 function resizeChart(){
-  chartEl.style.height = (window.innerHeight - 50 - 90 - 40) + "px";
+  const sb = document.getElementById("strategy-bar");
+  const sbH = sb ? sb.offsetHeight : 80;
+  chartEl.style.height = (window.innerHeight - 50 - sbH - 90 - 40) + "px";
 }
 resizeChart();
 window.addEventListener("resize", resizeChart);
@@ -819,6 +873,51 @@ function update(d){
   c("c-ev").style.color   = d.cal.ev!=null && d.cal.ev>0 ? "var(--green)" : "var(--red)";
   c("c-kelly").textContent = d.cal.kelly!=null ? d.cal.kelly+"%" : "—";
   c("c-pend").textContent  = d.cal.pending+"건";
+
+  // ─ Strategy A
+  if(d.strategyA){
+    const sA = d.strategyA;
+    const aColor = sA.pnlRate>=0?"var(--green)":"var(--red)";
+    c("sa-pnl").textContent = (sA.pnlRate>=0?"+":"")+sA.pnlRate+"%";
+    c("sa-pnl").style.color = aColor;
+    c("sa-asset").textContent = fmt(sA.totalAsset)+"원 | "+sA.totalTrades+"회";
+    c("sa-wr").textContent = sA.winRate!=null ? "승률 "+sA.winRate+"%" : "승률 —";
+    if(sA.position){
+      const p=sA.position;
+      c("sa-pos").innerHTML = \`<span style="color:var(--cyan);font-weight:700">\${p.market}</span>
+        &nbsp;진입 \${fmt(p.entryPrice)}→목표 \${fmt(p.targetPrice)}
+        \${p.trailStop?'<span style="color:var(--yellow)"> 🔒트레일</span>':""}\`;
+    } else {
+      c("sa-pos").textContent = "포지션 없음 — 신호 대기";
+    }
+    c("sa-hist").innerHTML = (sA.history||[]).slice(0,6).map(h=>{
+      const col=h.pnlRate>=0?"var(--green)":"var(--red)";
+      return \`<span style="font-size:.62rem;padding:1px 5px;border-radius:4px;background:rgba(0,0,0,.3);border:1px solid \${col};color:\${col}">\${h.market.replace("KRW-","")}&nbsp;\${h.pnlRate>=0?"+":""}\${(h.pnlRate*100).toFixed(1)}%</span>\`;
+    }).join("");
+  }
+
+  // ─ Strategy B
+  if(d.strategyB){
+    const sB = d.strategyB;
+    const bColor = sB.pnlRate>=0?"var(--green)":"var(--red)";
+    c("sb-pnl").textContent = (sB.pnlRate>=0?"+":"")+sB.pnlRate+"%";
+    c("sb-pnl").style.color = bColor;
+    c("sb-asset").textContent = fmt(sB.totalAsset)+"원 | "+sB.totalTrades+"회";
+    c("sb-monitor").textContent = (sB.monitoringCount||0)+"개 감시";
+    const det = (sB.detections||[])[0];
+    if(det){
+      const stCol = det.status.includes("청산")?"var(--muted)":det.status==="진입완료"?"var(--cyan)":"var(--purple)";
+      c("sb-detect").innerHTML = \`<span style="color:var(--purple);font-weight:700">\${det.market}</span>
+        &nbsp;<span style="color:\${stCol}">\${det.status}</span>
+        \${det.finalPnl!=null?'&nbsp;<span style="color:'+(det.finalPnl>=0?"var(--green)":"var(--red)")+'">'+det.finalPnl+'%</span>':""}\`;
+    } else {
+      c("sb-detect").textContent = "🔍 신규상장 감시 중...";
+    }
+    c("sb-hist").innerHTML = (sB.history||[]).slice(0,6).map(h=>{
+      const col=h.pnlRate>=0?"var(--green)":"var(--red)";
+      return \`<span style="font-size:.62rem;padding:1px 5px;border-radius:4px;background:rgba(0,0,0,.3);border:1px solid \${col};color:\${col}">\${h.market.replace("KRW-","")}&nbsp;\${h.pnlRate>=0?"+":""}\${(h.pnlRate*100).toFixed(1)}%</span>\`;
+    }).join("");
+  }
 
   // ─ 자본곡선
   drawEquity(d.equityCurve);
