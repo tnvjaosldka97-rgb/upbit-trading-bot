@@ -62,8 +62,6 @@ class StrategyB {
     this._ws       = null;
     this._wsActive = false;
 
-    // 텔레그램 알림
-    this._notifier = null;
   }
 
   // ── 시작/종료 ────────────────────────────────────────
@@ -83,7 +81,6 @@ class StrategyB {
           this.actedListings.add(market);
           this.detections.unshift({ market, detectedAt: listedAt, status: "이벤트감지" });
           this.detections = this.detections.slice(0, 20);
-          this._notifier?.notifyNewListing(market);
           this._enter(market).catch(e => console.error("[B] 즉시진입 오류:", e.message));
         });
         console.log("[StrategyB] DataEngine 이벤트 직결 — 신규상장 즉시 반응 활성화");
@@ -123,10 +120,6 @@ class StrategyB {
     this._wsActive = true;
     ws.onPrice((market, price) => this._onWsPrice(market, price));
     console.log("[StrategyB] WebSocket 활성화 — 신규상장 포지션 실시간(~100ms) 감시");
-  }
-
-  setNotifier(notifier) {
-    this._notifier = notifier;
   }
 
   /**
@@ -209,7 +202,6 @@ class StrategyB {
         `50% 매도, 스탑→브레이크이븐, 트레일링 ${TRAIL_PCT * 100}% 시작`
       );
       this._updateDetection(market, `+${(move * 100).toFixed(1)}% 부분청산`);
-      this._notifier?.notifyPartial("B", market, move * 100);
     }
 
     // ── 트레일링 스탑 갱신 ────────────────────────────
@@ -244,7 +236,6 @@ class StrategyB {
       const det = this.detections.find(d => d.market === market);
       if (det) { det.status = `청산(${reason})`; det.finalPnl = +(pnlRate * 100).toFixed(1); }
 
-      this._notifier?.notifyExit("B", market, pnlRate, reason, pos.partialDone);
       console.log(
         `[B] 청산(${reason})(WS) — ${market} ` +
         `${pnlRate >= 0 ? "+" : ""}${(pnlRate * 100).toFixed(1)}%`
@@ -318,9 +309,6 @@ class StrategyB {
 
     // WebSocket 구독 → 실시간 가격 수신 시작
     if (this._ws) this._ws.subscribe(market);
-
-    // 텔레그램 알림
-    this._notifier?.notifyEntry("B", market, price, budget, TARGET_RATE, STOP_RATE);
 
     console.log(`[B] 진입 — ${market} @${price.toLocaleString()} 목표:+30% 손절:-8% 트레일:${TRAIL_PCT * 100}%`);
 
@@ -431,7 +419,6 @@ class StrategyB {
       const det = this.detections.find(d => d.market === market);
       if (det) { det.status = `청산(${reason})`; det.finalPnl = +(pnlRate * 100).toFixed(1); }
 
-      this._notifier?.notifyExit("B", market, pnlRate, reason, pos.partialDone);
       console.log(`[B] 청산(${reason}) — ${market} ${pnlRate >= 0 ? "+" : ""}${(pnlRate * 100).toFixed(1)}%`);
     }
   }
