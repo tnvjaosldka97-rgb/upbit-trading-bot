@@ -4,7 +4,7 @@
   "description": "ATS v7 — 멀티팩터 퀀트 트레이딩 봇",
   "main": "trading-bot.js",
   "scripts": {
-    "start": "node trading-bot.js",
+    "start": "npm install --production && node trading-bot.js",
     "calibration": "BOT_MODE=CALIBRATION DRY_RUN=true node trading-bot.js",
     "live": "BOT_MODE=LIVE DRY_RUN=false node trading-bot.js",
     "dry": "BOT_MODE=LIVE DRY_RUN=true node trading-bot.js"

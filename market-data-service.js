@@ -488,7 +488,13 @@ class MarketDataService {
 
     for (const chunk of chunks) {
       const url = `https://api.coingecko.com/api/v3/coins/markets?vs_currency=usd&symbols=${encodeURIComponent(chunk.join(","))}&include_tokens=all&order=market_cap_desc&per_page=250&page=1&sparkline=false&price_change_percentage=24h`;
-      const rows = await this.fetchJson(url);
+      let rows;
+      try {
+        rows = await this.fetchJson(url);
+      } catch (e) {
+        console.warn("[MDS] CoinGecko 요청 실패 (무시):", e.message);
+        continue;
+      }
 
       if (!Array.isArray(rows)) continue;
 
