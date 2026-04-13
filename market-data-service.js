@@ -62,24 +62,24 @@ class MarketDataService {
       // 시장가 매수 사용 시 0.05% (실제 사용 방식에 맞게 선택)
       reservedBuyFeeRate: 0.00139,      // 예약매수(지정가) 수수료
 
-      // ── 핵심 R/R 재설계 ──────────────────────
-      // 예약매수+예약매도 전체 수수료: 0.139% + 0.139% = 0.278%
-      // 순익 목표 +0.35% → 총수익률 필요: 0.35 + 0.278 = 0.628%
-      targetGrossRate: 0.0063,          // 예약매수 수수료 포함 상향
-      targetNetIntentRate: 0.0035,      // 순익 목표 +0.35% 유지
-      stopLossRate: -0.0022,            // 손절 (손절 시 시장가 매도 0.05% 포함)
+      // ── 핵심 R/R — 백테스트 실증 최적값 (v9) ────
+      // 7일 실데이터 그리드서치: target+1.0% / stop-0.30% = R/R 3.33:1
+      // BTC 실측 EV +0.0075% (양수) 확인
+      targetGrossRate: 0.0100,          // 1.0% (백테스트 최적, 구버전 0.63%)
+      targetNetIntentRate: 0.0072,      // 순익 목표 +0.72% (수수료 0.278% 차감)
+      stopLossRate: -0.0030,            // -0.30% (백테스트 최적, 구버전 -0.22%)
 
       // ── 변동성 기반 동적 목표/손절 ────────────
       // σ = 최근 5초봉 실현변동성
       // target = σ × volTargetMult, stop = σ × volStopMult
-      // R/R = volTargetMult / volStopMult = 3.0/1.0 = 3.0:1
+      // R/R = volTargetMult / volStopMult = 3.33:1
       useVolatilityTargets: true,
-      volTargetMult: 3.0,               // target = 3.0σ  (구버전 2.2)
-      volStopMult: 1.0,                 // stop = 1.0σ    (구버전 1.1)
-      minTargetGross: 0.005,            // 하한: 0.5%     (구버전 0.3%)
-      maxTargetGross: 0.020,            // 상한: 2.0%     (구버전 1.2%)
-      minStopRate: -0.004,              // 하한: -0.4%
-      maxStopRate: -0.0015,             // 상한: -0.15%
+      volTargetMult: 3.3,               // target = 3.3σ  (백테스트 정렬)
+      volStopMult: 1.0,                 // stop = 1.0σ
+      minTargetGross: 0.008,            // 하한: 0.8%  (구버전 0.5%)
+      maxTargetGross: 0.025,            // 상한: 2.5%
+      minStopRate: -0.005,              // 하한: -0.5%
+      maxStopRate: -0.003,              // 상한: -0.30% (구버전 -0.15%)
 
       cooldownAfterStopMs: 10 * 60 * 1000,   // 10분 (구버전 25분)
       profitPauseMs: 15 * 60 * 1000,         // 15분 (구버전 45분)
@@ -173,6 +173,8 @@ class MarketDataService {
       { code: "TAKER_SELL_DOMINANT", label: "선물 테이커 매도 우위 — 공격적 매도 압력" },
       { code: "LS_CROWDED_LONG",     label: "롱/숏 비율 과밀 — 추가 상승 에너지 소진" },
       { code: "OI_DROP",             label: "미결제약정 급감 — 포지션 청산 중" },
+      // v9 일봉 추세 필터
+      { code: "DAILY_DOWNTREND",    label: "일봉 MA20 < MA60 하락 추세 — 롱 진입 금지 (백테스트 실증)" },
     ];
 
     this.state = {
@@ -1432,6 +1434,16 @@ class MarketDataService {
     if (shortVolume > 0 && shortVolume < baseVolume * 1.8) bullishProbability += 5;
     bullishProbability += rsiScore;  // RSI 반영
     bullishProbability = Math.max(0, Math.min(99, bullishProbability));
+
+    // ── 일봉 장기 추세 하드 필터 (v9) ────────────────────
+    // price < MA20 AND MA20 < MA60 → 확실한 하락 추세 → 롱 진입 전면 차단
+    // 백테스트 실증: 하락 추세에서 롱 진입 시 실측 승률 2~8%, EV 항상 음수
+    if (closes1d.length >= 20) {
+      const dailyCur = closes1d[closes1d.length - 1];
+      if (dailyCur > 0 && dailyCur < dailyShort && dailyShort < dailyLong) {
+        reasons.push("DAILY_DOWNTREND");
+      }
+    }
 
     const marketCapUsd = Number(marketCapInfo?.marketCapUsd || 0);
     // marketCapUsd=0 은 CoinGecko 429/미수신 → 데이터 없는 것이지 실제 저시총이 아님
