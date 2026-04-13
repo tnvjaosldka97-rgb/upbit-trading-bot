@@ -145,6 +145,7 @@ class TradingBot {
     this.strategyA.setWebSocket(this.upbitWs);   // 실시간 손절 활성화
     console.log(`[Bot] Strategy A 시작 (1h 스윙) — 자본 ${CAPITAL_A.toLocaleString()}원`);
     await this.strategyB.start();
+    this.strategyB.setWebSocket(this.upbitWs);   // 신규상장 포지션 실시간 감시
     console.log(`[Bot] Strategy B 시작 (신규상장) — 자본 ${CAPITAL_B.toLocaleString()}원`);
 
     // ── 시작 시 포지션 복구 ──────────────────────────
@@ -458,6 +459,7 @@ class TradingBot {
     this.dashboard.stop();
     this.macroEngine.stop();
     this.regimeEngine.stop();
+    this.fundingEngine.stop();
     this.upbitWs.stop();
     this.dataEngine.stop();
     this.strategyA.stop();

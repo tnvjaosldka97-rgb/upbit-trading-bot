@@ -21,9 +21,10 @@
 
 const MANAGE_INTERVAL_MS  = 20_000;       // 포지션 관리 주기 (20초)
 const SYNC_INTERVAL_MS    = 30_000;       // DataEngine 신규 상장 동기화 주기 (30초)
-const TARGET_RATE         = 0.30;         // +30% 최종 목표
+const TARGET_RATE         = 0.30;         // +30% 초기 목표 (부분청산 전까지)
 const PARTIAL_AT          = 0.15;         // +15%에서 50% 청산
 const STOP_RATE           = -0.08;        // -8% 손절
+const TRAIL_PCT           = 0.15;         // 부분청산 후 트레일링 폭 (최고가 -15%)
 const MAX_HOLD_MS         = 4 * 60 * 60_000;  // 4시간 타임스탑
 const BUDGET_PCT          = 0.40;         // 보유 현금의 40%
 const MAX_LISTING_AGE_MS  = 2 * 60 * 60_000; // 상장 후 2시간 이내만 진입
@@ -56,6 +57,10 @@ class StrategyB {
 
     this._syncId   = null;
     this._manageId = null;
+
+    // WebSocket 실시간 감시
+    this._ws       = null;
+    this._wsActive = false;
   }
 
   // ── 시작/종료 ────────────────────────────────────────
@@ -100,6 +105,88 @@ class StrategyB {
   stop() {
     if (this._syncId)   clearInterval(this._syncId);
     if (this._manageId) clearInterval(this._manageId);
+  }
+
+  /**
+   * WebSocket 주입 (trading-bot.js에서 호출)
+   * 신규상장 포지션 손절/목표/트레일링을 20초 폴링 → ~100ms 실시간으로 전환
+   */
+  setWebSocket(ws) {
+    this._ws       = ws;
+    this._wsActive = true;
+    ws.onPrice((market, price) => this._onWsPrice(market, price));
+    console.log("[StrategyB] WebSocket 활성화 — 신규상장 포지션 실시간(~100ms) 감시");
+  }
+
+  /**
+   * WebSocket 가격 수신 시 실시간 호출 (~100ms)
+   * 손절/부분청산/트레일링/타임스탑 즉시 처리
+   */
+  _onWsPrice(market, price) {
+    const pos = this.sim.positions.get(market);
+    if (!pos) return;
+
+    // 최고가 갱신
+    if (price > pos.peakPrice) pos.peakPrice = price;
+    const move = (price - pos.entryPrice) / pos.entryPrice;
+
+    // ── 부분청산: +15% 달성 시 50% 매도, 트레일링 시작 ──
+    if (!pos.partialDone && move >= PARTIAL_AT) {
+      const half    = pos.budget * 0.5;
+      const halfPnl = half * move;
+      this.sim.cash        += half + halfPnl;
+      this.sim.realizedPnl += halfPnl;
+      pos.budget      *= 0.5;
+      pos.quantity    *= 0.5;
+      pos.stopPrice    = pos.entryPrice * 1.001;   // 브레이크이븐
+      pos.partialDone  = true;
+      pos.trailActive  = true;
+      pos.peakPrice    = price;
+      pos.targetPrice  = Infinity;   // 하드 목표 제거 → 트레일링으로만 청산
+      console.log(
+        `[B] 부분청산(WS) +${(move * 100).toFixed(1)}% — ${market} ` +
+        `50% 매도, 스탑→브레이크이븐, 트레일링 ${TRAIL_PCT * 100}% 시작`
+      );
+      this._updateDetection(market, `+${(move * 100).toFixed(1)}% 부분청산`);
+    }
+
+    // ── 트레일링 스탑 갱신 ────────────────────────────
+    if (pos.trailActive) {
+      const newStop = pos.peakPrice * (1 - TRAIL_PCT);
+      if (newStop > pos.stopPrice) pos.stopPrice = newStop;
+    }
+
+    const hitStop   = price <= pos.stopPrice;
+    const hitTarget = !pos.partialDone && price >= pos.targetPrice;
+    const timeout   = Date.now() - pos.openedAt > MAX_HOLD_MS;
+
+    if (hitStop || hitTarget || timeout) {
+      const pnlRate = (price - pos.entryPrice) / pos.entryPrice;
+      const pnlKrw  = pnlRate * pos.budget;
+      this.sim.cash        += pos.budget * (1 + pnlRate);
+      this.sim.realizedPnl += pnlKrw;
+      this.sim.totalTrades++;
+      if (pnlKrw >= 0) this.sim.wins++; else this.sim.losses++;
+      this.sim.tradeReturns.push(pnlRate);
+      if (this.sim.tradeReturns.length > 100) this.sim.tradeReturns.shift();
+
+      const reason = hitTarget ? "목표" : hitStop ? "손절" : "타임";
+      this.sim.history.unshift({
+        market, entryPrice: pos.entryPrice, exitPrice: price,
+        pnlRate: +pnlRate.toFixed(4), reason, closedAt: Date.now(),
+        partialDone: pos.partialDone,
+      });
+      this.sim.history = this.sim.history.slice(0, 30);
+      this.sim.positions.delete(market);
+
+      const det = this.detections.find(d => d.market === market);
+      if (det) { det.status = `청산(${reason})`; det.finalPnl = +(pnlRate * 100).toFixed(1); }
+
+      console.log(
+        `[B] 청산(${reason})(WS) — ${market} ` +
+        `${pnlRate >= 0 ? "+" : ""}${(pnlRate * 100).toFixed(1)}%`
+      );
+    }
   }
 
   // ── 신규 상장 동기화 ─────────────────────────────────
@@ -156,14 +243,20 @@ class StrategyB {
       budget,
       targetPrice: price * (1 + TARGET_RATE),
       stopPrice:   price * (1 + STOP_RATE),
+      peakPrice:   price,
       partialDone: false,
+      trailActive: false,
       openedAt:    Date.now(),
     };
 
     this.sim.cash -= budget;
     this.sim.positions.set(market, pos);
     this._updateDetection(market, "진입완료");
-    console.log(`[B] 진입 — ${market} @${price.toLocaleString()} 목표:+30% 손절:-8%`);
+
+    // WebSocket 구독 → 실시간 가격 수신 시작
+    if (this._ws) this._ws.subscribe(market);
+
+    console.log(`[B] 진입 — ${market} @${price.toLocaleString()} 목표:+30% 손절:-8% 트레일:${TRAIL_PCT * 100}%`);
 
     // 실거래
     if (!this.dryRun && this.orderService?.getSummary().hasApiKeys) {
@@ -210,27 +303,44 @@ class StrategyB {
     const pos = this.sim.positions.get(market);
     if (!pos) return;
 
-    const cur     = await this._ticker(market);
+    // WS 활성 시 실시간으로 처리됨 — 폴링은 보험용
+    const cur = this._wsActive
+      ? (this._ws?.getPrice(market) ?? await this._ticker(market))
+      : await this._ticker(market);
     if (!cur) return;
 
+    // 최고가 갱신
+    if (cur > pos.peakPrice) pos.peakPrice = cur;
     const move    = (cur - pos.entryPrice) / pos.entryPrice;
     const timeout = Date.now() - pos.openedAt > MAX_HOLD_MS;
 
-    // 부분청산: +15% → 50% 매도 + 스탑 브레이크이븐
+    // 부분청산: +15% → 50% 매도, 트레일링 시작
     if (!pos.partialDone && move >= PARTIAL_AT) {
       const half    = pos.budget * 0.5;
       const halfPnl = half * move;
       this.sim.cash        += half + halfPnl;
       this.sim.realizedPnl += halfPnl;
-      pos.budget   *= 0.5;
-      pos.quantity *= 0.5;
-      pos.stopPrice  = pos.entryPrice * 1.001;
-      pos.partialDone = true;
-      console.log(`[B] 부분청산(+${(move * 100).toFixed(0)}%) — ${market} 50% 매도, 스탑→브레이크이븐`);
+      pos.budget      *= 0.5;
+      pos.quantity    *= 0.5;
+      pos.stopPrice    = pos.entryPrice * 1.001;
+      pos.partialDone  = true;
+      pos.trailActive  = true;
+      pos.peakPrice    = cur;
+      pos.targetPrice  = Infinity;   // 하드 목표 제거 → 트레일링으로만 청산
+      console.log(
+        `[B] 부분청산(+${(move * 100).toFixed(0)}%) — ${market} ` +
+        `50% 매도, 스탑→브레이크이븐, 트레일링 ${TRAIL_PCT * 100}% 시작`
+      );
       this._updateDetection(market, `+${(move * 100).toFixed(0)}% 부분청산`);
     }
 
-    const hitTarget = cur >= pos.targetPrice;
+    // 트레일링 스탑 갱신
+    if (pos.trailActive) {
+      const newStop = pos.peakPrice * (1 - TRAIL_PCT);
+      if (newStop > pos.stopPrice) pos.stopPrice = newStop;
+    }
+
+    const hitTarget = !pos.partialDone && cur >= pos.targetPrice;
     const hitStop   = cur <= pos.stopPrice;
 
     if (hitTarget || hitStop || timeout) {
@@ -263,18 +373,29 @@ class StrategyB {
     const pos = this.livePositions.get(market);
     if (!pos) return;
 
-    const cur = await this._ticker(market);
+    const cur = this._wsActive
+      ? (this._ws?.getPrice(market) ?? await this._ticker(market))
+      : await this._ticker(market);
     if (!cur) return;
 
+    if (!pos.peakPrice || cur > pos.peakPrice) pos.peakPrice = cur;
     const move = (cur - pos.entryPrice) / pos.entryPrice;
 
     if (!pos.partialDone && move >= PARTIAL_AT && !this.dryRun && this.orderService?.getSummary().hasApiKeys) {
       const halfQty = pos.quantity * 0.5;
       await this.orderService.marketSell(market, halfQty).catch(e => console.error("[B]", e.message));
-      pos.quantity   *= 0.5;
-      pos.stopPrice   = pos.entryPrice * 1.001;
-      pos.partialDone = true;
-      console.log(`[B] 실거래 부분청산 — ${market} 50%`);
+      pos.quantity    *= 0.5;
+      pos.stopPrice    = pos.entryPrice * 1.001;
+      pos.partialDone  = true;
+      pos.trailActive  = true;
+      pos.peakPrice    = cur;
+      console.log(`[B] 실거래 부분청산 — ${market} 50%, 트레일링 시작`);
+    }
+
+    // 트레일링 스탑 갱신
+    if (pos.trailActive) {
+      const newStop = pos.peakPrice * (1 - TRAIL_PCT);
+      if (newStop > pos.stopPrice) pos.stopPrice = newStop;
     }
 
     if (cur <= pos.stopPrice) {
@@ -317,6 +438,27 @@ class StrategyB {
     const init   = this.initialCapital;
     const inPos  = Array.from(this.sim.positions.values()).reduce((s, p) => s + p.budget, 0);
     const total  = this.sim.cash + inPos;
+
+    const positions = Array.from(this.sim.positions.values()).map(p => {
+      // WS 실시간 가격으로 미실현 손익 계산
+      const curPrice = this._ws?.getPrice(p.market) ?? null;
+      const unrealizedPct = curPrice
+        ? +((curPrice - p.entryPrice) / p.entryPrice * 100).toFixed(2)
+        : null;
+      return {
+        market:         p.market,
+        entryPrice:     Math.round(p.entryPrice),
+        targetPrice:    p.targetPrice === Infinity ? null : Math.round(p.targetPrice),
+        stopPrice:      Math.round(p.stopPrice),
+        peakPrice:      Math.round(p.peakPrice),
+        openedAt:       p.openedAt,
+        partialDone:    p.partialDone,
+        trailActive:    p.trailActive,
+        unrealizedPct,
+        currentPrice:   curPrice ? Math.round(curPrice) : null,
+      };
+    });
+
     return {
       name: "B — 신규상장 v2",
       pnlRate:     +((total - init) / init * 100).toFixed(3),
@@ -326,17 +468,14 @@ class StrategyB {
       wins: this.sim.wins, losses: this.sim.losses,
       winRate: this.sim.totalTrades > 0
         ? +(this.sim.wins / this.sim.totalTrades * 100).toFixed(1) : null,
-      positions:       Array.from(this.sim.positions.values()).map(p => ({
-        market: p.market, entryPrice: Math.round(p.entryPrice),
-        targetPrice: Math.round(p.targetPrice), stopPrice: Math.round(p.stopPrice),
-        openedAt: p.openedAt, partialDone: p.partialDone,
-      })),
+      positions,
       livePositions:   Array.from(this.livePositions.values()),
       monitoringCount: this.knownMarkets.size || this.actedListings.size,
       detections:      this.detections.slice(0, 8),
       history:         this.sim.history.slice(0, 8),
       tradeReturns:    this.sim.tradeReturns,
       dataEngineMode:  !!this.dataEngine,
+      wsActive:        this._wsActive,
     };
   }
 }

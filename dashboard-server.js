@@ -561,7 +561,9 @@ body{font-family:-apple-system,'SF Pro Display',sans-serif;background:var(--bg);
         🔍 신규상장 감시 중...
       </div>
     </div>
-    <div id="sb-hist" style="display:flex;gap:4px;margin-top:6px;flex-wrap:wrap"></div>
+    <!-- 오픈 포지션 (실시간 손익) -->
+    <div id="sb-positions" style="margin-top:6px"></div>
+    <div id="sb-hist" style="display:flex;gap:4px;margin-top:4px;flex-wrap:wrap"></div>
   </div>
 </div>
 
@@ -1070,6 +1072,28 @@ function update(d){
         \${det.finalPnl!=null?'&nbsp;<span style="color:'+(det.finalPnl>=0?"var(--green)":"var(--red)")+'">'+det.finalPnl+'%</span>':""}\`;
     } else {
       c("sb-detect").textContent = "🔍 신규상장 감시 중...";
+    }
+    // 오픈 포지션 실시간 손익
+    const positions = sB.positions||[];
+    if(positions.length>0){
+      c("sb-positions").innerHTML = positions.map(p=>{
+        const uPct = p.unrealizedPct;
+        const uCol = uPct==null?"var(--muted)":uPct>=0?"var(--green)":"var(--red)";
+        const trail = p.trailActive ? \`<span style="color:var(--cyan);font-size:.6rem"> 트레일 🟢</span>\` : "";
+        const partial = p.partialDone ? \`<span style="color:var(--yellow);font-size:.6rem"> 50%청산완료</span>\` : "";
+        const stopDist = p.currentPrice && p.stopPrice
+          ? ((p.currentPrice - p.stopPrice)/p.stopPrice*100).toFixed(1)
+          : null;
+        return \`<div style="display:flex;align-items:center;gap:8px;padding:4px 8px;background:var(--bg);border-radius:5px;border:1px solid var(--border);margin-bottom:3px;font-size:.68rem">
+          <span style="color:var(--purple);font-weight:700">\${p.market.replace("KRW-","")}</span>
+          <span style="color:var(--muted)">@\${(p.entryPrice||0).toLocaleString()}</span>
+          <span style="color:\${uCol};font-weight:700">\${uPct!=null?(uPct>=0?"+":"")+uPct+"%":"—"}</span>
+          \${stopDist?'<span style="color:var(--muted)">손절까지 '+stopDist+'%</span>':""}
+          \${partial}\${trail}
+        </div>\`;
+      }).join("");
+    } else {
+      c("sb-positions").innerHTML = "";
     }
     c("sb-hist").innerHTML = (sB.history||[]).slice(0,6).map(h=>{
       const col=h.pnlRate>=0?"var(--green)":"var(--red)";
