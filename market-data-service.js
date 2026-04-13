@@ -72,16 +72,17 @@ class MarketDataService {
       // ── 변동성 기반 동적 목표/손절 ────────────
       // σ = 최근 5초봉 실현변동성
       // target = σ × volTargetMult, stop = σ × volStopMult
+      // R/R = volTargetMult / volStopMult = 3.0/1.0 = 3.0:1
       useVolatilityTargets: true,
-      volTargetMult: 2.2,               // target = 2.2σ
-      volStopMult: 1.1,                 // stop = 1.1σ
-      minTargetGross: 0.003,            // 하한: 0.3%
-      maxTargetGross: 0.012,            // 상한: 1.2%
+      volTargetMult: 3.0,               // target = 3.0σ  (구버전 2.2)
+      volStopMult: 1.0,                 // stop = 1.0σ    (구버전 1.1)
+      minTargetGross: 0.005,            // 하한: 0.5%     (구버전 0.3%)
+      maxTargetGross: 0.020,            // 상한: 2.0%     (구버전 1.2%)
       minStopRate: -0.004,              // 하한: -0.4%
-      maxStopRate: -0.0012,             // 상한: -0.12%
+      maxStopRate: -0.0015,             // 상한: -0.15%
 
-      cooldownAfterStopMs: 25 * 60 * 1000,
-      profitPauseMs: 45 * 60 * 1000,
+      cooldownAfterStopMs: 10 * 60 * 1000,   // 10분 (구버전 25분)
+      profitPauseMs: 15 * 60 * 1000,         // 15분 (구버전 45분)
       minTradeFreshMs: 12_000,
       minAccTradePrice24h: 60_0000_0000,  // 600억 (구버전 400억)
       minMarketCapUsd: 2_000_000_000,     // $20억 (구버전 $10억)
@@ -1127,7 +1128,7 @@ class MarketDataService {
       const openMinute = exchange.openHour * 60 + exchange.openMinute;
       const diff = currentMinute - openMinute;
 
-      if (diff >= -15 && diff <= 20) {
+      if (diff >= -5 && diff <= 10) {
         return {
           active: true,
           code: "GLOBAL_OPEN_REST",
@@ -1576,6 +1577,15 @@ class MarketDataService {
     // v6: 체결 흐름 점수 — 매수 주도 체결이 많을수록 강세
     const flowScore = Math.max(-10, Math.min(15, (buyFlowRatio - 0.5) * 80));
 
+    // 모멘텀 가속 점수: 1분 모멘텀이 2분보다 강하면 추세가 붙는 중
+    // 가속 = momentum1m - momentum2m > 0 이면 추세 강화 중
+    const momentumAcceleration = momentum1m - momentum2m;
+    const accelScore = (momentum1m > 0 && momentum2m > 0 && momentumAcceleration > 0)
+      ? Math.min(15, momentumAcceleration * 3000)
+      : (momentum1m < 0 && momentumAcceleration < 0)
+        ? Math.max(-10, momentumAcceleration * 2000)
+        : 0;
+
     let rawScore =
       bullishProbability +
       liquidityScore +
@@ -1587,8 +1597,9 @@ class MarketDataService {
       evBonus +
       vwapScore +
       flowScore +
-      macroScore
-      + dataScore;
+      macroScore +
+      dataScore +
+      accelScore;
     rawScore -= reasons.length * 8;
     rawScore = Math.max(0, Number(rawScore.toFixed(2)));
 
@@ -1944,6 +1955,36 @@ class MarketDataService {
       position.totalSpentCash > 0
         ? marketNetValue / position.totalSpentCash - 1
         : 0;
+    const grossMoveRate =
+      position.averageBuyPrice > 0
+        ? (currentPrice - position.averageBuyPrice) / position.averageBuyPrice
+        : 0;
+
+    // ── 브레이크이븐 트레일링 스톱 ───────────────────
+    // +0.2% 이상 상승 시 손절가를 진입가(수수료 포함)로 이동
+    // 수익 구간에서 손절 = 확정 이익 (최소 0원 손실 보장)
+    const BREAKEVEN_TRIGGER = 0.002;  // +0.2% 도달 시 발동
+    if (
+      grossMoveRate >= BREAKEVEN_TRIGGER &&
+      !position.breakevenActivated
+    ) {
+      const breakEvenStop = -(
+        (this.simulationConfig.reservedBuyFeeRate ?? this.simulationConfig.buyFeeRate) +
+        this.simulationConfig.marketSellFeeRate
+      );
+      if ((position.dynamicStopRate ?? this.simulationConfig.stopLossRate) < breakEvenStop) {
+        position.dynamicStopRate = breakEvenStop;
+        position.breakevenActivated = true;
+      }
+    }
+
+    // ── 타임스톱: 20분 경과 후 손실 중이면 철수 ──────
+    // 방향성 없는 포지션이 자본 묶는 것 방지
+    const holdingMs = now - position.openedAt;
+    if (holdingMs > 20 * 60 * 1000 && marketPnlRate < -0.0005) {
+      this.closePosition(now, currentPrice, "TIME_STOP");
+      return;
+    }
 
     // v4: position에 저장된 동적 손절가 사용
     const effectiveStopRate =
@@ -2006,7 +2047,10 @@ class MarketDataService {
       sim.daily.consecutiveLosses = 0;  // 이기면 연속 손절 카운터 리셋
     }
 
-    sim.lastActionText = `${position.marketCode} ${reason === "STOP_LOSS" ? "시장가 손절" : "예약매도 체결"} · ${realizedPnl >= 0 ? "+" : ""}${realizedPnl.toFixed(0)}원`;
+    const reasonLabel = reason === "STOP_LOSS" ? "시장가 손절"
+      : reason === "TIME_STOP" ? "타임스톱 청산"
+      : "예약매도 체결";
+    sim.lastActionText = `${position.marketCode} ${reasonLabel} · ${realizedPnl >= 0 ? "+" : ""}${realizedPnl.toFixed(0)}원`;
 
     this.appendSimulationRecord({
       type: "POSITION_CLOSED",
@@ -2031,7 +2075,7 @@ class MarketDataService {
     sim.activePosition = null;
     sim.currentPositionFeeView = null;
 
-    if (reason === "STOP_LOSS") {
+    if (reason === "STOP_LOSS" || reason === "TIME_STOP") {
       sim.pauseUntil = now + this.simulationConfig.cooldownAfterStopMs;
       sim.pauseReasonCode = "STOPLOSS_COOLDOWN";
       return;

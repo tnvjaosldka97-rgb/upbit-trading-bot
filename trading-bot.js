@@ -281,8 +281,8 @@ class TradingBot {
     if (cal?.kellyFraction && cal.evPositive) {
       fraction = cal.kellyFraction;
     } else {
-      // 캘리브레이션 전: 보수적 고정값
-      fraction = 0.05;
+      // 캘리브레이션 전: 적정 고정값 (R/R 3:1 기반 최소 켈리)
+      fraction = 0.08;
     }
 
     const budget = Math.min(krwBalance, INITIAL_KRW * fraction);
