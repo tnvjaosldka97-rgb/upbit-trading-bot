@@ -86,27 +86,27 @@ class MarketDataService {
       minAccTradePrice24h: 60_0000_0000,  // 600억 (구버전 400억)
       minMarketCapUsd: 2_000_000_000,     // $20억 (구버전 $10억)
 
-      // ── 진입 조건 강화 ────────────────────────
-      maxVolumeSpikeRatio: 2.0,          // 구버전 3.3
-      maxVolatility5s: 0.0020,           // 구버전 0.0035
-      minBullishProbability: 86,         // 구버전 80
-      stablePassNeeded: 5,               // 구버전 3
-      switchMarginScore: 14,             // 구버전 9
+      // ── 진입 조건 (v8: 현실적 수준으로 조정) ────────
+      maxVolumeSpikeRatio: 3.5,          // 거래량 급등은 오히려 모멘텀 신호
+      maxVolatility5s: 0.003,            // 변동성 허용 범위 확대
+      minBullishProbability: 62,         // EV+ 보장 최소선 (수학적 손익분기 ~39%)
+      stablePassNeeded: 2,               // 10초 연속 통과로 충분
+      switchMarginScore: 14,
       keepIncumbentWithinScore: 5,
-      scoreEmaAlpha: 0.25,              // 더 느린 EMA (구버전 0.35)
-      bullEmaAlpha: 0.20,               // 더 느린 EMA (구버전 0.30)
+      scoreEmaAlpha: 0.30,              // 반응 속도 개선
+      bullEmaAlpha: 0.25,
 
-      // ── 일일 서킷브레이커 (신규) ──────────────
+      // ── 일일 서킷브레이커 ─────────────────────
       maxDailyLossRate: -0.006,          // 일일 총자산 -0.6% 도달 시 당일 종료
-      maxConsecutiveLosses: 2,           // 2연속 손절 시 당일 종료
-      maxDailyTrades: 8,                 // 하루 최대 8회 거래
+      maxConsecutiveLosses: 3,           // 3연속 손절 시 당일 종료 (2→3)
+      maxDailyTrades: 12,                // 하루 최대 12회 (8→12)
 
       // ── v6: 고급 멀티팩터 필터 ────────────────
-      btcFilterThreshold:  -0.002,       // BTC 1분 수익률 -0.2% 이하 → 알트 전면 차단
-      vwapMaxOvershoot:     0.005,       // VWAP 대비 +0.5% 초과 진입 금지
-      minBuyFlowRatio:      0.45,        // 체결 흐름 매수 비율 45% 미만 → 진입 금지
-      // 트레이딩 세션 (KST 분 단위): 09:00-11:30, 14:00-17:00, 20:00-24:00
-      tradingSessionsKST:  [[540, 690], [840, 1020], [1200, 1440]],
+      btcFilterThreshold:  -0.003,       // BTC 급락 기준 완화 (-0.2% → -0.3%)
+      vwapMaxOvershoot:     0.008,       // VWAP 이탈 허용 확대 (0.5% → 0.8%)
+      minBuyFlowRatio:      0.40,        // 체결 흐름 기준 완화
+      // 트레이딩 세션 (KST 분 단위): 06:00~01:00 — 새벽 사망구간만 제외
+      tradingSessionsKST:  [[0, 60], [360, 1440]],
       crossSectionBotPct:   0.40,        // 횡단면 모멘텀 하위 40% 코인 제외
     };
 
@@ -1516,8 +1516,8 @@ class MarketDataService {
       reasons.push("SPREAD_TOO_WIDE");
     }
 
-    // 매수 압력 게이트: 55% 미만이면 상승 모멘텀 약함
-    if (bidAskImbalance < 0.55) {
+    // 매수 압력 게이트: 48% 미만이면 매도 우위 확정
+    if (bidAskImbalance < 0.48) {
       reasons.push("WEAK_BID_PRESSURE");
     }
 
@@ -1534,15 +1534,13 @@ class MarketDataService {
      * 승률 추정: bullishProbability / 100 (최대 0.72로 보수적 캡)
      * EV = (estimatedWinRate × targetNet) - (estimatedLossRate × |stop|) - totalFees
      */
-    const estimatedWinRate = Math.min(0.72, bullishProbability / 100);
+    // estimatedWinRate 캡: bullishProbability 스케일과 일치 (0.85)
+    const estimatedWinRate = Math.min(0.85, bullishProbability / 100);
     const estimatedLossRate = 1 - estimatedWinRate;
-    const totalFees =
-      (this.simulationConfig.reservedBuyFeeRate ?? this.simulationConfig.buyFeeRate) +
-      this.simulationConfig.reservedSellFeeRate;
+    // targetNetIntentRate는 이미 수수료 제외 순수익 → 수수료 이중 차감 금지
     const ev =
       estimatedWinRate * this.simulationConfig.targetNetIntentRate -
-      estimatedLossRate * Math.abs(this.simulationConfig.stopLossRate) -
-      totalFees;
+      estimatedLossRate * Math.abs(this.simulationConfig.stopLossRate);
 
     if (ev < 0) {
       reasons.push("EV_NEGATIVE");

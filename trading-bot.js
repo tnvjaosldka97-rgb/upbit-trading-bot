@@ -105,25 +105,10 @@ class TradingBot {
       }
     }
 
-    if (BOT_MODE === "LIVE" || this.calibration.isLive()) {
-      this.startMainLoop();
-    } else {
-      console.log("[Bot] 캘리브레이션 모드 — 데이터 수집 중...");
-      // 캘리브레이션 완료 감지 루프
-      const waitForCalibration = setInterval(() => {
-        if (this.calibration.isLive()) {
-          console.log("[Bot] 캘리브레이션 완료 — 실거래 루프 시작");
-          clearInterval(waitForCalibration);
-          this.startMainLoop();
-        }
-        const s = this.calibration.getSummary();
-        console.log(
-          `[Calibration] ${s.totalCompleted}/${this.calibration.MIN_TRADES_FOR_OUTPUT}건 ` +
-          `| 승률 ${s.currentWinRate != null ? (s.currentWinRate * 100).toFixed(1) + "%" : "-"} ` +
-          `| EV ${s.calibratedConfig ? (s.calibratedConfig.ev * 100).toFixed(3) + "%" : "-"}`,
-        );
-      }, 5 * 60_000);
-    }
+    // 캘리브레이션은 백그라운드 병렬 실행 — 게이트 제거
+    // 실거래 루프는 즉시 시작, 캘리브레이션 데이터가 쌓이면 자동으로 파라미터 갱신
+    console.log("[Bot] 실거래 루프 즉시 시작 (캘리브레이션 백그라운드 병렬 실행)");
+    this.startMainLoop();
 
     process.on("SIGINT",  () => this.shutdown("SIGINT"));
     process.on("SIGTERM", () => this.shutdown("SIGTERM"));
@@ -383,6 +368,14 @@ class TradingBot {
     process.exit(0);
   }
 }
+
+process.on("uncaughtException", (err) => {
+  console.error("[Bot] 처리되지 않은 예외:", err.message, err.stack);
+});
+
+process.on("unhandledRejection", (reason) => {
+  console.error("[Bot] 처리되지 않은 Promise 거부:", reason);
+});
 
 const bot = new TradingBot();
 bot.start().catch((e) => { console.error(e); process.exit(1); });
