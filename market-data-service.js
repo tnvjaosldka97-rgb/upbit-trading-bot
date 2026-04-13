@@ -1393,7 +1393,9 @@ class MarketDataService {
     bullishProbability = Math.max(0, Math.min(99, bullishProbability));
 
     const marketCapUsd = Number(marketCapInfo?.marketCapUsd || 0);
-    if (!marketCapUsd || marketCapUsd < this.simulationConfig.minMarketCapUsd) {
+    // marketCapUsd=0 은 CoinGecko 429/미수신 → 데이터 없는 것이지 실제 저시총이 아님
+    // 실제로 값이 있을 때만 차단
+    if (marketCapUsd > 0 && marketCapUsd < this.simulationConfig.minMarketCapUsd) {
       reasons.push("MARKETCAP_TOO_LOW");
     }
 
@@ -1517,8 +1519,8 @@ class MarketDataService {
       reasons.push("SPREAD_TOO_WIDE");
     }
 
-    // 매수 압력 게이트: 48% 미만이면 매도 우위 확정
-    if (bidAskImbalance < 0.48) {
+    // 매수 압력 게이트: 43% 미만이면 강한 매도 우위 확정
+    if (bidAskImbalance < 0.43) {
       reasons.push("WEAK_BID_PRESSURE");
     }
 
