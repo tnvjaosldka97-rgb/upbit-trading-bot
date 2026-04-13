@@ -75,12 +75,24 @@ class MacroSignalEngine {
         this.state.binancePrices.set(item.symbol.replace("USDT", ""), Number(item.price));
       }
     } catch {}
+
+    // 환율도 함께 갱신 (FX 데이터 없을 때 폴백용)
+    try {
+      const res = await fetch("https://open.er-api.com/v6/latest/USD");
+      if (res.ok) {
+        const data = await res.json();
+        if (data?.rates?.KRW) this._cachedUsdKrw = data.rates.KRW;
+      }
+    } catch {}
   }
 
   computeKimchiPremiums() {
     const fxUsd = this.mds.state.fxUsd;
-    if (!fxUsd?.basePrice) return;
-    const usdKrw = Number(fxUsd.basePrice);
+    // FX 데이터 없으면 환율 API로 직접 폴백 (캐시된 값 사용)
+    const usdKrw = fxUsd?.basePrice
+      ? Number(fxUsd.basePrice)
+      : (this._cachedUsdKrw || 1370);  // 없으면 근사치 사용
+    if (!usdKrw) return;
 
     for (const [symbol, binanceUsd] of this.state.binancePrices.entries()) {
       const market = `KRW-${symbol}`;

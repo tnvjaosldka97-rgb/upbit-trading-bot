@@ -28,7 +28,7 @@ class DashboardServer {
   constructor(bot) {
     this.bot  = bot;
     this.server = null;
-    this.port = Number(process.env.PORT || 3000);
+    this.port = Number(process.env.PORT || 4020);
     this.sseClients = new Set();
     setInterval(() => this._broadcast(), 2000);
   }
@@ -40,8 +40,21 @@ class DashboardServer {
       if (req.url === "/api/stream")  return this._sse(req, res);
       return this._page(res);
     });
-    this.server.listen(this.port, () =>
-      console.log(`[Dashboard] http://localhost:${this.port}`));
+
+    // 포트 충돌 시 자동으로 다음 포트 시도 (최대 10회)
+    const tryListen = (port, attempt = 0) => {
+      this.server.listen(port, () => {
+        this.port = port;
+        console.log(`[Dashboard] http://localhost:${port}`);
+      }).once("error", (err) => {
+        if (err.code === "EADDRINUSE" && attempt < 10) {
+          tryListen(port + 1, attempt + 1);
+        } else {
+          console.warn(`[Dashboard] 포트 할당 실패 — 대시보드 없이 계속`);
+        }
+      });
+    };
+    tryListen(this.port);
   }
 
   stop() { this.server?.close(); }
@@ -201,7 +214,26 @@ class DashboardServer {
       equityCurve,
       strategyA: sA,
       strategyB: sB,
-      // 합산 포트폴리오
+      // ── BTC 레짐 ─────────────────────────────────────────
+      btcRegime: (() => {
+        const r = bot.regimeEngine?.state;
+        if (!r) return null;
+        return {
+          regime:     r.regime     || "UNKNOWN",
+          confidence: r.confidence != null ? +(r.confidence * 100).toFixed(0) : null,
+          btcVsSma200: r.btcVsSma200 != null ? +(r.btcVsSma200 * 100).toFixed(1) : null,
+          sma50Trend:  r.sma50Trend  || null,
+        };
+      })(),
+      // ── 펀딩비 파밍 ──────────────────────────────────────
+      funding: bot.fundingEngine?.getSummary() || null,
+      // ── 전략 활성 상태 ───────────────────────────────────
+      stratStatus: {
+        A: { active: bot.regimeEngine?.state?.regime === "BULL", reason: bot.regimeEngine?.state?.regime !== "BULL" ? `${bot.regimeEngine?.state?.regime || "?"} 레짐` : "정상가동" },
+        B: { active: true, reason: "신규상장 모니터링" },
+        farming: { active: (() => { const f = bot.fundingEngine?.state; return f?.signal && f.signal !== "NEUTRAL"; })(), signal: bot.fundingEngine?.state?.signal || "NEUTRAL" },
+      },
+      // ── 합산 포트폴리오 ──────────────────────────────────
       portfolio: {
         totalAsset: Math.round(totalAsset) + (sA?.totalAsset || 0) + (sB?.totalAsset || 0),
         pnlA: sA?.pnlRate ?? 0,
@@ -419,8 +451,18 @@ body{font-family:-apple-system,'SF Pro Display',sans-serif;background:var(--bg);
   </div>
   <div class="tb-sep"></div>
   <div class="tb-stat">
-    <span class="lbl">레짐</span>
+    <span class="lbl">공포탐욕</span>
     <span class="val" id="tb-regime">—</span>
+  </div>
+  <div class="tb-sep"></div>
+  <div class="tb-stat">
+    <span class="lbl">BTC 레짐</span>
+    <span class="val" id="tb-btc-regime" style="font-size:.82rem">—</span>
+  </div>
+  <div class="tb-sep"></div>
+  <div class="tb-stat">
+    <span class="lbl">펀딩비/8h</span>
+    <span class="val" id="tb-funding" style="font-size:.82rem">—</span>
   </div>
   <div class="tb-sep"></div>
   <div class="tb-stat">
@@ -431,6 +473,55 @@ body{font-family:-apple-system,'SF Pro Display',sans-serif;background:var(--bg);
     <div class="live-ring"></div>
     <span id="tb-uptime">—</span>
     <span id="tb-mode" class="mode-pill pill-sim">SIM</span>
+  </div>
+</div>
+
+<!-- ─── 레짐 + 펀딩비 파밍 바 ─── -->
+<div style="display:grid;grid-template-columns:1fr 1fr 1fr 1fr;border-bottom:1px solid var(--border);flex-shrink:0;background:var(--s2)">
+
+  <!-- BTC 레짐 -->
+  <div style="padding:8px 16px;border-right:1px solid var(--border)">
+    <div style="font-size:.58rem;font-weight:700;color:var(--muted);text-transform:uppercase;letter-spacing:.8px;margin-bottom:4px">BTC 마켓 레짐</div>
+    <div style="display:flex;align-items:center;gap:8px">
+      <div id="regime-pill" style="padding:3px 10px;border-radius:99px;font-size:.78rem;font-weight:800;border:1px solid var(--muted);color:var(--muted)">—</div>
+      <div id="regime-conf" style="font-size:.7rem;color:var(--muted)">—</div>
+    </div>
+    <div id="regime-detail" style="font-size:.65rem;color:var(--muted);margin-top:3px">SMA200 대비 —</div>
+  </div>
+
+  <!-- 펀딩비 -->
+  <div style="padding:8px 16px;border-right:1px solid var(--border)">
+    <div style="font-size:.58rem;font-weight:700;color:var(--muted);text-transform:uppercase;letter-spacing:.8px;margin-bottom:4px">Bybit 펀딩비 (BTC)</div>
+    <div style="display:flex;align-items:baseline;gap:6px">
+      <span id="funding-rate" style="font-size:1.1rem;font-weight:800;color:var(--text)">—</span>
+      <span style="font-size:.65rem;color:var(--muted)">/8h</span>
+      <span id="funding-apr" style="font-size:.72rem;font-weight:700;color:var(--muted)">APR —</span>
+    </div>
+    <div id="funding-next" style="font-size:.65rem;color:var(--muted);margin-top:2px">다음 정산 —</div>
+  </div>
+
+  <!-- 파밍 신호 -->
+  <div style="padding:8px 16px;border-right:1px solid var(--border)">
+    <div style="font-size:.58rem;font-weight:700;color:var(--muted);text-transform:uppercase;letter-spacing:.8px;margin-bottom:4px">펀딩비 파밍 신호</div>
+    <div id="farming-signal" style="padding:3px 10px;border-radius:99px;font-size:.75rem;font-weight:800;border:1px solid var(--muted);color:var(--muted);display:inline-block">대기 중</div>
+    <div id="farming-desc" style="font-size:.63rem;color:var(--muted);margin-top:3px">|rate| ≥ 0.03% 시 활성</div>
+  </div>
+
+  <!-- 전략 상태 -->
+  <div style="padding:8px 16px">
+    <div style="font-size:.58rem;font-weight:700;color:var(--muted);text-transform:uppercase;letter-spacing:.8px;margin-bottom:4px">전략 가동 상태</div>
+    <div style="display:flex;flex-direction:column;gap:3px">
+      <div style="display:flex;align-items:center;gap:6px">
+        <div id="strat-a-dot" style="width:7px;height:7px;border-radius:50%;background:var(--muted);flex-shrink:0"></div>
+        <span style="font-size:.68rem;color:var(--muted)">Strategy A:</span>
+        <span id="strat-a-status" style="font-size:.68rem;font-weight:700;color:var(--muted)">—</span>
+      </div>
+      <div style="display:flex;align-items:center;gap:6px">
+        <div id="strat-b-dot" style="width:7px;height:7px;border-radius:50%;background:var(--green);flex-shrink:0;box-shadow:0 0 5px var(--green)"></div>
+        <span style="font-size:.68rem;color:var(--muted)">Strategy B:</span>
+        <span id="strat-b-status" style="font-size:.68rem;font-weight:700;color:var(--green)">모니터링</span>
+      </div>
+    </div>
   </div>
 </div>
 
@@ -738,6 +829,73 @@ function update(d){
   c("tb-sharpe").textContent = d.sharpe!=null ? d.sharpe : "—";
   c("tb-regime").textContent = d.regime;
   c("tb-regime").style.color = d.regimeColor;
+
+  // ─ BTC 레짐 (탑바)
+  if (d.btcRegime) {
+    const rc = d.btcRegime.regime;
+    const rcolor = rc==="BULL"?"var(--green)":rc==="BEAR"?"var(--red)":"var(--yellow)";
+    const ricon  = rc==="BULL"?"🟢":rc==="BEAR"?"🔴":"🟡";
+    c("tb-btc-regime").textContent = ricon+" "+rc;
+    c("tb-btc-regime").style.color = rcolor;
+  }
+
+  // ─ 펀딩비 (탑바)
+  if (d.funding?.ratePct != null) {
+    const fp = d.funding.ratePct;
+    const fc = fp>0?"var(--red)":fp<0?"var(--green)":"var(--muted)";
+    c("tb-funding").textContent = (fp>=0?"+":"")+fp+"%";
+    c("tb-funding").style.color = fc;
+  }
+
+  // ─ 레짐+파밍 상세 바
+  if (d.btcRegime) {
+    const rc = d.btcRegime.regime;
+    const rcolor = rc==="BULL"?"#10b981":rc==="BEAR"?"#ef4444":"#f59e0b";
+    const rbg    = rc==="BULL"?"rgba(16,185,129,.12)":rc==="BEAR"?"rgba(239,68,68,.12)":"rgba(245,158,11,.12)";
+    const ricon  = rc==="BULL"?"🟢 BULL":rc==="BEAR"?"🔴 BEAR":"🟡 NEUTRAL";
+    c("regime-pill").textContent   = ricon;
+    c("regime-pill").style.color   = rcolor;
+    c("regime-pill").style.borderColor = rcolor;
+    c("regime-pill").style.background  = rbg;
+    c("regime-conf").textContent   = (d.btcRegime.confidence??"-")+"% 신뢰도";
+    const vs = d.btcRegime.btcVsSma200;
+    c("regime-detail").textContent = vs!=null ? "SMA200 대비 "+(vs>=0?"+":"")+vs+"%" : "SMA200 대비 —";
+    c("regime-detail").style.color = vs>=0?"var(--green)":"var(--red)";
+    // 전략 A 상태
+    const aActive = rc==="BULL";
+    c("strat-a-dot").style.background  = aActive?"var(--green)":"var(--muted)";
+    c("strat-a-dot").style.boxShadow   = aActive?"0 0 5px var(--green)":"none";
+    c("strat-a-status").textContent    = aActive?"가동 중":rc+" 레짐 (대기)";
+    c("strat-a-status").style.color    = aActive?"var(--green)":"var(--muted)";
+  }
+
+  if (d.funding) {
+    const fp  = d.funding.ratePct;
+    const fc  = fp>0?"var(--red)":fp<0?"var(--green)":"var(--muted)";
+    if (fp!=null) {
+      c("funding-rate").textContent   = (fp>=0?"+":"")+fp+"%";
+      c("funding-rate").style.color   = fc;
+      c("funding-apr").textContent    = "APR "+(d.funding.apr>=0?"+":"")+d.funding.apr+"%";
+      c("funding-apr").style.color    = fc;
+    }
+    c("funding-next").textContent = "다음 정산 "+d.funding.nextLabel;
+
+    // 파밍 신호
+    const sig   = d.funding.signal;
+    const sigEl = c("farming-signal");
+    const descEl= c("farming-desc");
+    if (sig==="SHORT_COLLECT") {
+      sigEl.textContent="🔴 숏 수취 기회";sigEl.style.color="var(--red)";sigEl.style.borderColor="var(--red)";sigEl.style.background="rgba(239,68,68,.1)";
+      descEl.textContent="펀딩비 +"+fp+"% — 롱이 숏에 지불";descEl.style.color="var(--red)";
+    } else if (sig==="LONG_COLLECT") {
+      sigEl.textContent="🟢 롱 수취 기회";sigEl.style.color="var(--green)";sigEl.style.borderColor="var(--green)";sigEl.style.background="rgba(16,185,129,.1)";
+      descEl.textContent="펀딩비 "+fp+"% — 숏이 롱에 지불";descEl.style.color="var(--green)";
+    } else {
+      sigEl.textContent="⚪ 대기 중";sigEl.style.color="var(--muted)";sigEl.style.borderColor="var(--muted)";sigEl.style.background="transparent";
+      descEl.textContent="|rate| < 0.03% — 수익성 낮음";descEl.style.color="var(--muted)";
+    }
+  }
+
   c("tb-cal").textContent = d.cal.completed+"/"+d.cal.minNeeded;
   c("tb-cal").style.color = d.cal.evPositive?"var(--green)":"var(--yellow)";
   const s=d.uptime;

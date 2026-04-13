@@ -16,9 +16,12 @@ const { CalibrationEngine }    = require("./calibration-engine");
 const { UpbitOrderService }    = require("./upbit-order-service");
 const { MacroSignalEngine }    = require("./macro-signal-engine");
 const { DataAggregationEngine }= require("./data-aggregation-engine");
+const { RegimeEngine }         = require("./regime-engine");
+const { UpbitWebSocket }       = require("./upbit-websocket");
 const { DashboardServer }      = require("./dashboard-server");
 const { StrategyA }            = require("./strategy-a");
 const { StrategyB }            = require("./strategy-b");
+const { BybitFundingEngine }   = require("./bybit-funding-engine");
 
 try { require("dotenv").config(); } catch {}
 
@@ -46,13 +49,29 @@ class TradingBot {
       accessKey: process.env.UPBIT_ACCESS_KEY,
       secretKey: process.env.UPBIT_SECRET_KEY,
     });
-    this.macroEngine = new MacroSignalEngine(this.mds);
-    this.dataEngine  = new DataAggregationEngine(this.mds);
+    this.macroEngine  = new MacroSignalEngine(this.mds);
+    this.dataEngine   = new DataAggregationEngine(this.mds);
+    this.regimeEngine  = new RegimeEngine();
+    this.fundingEngine = new BybitFundingEngine();
+    this.upbitWs       = new UpbitWebSocket();
+    this._wsBtcPrice  = null;   // WS 실시간 BTC 가격
 
     // ── Strategy A/B ─────────────────────────────────
+    // 모든 엔진을 각 전략에 주입 → 신호 퓨전 가능
     const opts = { orderService: this.orderService, dryRun: DRY_RUN };
-    this.strategyA = new StrategyA({ ...opts, macroEngine: this.macroEngine, initialCapital: CAPITAL_A });
-    this.strategyB = new StrategyB({ ...opts, initialCapital: CAPITAL_B });
+    this.strategyA = new StrategyA({
+      ...opts,
+      macroEngine:   this.macroEngine,
+      dataEngine:    this.dataEngine,
+      regimeEngine:  this.regimeEngine,
+      fundingEngine: this.fundingEngine,   // 펀딩비 신호 연동
+      initialCapital: CAPITAL_A,
+    });
+    this.strategyB = new StrategyB({
+      ...opts,
+      dataEngine:   this.dataEngine,   // DataEngine 연동 → 중복 폴링 제거
+      initialCapital: CAPITAL_B,
+    });
 
     // 실거래 포지션 (구 MDS 기반, 참조용 유지)
     this.livePosition = null;
@@ -78,12 +97,21 @@ class TradingBot {
 
   async start() {
     console.log("══════════════════════════════════════════");
-    console.log("  ATS v5 — 10점짜리 트레이딩 봇");
+    console.log("  ATS v9 — 상위 0.1% 트레이딩 봇");
     console.log(`  모드:     ${BOT_MODE}`);
     console.log(`  자본:     ${INITIAL_KRW.toLocaleString()}원`);
-    console.log(`  실거래:   ${DRY_RUN ? "OFF (시뮬레이션만)" : "ON"}`);
-    console.log(`  API 키:   ${this.orderService.getSummary().hasApiKeys ? "연결됨" : "없음"}`);
+    console.log(`  실거래:   ${DRY_RUN ? "OFF (시뮬레이션만)" : "ON ⚡"}`);
+    console.log(`  API 키:   ${this.orderService.getSummary().hasApiKeys ? "연결됨" : "없음 ⚠"}`);
     console.log("══════════════════════════════════════════");
+
+    // ── 실거래 모드 프리플라이트 체크 ──────────────────
+    if (!DRY_RUN) {
+      const ok = await this._preflight();
+      if (!ok) {
+        console.error("[Bot] 프리플라이트 실패 — 안전을 위해 중단. DRY_RUN=true로 재시작하세요.");
+        process.exit(1);
+      }
+    }
 
     this.dashboard.start();
 
@@ -101,8 +129,20 @@ class TradingBot {
     this.mds.setDataEngine(this.dataEngine);
     console.log("[Bot] 데이터 집합 엔진 시작 (OI / L/S비율 / 테이커 / 신규상장 / 뉴스)");
 
+    await this.regimeEngine.start();
+    console.log(`[Bot] 레짐 엔진 시작 — 현재 국면: ${this.regimeEngine.getRegime()}`);
+
+    // ── WebSocket 실시간 시세 ─────────────────────────
+    this.upbitWs.subscribe("KRW-BTC");
+    this.upbitWs.onPrice((market, price) => {
+      if (market === "KRW-BTC") this._wsBtcPrice = price;
+    });
+    this.upbitWs.connect();
+    console.log("[Bot] WebSocket 시세 스트림 연결 시작 (KRW-BTC 실시간)");
+
     // ── Strategy A/B 시작 ─────────────────────────────
     this.strategyA.start();
+    this.strategyA.setWebSocket(this.upbitWs);   // 실시간 손절 활성화
     console.log(`[Bot] Strategy A 시작 (1h 스윙) — 자본 ${CAPITAL_A.toLocaleString()}원`);
     await this.strategyB.start();
     console.log(`[Bot] Strategy B 시작 (신규상장) — 자본 ${CAPITAL_B.toLocaleString()}원`);
@@ -142,6 +182,8 @@ class TradingBot {
   }
 
   // ─── 5초 메인 틱 ────────────────────────────────────
+  // Strategy A/B가 독립적으로 주문을 처리함.
+  // 메인 틱은 공통 서킷브레이커 + MDS 구시스템 포지션 복구 관리만 담당.
 
   async tick() {
     const now = Date.now();
@@ -150,17 +192,11 @@ class TradingBot {
     if (this.isHalted()) return;
     this.applyCalibratedConfig();
 
-    // 기존 포지션 손절 감시
+    // 복구된 구시스템 포지션(재시작 시)만 손절 감시
+    // Strategy A/B 포지션은 각 전략이 직접 관리
     if (this.livePosition) {
       await this.managePosition();
-      return;
     }
-
-    // market-data-service 내부 시뮬레이션이 진입 결정을 내렸을 때만 실거래 진입
-    const simPosition = this.mds.state.simulation.activePosition;
-    if (!simPosition || this.enteringPosition) return;
-
-    await this.enterPosition(simPosition);
   }
 
   // ─── 진입 ───────────────────────────────────────────
@@ -242,8 +278,11 @@ class TradingBot {
   async managePosition() {
     if (!this.livePosition) return;
 
+    // WS 실시간 가격 우선, 없으면 MDS 폴백
     const ctx          = this.mds.ensureContext(this.livePosition.market);
-    const currentPrice = this.mds.getCurrentPrice(ctx);
+    const currentPrice = (this.livePosition.market === "KRW-BTC" && this._wsBtcPrice)
+      ? this._wsBtcPrice
+      : this.mds.getCurrentPrice(ctx);
     if (!currentPrice) return;
 
     if (currentPrice <= this.livePosition.stopPrice) {
@@ -359,6 +398,57 @@ class TradingBot {
     }
   }
 
+  // ─── 실거래 프리플라이트 체크 ────────────────────────
+
+  async _preflight() {
+    console.log("[Bot] 프리플라이트 체크 시작...");
+    const checks = [];
+
+    // 1. API 키 유효성
+    const hasKeys = this.orderService.getSummary().hasApiKeys;
+    checks.push({ name: "API 키", ok: hasKeys });
+
+    // 2. 계좌 잔고 조회
+    let krwBalance = 0;
+    try {
+      krwBalance = await this.orderService.getBalance("KRW");
+      checks.push({ name: `KRW 잔고 (${krwBalance.toLocaleString()}원)`, ok: krwBalance >= 5_000 });
+    } catch (e) {
+      checks.push({ name: "KRW 잔고 조회", ok: false, reason: e.message });
+    }
+
+    // 3. 최소 자본 대비 잔고 확인
+    checks.push({
+      name: `잔고 ≥ 자본설정(${INITIAL_KRW.toLocaleString()}원)의 50%`,
+      ok: krwBalance >= INITIAL_KRW * 0.5,
+    });
+
+    // 4. 업비트 API 응답 테스트
+    try {
+      const res = await fetch("https://api.upbit.com/v1/ticker?markets=KRW-BTC");
+      checks.push({ name: "업비트 API 응답", ok: res.ok });
+    } catch (e) {
+      checks.push({ name: "업비트 API 응답", ok: false });
+    }
+
+    // 결과 출력
+    let allOk = true;
+    console.log("[Bot] ─── 프리플라이트 결과 ───────────────");
+    for (const c of checks) {
+      const mark = c.ok ? "✅" : "❌";
+      console.log(`[Bot]   ${mark} ${c.name}${c.reason ? ` — ${c.reason}` : ""}`);
+      if (!c.ok) allOk = false;
+    }
+    console.log("[Bot] ────────────────────────────────────");
+
+    if (allOk) {
+      console.log("[Bot] 프리플라이트 통과 — 실거래 시작");
+    } else {
+      console.error("[Bot] 프리플라이트 실패 항목 있음");
+    }
+    return allOk;
+  }
+
   // ─── 종료 ───────────────────────────────────────────
 
   async shutdown(signal) {
@@ -367,6 +457,8 @@ class TradingBot {
     this.calibration.stop();
     this.dashboard.stop();
     this.macroEngine.stop();
+    this.regimeEngine.stop();
+    this.upbitWs.stop();
     this.dataEngine.stop();
     this.strategyA.stop();
     this.strategyB.stop();

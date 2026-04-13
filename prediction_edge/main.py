@@ -262,9 +262,10 @@ async def process_aggregated_signals(
             log.debug(f"Expired signal dropped: {strategy}")
             continue
 
-        # Kelly sizing
+        # Kelly sizing — maker orders pay 0% fee (reflected in sizing)
         days = market.days_to_resolution if market else 30.0
-        fee_per_dollar = config.TAKER_FEE_RATE * (1 - current_price)
+        is_maker_order = urgency not in ("IMMEDIATE", "HIGH")
+        fee_per_dollar = 0.0 if is_maker_order else config.TAKER_FEE_RATE * (1 - current_price)
 
         size_usd = compute_kelly(
             model_prob=model_prob,
@@ -273,6 +274,7 @@ async def process_aggregated_signals(
             days_to_resolution=days,
             strategy=strategy,
             fee_cost_per_dollar=fee_per_dollar,
+            is_maker=is_maker_order,
         )
 
         if size_usd < config.MIN_ORDER_SIZE_USD:
@@ -353,6 +355,12 @@ async def main():
     reconciler = PositionReconciler(portfolio, gateway.get_clob)
     gateway.set_reconciler(reconciler)
 
+    # 스타트업 인증 검증 — 실매매 모드에서 잘못된 키로 첫 주문까지 기다리지 않음
+    creds_ok = await gateway.validate_credentials()
+    if not config.DRY_RUN and not creds_ok:
+        log.error("LIVE mode credential validation failed. Fix keys and restart.")
+        return
+
     # Initial market fetch
     log.info("Fetching initial market data...")
     markets = await fetch_active_markets(limit=500)
@@ -361,21 +369,26 @@ async def main():
     await store.update_markets(markets)
     log.info(f"Loaded {len(markets)} markets, {sum(len(m.tokens) for m in markets)} tokens")
 
-    # Build wallet profitability database (runs once; skip if already done)
-    from core.db import get_conn as _gc
-    conn = _gc()
-    wallet_count = conn.execute("SELECT COUNT(*) FROM wallet_stats").fetchone()[0]
-    if wallet_count == 0:
-        log.info("No wallet data found. Building wallet database (this takes ~5 minutes)...")
-        try:
-            await build_wallet_database()
-        except Exception as e:
-            log.warning(f"Wallet database build failed: {e}. Copy trading will be limited.")
-    else:
-        log.info(f"Wallet database: {wallet_count} wallets loaded")
+    # Build wallet profitability database — 백그라운드로 실행 (대시보드 블로킹 방지)
+    async def _build_wallet_db_bg():
+        from core.db import get_conn as _gc
+        conn = _gc()
+        wallet_count = conn.execute("SELECT COUNT(*) FROM wallet_stats").fetchone()[0]
+        if wallet_count == 0:
+            log.info("No wallet data found. Building wallet database in background (~5 min)...")
+            try:
+                await build_wallet_database()
+                log.info("Wallet database build complete.")
+            except Exception as e:
+                log.warning(f"Wallet database build failed: {e}. Copy trading will be limited.")
+        else:
+            log.info(f"Wallet database: {wallet_count} wallets loaded")
 
     # Init correlated arb scanner (relation graph auto-built and injected)
     corr_arb_scanner = CorrelatedArbScanner(store, raw_signal_bus)
+
+    # 지갑 DB 백그라운드 빌드 태스크 등록
+    asyncio.create_task(_build_wallet_db_bg(), name="wallet_db_build")
 
     # ── CORE 3 STRATEGIES ONLY ────────────────────────────────────────────────
     # Each strategy here has verified mathematical edge.
@@ -438,22 +451,25 @@ async def main():
     except Exception as e:
         log.warning(f"WebSocket startup failed: {e}. Falling back to REST polling.")
 
-    # On-chain watcher (requires premium RPC)
-    if config.POLYGON_RPC and "alchemy" in config.POLYGON_RPC.lower():
+    # On-chain copy trading — 모든 Polygon RPC 사용 가능 (public RPC 포함)
+    # Alchemy: 블록당 2s 폴링으로 더 빠름 / public RPC: 5-10s 딜레이 허용
+    if config.POLYGON_RPC:
         tasks.append(asyncio.create_task(
-            OnChainWatcher(store, raw_signal_bus).start(),
+            OnChainWatcher(store, raw_signal_bus, portfolio=portfolio).start(),
             name="onchain"
         ))
-        log.info("On-chain copy trading: ACTIVE")
+        rpc_type = "Alchemy (fast)" if "alchemy" in config.POLYGON_RPC.lower() else "public RPC"
+        log.info(f"On-chain copy trading: ACTIVE ({rpc_type})")
     else:
-        log.warning("On-chain copy trading: DISABLED (configure POLYGON_RPC in .env)")
+        log.warning("On-chain copy trading: DISABLED (set POLYGON_RPC)")
 
-    # Web dashboard — http://localhost:8080
+    # Web dashboard — Railway PORT env var 우선 사용
+    dashboard_port = int(os.environ.get("PORT", 8080))
     tasks.append(asyncio.create_task(
-        start_dashboard(store, portfolio, lambda: gateway.stats),
+        start_dashboard(store, portfolio, lambda: gateway.stats, port=dashboard_port),
         name="dashboard"
     ))
-    log.info("Dashboard: http://localhost:8080")
+    log.info(f"Dashboard: http://0.0.0.0:{dashboard_port}")
 
     log.info(f"System running with {len(tasks)} tasks. Ctrl+C to stop.")
     log.info(f"Active strategies: oracle_convergence, fee_arb (near-certain + internal_arb), "

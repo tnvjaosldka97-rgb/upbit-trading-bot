@@ -479,6 +479,9 @@ class MarketDataService {
   }
 
   async loadMarketCapsForAnalysis() {
+    // CoinGecko 실패 시 1시간에 1회만 로그 출력 (스팸 방지)
+    if (!this._cgFailLogAt) this._cgFailLogAt = 0;
+
     const symbols = this.state.analysisMarketCodes
       .map((marketCode) => marketCode.split("-")[1]?.toLowerCase())
       .filter(Boolean);
@@ -498,7 +501,11 @@ class MarketDataService {
       try {
         rows = await this.fetchJson(url);
       } catch (e) {
-        console.warn("[MDS] CoinGecko 요청 실패 (무시):", e.message);
+        const now = Date.now();
+        if (now - this._cgFailLogAt > 60 * 60_000) {   // 1시간에 1회만 로그
+          console.warn("[MDS] CoinGecko 연결 실패 — 시총 필터 비활성화 (1h 침묵)");
+          this._cgFailLogAt = now;
+        }
         continue;
       }
 

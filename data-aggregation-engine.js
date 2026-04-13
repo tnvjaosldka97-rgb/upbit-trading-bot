@@ -59,7 +59,16 @@ class DataAggregationEngine {
       },
     };
 
-    this.intervalIds = [];
+    this.intervalIds       = [];
+    this._listingCallbacks = [];  // 신규상장 즉시 이벤트 리스너
+  }
+
+  /**
+   * 신규상장 감지 시 즉시 호출되는 콜백 등록
+   * Strategy B가 구독 → 30초 폴링 대기 없이 즉시 반응
+   */
+  onNewListing(cb) {
+    this._listingCallbacks.push(cb);
   }
 
   // ─── 시작 / 종료 ──────────────────────────────────────
@@ -82,7 +91,7 @@ class DataAggregationEngine {
     this.intervalIds.push(setInterval(() => this.refreshBybitOI(),       60_000));
     this.intervalIds.push(setInterval(() => this.refreshTakerFlow(),     60_000));
     this.intervalIds.push(setInterval(() => this.refreshLsRatios(),  5 * 60_000));
-    this.intervalIds.push(setInterval(() => this.checkNewListings(),     60_000));
+    this.intervalIds.push(setInterval(() => this.checkNewListings(),     30_000)); // 신규상장은 30초 (빠른 감지)
     this.intervalIds.push(setInterval(() => this.refreshNewsScores(), 10 * 60_000));
   }
 
@@ -254,6 +263,12 @@ class DataAggregationEngine {
           const listedAt = Date.now();
           this.state.newListings.set(market, listedAt);
           console.log(`[DataAggregation] 🚨 신규 상장 감지: ${market} @ ${new Date(listedAt).toLocaleTimeString("ko-KR")}`);
+          // 구독자에게 즉시 통보 (Strategy B 30초 대기 제거)
+          for (const cb of this._listingCallbacks) {
+            try { cb(market, listedAt); } catch (e) {
+              console.error("[DataAggregation] 상장 콜백 오류:", e.message);
+            }
+          }
         }
       }
 
