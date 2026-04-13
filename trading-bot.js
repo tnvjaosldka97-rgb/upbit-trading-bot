@@ -16,6 +16,7 @@ const { CalibrationEngine } = require("./calibration-engine");
 const { UpbitOrderService } = require("./upbit-order-service");
 const { MacroSignalEngine } = require("./macro-signal-engine");
 const { DataAggregationEngine } = require("./data-aggregation-engine");
+const { DashboardServer } = require("./dashboard-server");
 
 try { require("dotenv").config(); } catch {}
 
@@ -58,6 +59,7 @@ class TradingBot {
     this.MAX_CONS_LOSSES     = 2;
 
     this.mainLoopId = null;
+    this.dashboard  = new DashboardServer(this);
   }
 
   async start() {
@@ -68,6 +70,8 @@ class TradingBot {
     console.log(`  실거래:   ${DRY_RUN ? "OFF (시뮬레이션만)" : "ON"}`);
     console.log(`  API 키:   ${this.orderService.getSummary().hasApiKeys ? "연결됨" : "없음"}`);
     console.log("══════════════════════════════════════════");
+
+    this.dashboard.start();
 
     await this.mds.start();
     console.log("[Bot] 시세 엔진 준비 완료");
@@ -356,6 +360,7 @@ class TradingBot {
     console.log(`\n[Bot] 종료 (${signal})`);
     if (this.mainLoopId) clearInterval(this.mainLoopId);
     this.calibration.stop();
+    this.dashboard.stop();
     this.macroEngine.stop();
     this.dataEngine.stop();
 

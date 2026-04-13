@@ -311,7 +311,9 @@ class MarketDataService {
     ]);
 
     this.syncAnalysisMarkets();
-    await this.loadMarketCapsForAnalysis();
+    await this.loadMarketCapsForAnalysis().catch((e) => {
+      console.warn("[MDS] 시총 데이터 로드 실패 (무시하고 계속):", e.message);
+    });
 
     const warmTargets = Array.from(
       new Set([this.defaultMarketCode, ...this.state.analysisMarketCodes]),
