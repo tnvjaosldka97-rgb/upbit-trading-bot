@@ -61,6 +61,9 @@ class StrategyB {
     // WebSocket 실시간 감시
     this._ws       = null;
     this._wsActive = false;
+
+    // 텔레그램 알림
+    this._notifier = null;
   }
 
   // ── 시작/종료 ────────────────────────────────────────
@@ -80,6 +83,7 @@ class StrategyB {
           this.actedListings.add(market);
           this.detections.unshift({ market, detectedAt: listedAt, status: "이벤트감지" });
           this.detections = this.detections.slice(0, 20);
+          this._notifier?.notifyNewListing(market);
           this._enter(market).catch(e => console.error("[B] 즉시진입 오류:", e.message));
         });
         console.log("[StrategyB] DataEngine 이벤트 직결 — 신규상장 즉시 반응 활성화");
@@ -99,6 +103,9 @@ class StrategyB {
       MANAGE_INTERVAL_MS
     );
 
+    // 크래시 복구 — 재시작 시 기존 포지션 복원 (실거래 모드)
+    await this._recoverLivePositions();
+
     console.log("[StrategyB v2] 신규상장 스캐너 시작");
   }
 
@@ -116,6 +123,60 @@ class StrategyB {
     this._wsActive = true;
     ws.onPrice((market, price) => this._onWsPrice(market, price));
     console.log("[StrategyB] WebSocket 활성화 — 신규상장 포지션 실시간(~100ms) 감시");
+  }
+
+  setNotifier(notifier) {
+    this._notifier = notifier;
+  }
+
+  /**
+   * 크래시 복구 — 봇 재시작 시 Upbit 잔고 스캔하여 기존 포지션 복원
+   * 실거래 모드에서만 동작
+   */
+  async _recoverLivePositions() {
+    if (this.dryRun || !this.orderService?.getSummary().hasApiKeys) return;
+    try {
+      const accounts = await this.orderService.getAccounts().catch(() => null);
+      if (!accounts) return;
+
+      let recovered = 0;
+      for (const acc of accounts) {
+        const { currency, balance, avg_buy_price } = acc;
+        if (currency === "KRW" || parseFloat(balance) < 0.00001) continue;
+
+        const market     = `KRW-${currency}`;
+        if (this.livePositions.has(market)) continue;
+
+        const entryPrice = parseFloat(avg_buy_price) || 0;
+        const qty        = parseFloat(balance);
+        if (!entryPrice || !qty) continue;
+
+        const lp = {
+          market,
+          quantity:    qty,
+          entryPrice,
+          budget:      qty * entryPrice,
+          targetPrice: entryPrice * (1 + TARGET_RATE),
+          stopPrice:   entryPrice * (1 + STOP_RATE),
+          peakPrice:   entryPrice,
+          partialDone: false,
+          trailActive: false,
+          openedAt:    Date.now() - 30 * 60_000,  // 30분 전 추정
+        };
+        this.livePositions.set(market, lp);
+        if (this._ws) this._ws.subscribe(market);
+        console.log(
+          `[B] 🔄 포지션 복구 — ${market} qty:${qty.toFixed(4)} ` +
+          `@${Math.round(entryPrice).toLocaleString()}원`
+        );
+        recovered++;
+      }
+      if (recovered > 0) {
+        console.log(`[B] 크래시 복구 완료 — ${recovered}개 포지션 복원`);
+      }
+    } catch (e) {
+      console.warn(`[B] 크래시 복구 실패: ${e.message}`);
+    }
   }
 
   /**
@@ -148,6 +209,7 @@ class StrategyB {
         `50% 매도, 스탑→브레이크이븐, 트레일링 ${TRAIL_PCT * 100}% 시작`
       );
       this._updateDetection(market, `+${(move * 100).toFixed(1)}% 부분청산`);
+      this._notifier?.notifyPartial("B", market, move * 100);
     }
 
     // ── 트레일링 스탑 갱신 ────────────────────────────
@@ -182,6 +244,7 @@ class StrategyB {
       const det = this.detections.find(d => d.market === market);
       if (det) { det.status = `청산(${reason})`; det.finalPnl = +(pnlRate * 100).toFixed(1); }
 
+      this._notifier?.notifyExit("B", market, pnlRate, reason, pos.partialDone);
       console.log(
         `[B] 청산(${reason})(WS) — ${market} ` +
         `${pnlRate >= 0 ? "+" : ""}${(pnlRate * 100).toFixed(1)}%`
@@ -255,6 +318,9 @@ class StrategyB {
 
     // WebSocket 구독 → 실시간 가격 수신 시작
     if (this._ws) this._ws.subscribe(market);
+
+    // 텔레그램 알림
+    this._notifier?.notifyEntry("B", market, price, budget, TARGET_RATE, STOP_RATE);
 
     console.log(`[B] 진입 — ${market} @${price.toLocaleString()} 목표:+30% 손절:-8% 트레일:${TRAIL_PCT * 100}%`);
 
@@ -365,6 +431,7 @@ class StrategyB {
       const det = this.detections.find(d => d.market === market);
       if (det) { det.status = `청산(${reason})`; det.finalPnl = +(pnlRate * 100).toFixed(1); }
 
+      this._notifier?.notifyExit("B", market, pnlRate, reason, pos.partialDone);
       console.log(`[B] 청산(${reason}) — ${market} ${pnlRate >= 0 ? "+" : ""}${(pnlRate * 100).toFixed(1)}%`);
     }
   }
