@@ -1,0 +1,22 @@
+version: "3.9"
+
+services:
+  bot:
+    build: .
+    restart: unless-stopped
+    env_file: .env
+    ports:
+      - "8080:8080"
+    volumes:
+      - db_data:/app/data_db        # SQLite 영속 저장
+      - ./logs:/app/logs
+    environment:
+      - DB_PATH=/app/data_db/prediction_edge.db
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "50m"
+        max-file: "3"
+
+volumes:
+  db_data:

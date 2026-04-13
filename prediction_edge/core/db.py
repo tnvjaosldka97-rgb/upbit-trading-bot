@@ -142,21 +142,52 @@ def get_calibration_stats(strategy: str) -> dict:
     ).fetchall()
 
     if not rows:
-        return {"count": 0, "accuracy": 0.5, "calibration_error": 0.5}
+        # Cold-start: no calibration data yet.
+        # Return error=0 so Kelly trusts the model until we have real data.
+        # Without this, shrinkage=1.0 makes every Kelly bet = 0 forever.
+        return {"count": 0, "accuracy": 0.5, "calibration_error": 0.0}
 
     total = len(rows)
     correct = sum(1 for r in rows if r["was_correct"] == 1)
     accuracy = correct / total
 
     # Mean calibration error: |model_prob - empirical_hit_rate|
-    # Simplified: bucket by probability and measure each bucket's accuracy
     calib_error = abs(accuracy - sum(r["model_prob"] for r in rows) / total)
+    # Cap at 0.3 — even a bad model shouldn't fully collapse bets
+    calib_error = min(calib_error, 0.30)
 
     return {
         "count": total,
         "accuracy": accuracy,
         "calibration_error": calib_error,
     }
+
+
+def update_pnl_for_token(token_id: str, pnl: float) -> None:
+    """Record realized PnL on the most recent open buy trade for a token."""
+    conn = get_conn()
+    row = conn.execute(
+        "SELECT id FROM trades WHERE token_id = ? AND side = 'BUY' AND pnl IS NULL ORDER BY timestamp DESC LIMIT 1",
+        (token_id,)
+    ).fetchone()
+    if row:
+        conn.execute("UPDATE trades SET pnl = ? WHERE id = ?", (pnl, row["id"]))
+        conn.commit()
+
+
+def get_recent_trade_returns(limit: int = 50) -> list[float]:
+    """Return recent closed-trade returns as fractions of cost basis."""
+    conn = get_conn()
+    rows = conn.execute(
+        "SELECT pnl, fill_price, size_shares FROM trades WHERE pnl IS NOT NULL AND side = 'BUY' ORDER BY timestamp DESC LIMIT ?",
+        (limit,)
+    ).fetchall()
+    result = []
+    for r in rows:
+        cost = r["fill_price"] * r["size_shares"]
+        if cost > 0:
+            result.append(r["pnl"] / cost)
+    return result
 
 
 def upsert_wallet_stats(address: str, stats: dict) -> None:
