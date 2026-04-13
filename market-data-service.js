@@ -173,8 +173,9 @@ class MarketDataService {
       { code: "TAKER_SELL_DOMINANT", label: "선물 테이커 매도 우위 — 공격적 매도 압력" },
       { code: "LS_CROWDED_LONG",     label: "롱/숏 비율 과밀 — 추가 상승 에너지 소진" },
       { code: "OI_DROP",             label: "미결제약정 급감 — 포지션 청산 중" },
-      // v9 일봉 추세 필터
-      { code: "DAILY_DOWNTREND",    label: "일봉 MA20 < MA60 하락 추세 — 롱 진입 금지 (백테스트 실증)" },
+      // v9 추세/레짐 필터
+      { code: "DAILY_DOWNTREND",  label: "일봉 MA20 < MA60 하락 추세 — 롱 진입 금지 (백테스트 실증)" },
+      { code: "FEAR_GREED_HALT",  label: "공포탐욕 25 미만 패닉셀 구간 — 모멘텀 롱 EV 항상 음수" },
     ];
 
     this.state = {
@@ -1029,6 +1030,29 @@ class MarketDataService {
     return Array.from(bucketMap.values()).slice(-limit);
   }
 
+  /**
+   * 15분봉 — lines15m 원본 그대로 사용
+   * 기존 get30mCandles은 15m 2개 합산 → 실제로는 30분봉
+   * get15mCandles은 순수 15분봉 제공
+   */
+  get15mCandles(context, limit = 60) {
+    return context.lines15m
+      .slice()
+      .sort((a, b) =>
+        new Date(a.candleDateTimeKst || a.candleDateTime).getTime() -
+        new Date(b.candleDateTimeKst || b.candleDateTime).getTime()
+      )
+      .slice(-limit)
+      .map(c => ({
+        t: new Date(c.candleDateTimeKst || c.candleDateTime).getTime(),
+        o: Number(c.openingPrice || 0),
+        h: Number(c.highPrice    || 0),
+        l: Number(c.lowPrice     || 0),
+        c: Number(c.tradePrice   || 0),
+        v: Number(c.candleAccTradeVolume || 0),
+      }));
+  }
+
   /** BUG FIX: 구버전의 "촛불" 변수명 오타 수정 */
   get1dCandles(context, limit = 90) {
     return context.dailyCandles
@@ -1362,13 +1386,16 @@ class MarketDataService {
     const context = this.ensureContext(marketCode);
     const market24h = this.get24hStats(marketCode);
     const marketCapInfo = this.getMarketCapInfo(marketCode);
-    const candles5s = this.get5sCandles(context, 120);
-    const candles1d = this.get1dCandles(context, 90);
-    const closes5s = candles5s.map((item) => Number(item.c || 0));
+    const candles5s  = this.get5sCandles(context, 120);
+    const candles1d  = this.get1dCandles(context, 90);
+    const candles15m = this.get15mCandles(context, 60);   // ← 15분봉 추가
+    const closes5s  = candles5s.map((item) => Number(item.c || 0));
     const volumes5s = candles5s.map((item) => Number(item.v || 0));
-    const closes1d = candles1d.map((item) => Number(item.c || 0));
-    const opens1d = candles1d.map((item) => Number(item.o || 0));
-    const trades5s = candles5s.map((item) => Number(item.trades || 0));
+    const closes1d  = candles1d.map((item) => Number(item.c || 0));
+    const opens1d   = candles1d.map((item) => Number(item.o || 0));
+    const closes15m = candles15m.map((item) => Number(item.c || 0)).filter(v => v > 0);
+    const volumes15m = candles15m.map((item) => Number(item.v || 0));
+    const trades5s  = candles5s.map((item) => Number(item.trades || 0));
 
     const reasons = [];
 
@@ -1411,6 +1438,21 @@ class MarketDataService {
         ? (this.last(closes1d) - this.last(opens1d)) / Math.max(1, this.last(opens1d))
         : 0;
 
+    // ── 15분봉 MA 추세 (핵심 신호 품질 개선) ────────────
+    // 5초봉은 노이즈. 15분봉 MA가 실제 추세 방향을 정의한다.
+    // MA8 = 2시간 추세, MA21 = 5.25시간 추세
+    const ma15_8  = this.sma(closes15m, 8);   // 2h
+    const ma15_21 = this.sma(closes15m, 21);  // 5h
+    const ma15_55 = this.sma(closes15m, 55);  // 13.75h (선택적)
+    // 15m 추세: +1=상승, 0=데이터부족, -1=하락
+    const trend15m = (ma15_8 && ma15_21)
+      ? (ma15_8 > ma15_21 ? 1 : -1)
+      : 0;
+    // 15m 거래량 모멘텀: 최근 3봉 vs 이전 10봉
+    const vol15mRecent = this.average(volumes15m.slice(-3));
+    const vol15mBase   = this.average(volumes15m.slice(-13, -3));
+    const volSpike15m  = vol15mBase > 0 ? vol15mRecent / vol15mBase : 1;
+
     // RSI(14) — 과매도/과매수 신호
     const rsi = this.computeRSI(closes5s, 14);
     const rsiScore = rsi < 25 ? 18    // 극단 과매도 → 강한 반등 기회
@@ -1422,17 +1464,20 @@ class MarketDataService {
       : 0;
 
     let bullishProbability = 28;
-    if (dailyShort > dailyLong)             bullishProbability += 18;
-    if (upDayRatio >= 0.55)                 bullishProbability += 16;
-    if (ma5 > ma20 && ma20 > ma60)          bullishProbability += 18;
-    if (momentum1m > 0)                     bullishProbability += 8;
-    if (momentum2m > 0)                     bullishProbability += 10;
-    if (market24h.signedChangeRate > 0)     bullishProbability += 8;
-    if (todayBias > 0)                      bullishProbability += 5;
-    if (volatility <= 0.0015)               bullishProbability += 7;
+    if (dailyShort > dailyLong)             bullishProbability += 18;  // 일봉 장기추세
+    if (upDayRatio >= 0.55)                 bullishProbability += 16;  // 일봉 상승일 비율
+    if (trend15m === 1)                     bullishProbability += 20;  // 15분봉 상승추세 ← 핵심
+    else if (trend15m === -1)               bullishProbability -= 15;  // 15분봉 하락추세 ← 패널티
+    if (ma5 > ma20 && ma20 > ma60)          bullishProbability += 12;  // 5초봉 정배열 (비중 축소)
+    if (momentum1m > 0)                     bullishProbability += 6;
+    if (momentum2m > 0)                     bullishProbability += 7;
+    if (market24h.signedChangeRate > 0)     bullishProbability += 6;
+    if (todayBias > 0)                      bullishProbability += 4;
+    if (volatility <= 0.0015)               bullishProbability += 6;
     else if (volatility <= 0.0025)          bullishProbability += 3;
-    if (shortVolume > 0 && shortVolume < baseVolume * 1.8) bullishProbability += 5;
-    bullishProbability += rsiScore;  // RSI 반영
+    if (volSpike15m >= 1.5 && trend15m === 1) bullishProbability += 8; // 15m 거래량 폭증 + 상승추세
+    if (shortVolume > 0 && shortVolume < baseVolume * 1.8) bullishProbability += 4;
+    bullishProbability += rsiScore;
     bullishProbability = Math.max(0, Math.min(99, bullishProbability));
 
     // ── 일봉 장기 추세 하드 필터 (v9) ────────────────────
@@ -1469,20 +1514,25 @@ class MarketDataService {
         ma20 > ma60 &&
         momentum1m > 0 &&
         momentum2m > -0.0003 &&
-        volatility <= this.simulationConfig.maxVolatility5s
+        volatility <= this.simulationConfig.maxVolatility5s &&
+        trend15m >= 0   // 15분봉 하락추세면 진입 금지
       )
     ) {
       reasons.push("TREND_NOT_CONFIRMED");
     }
 
-    // 레짐 적응 임계값: 공포탐욕 지수에 따라 진입 기준 동적 조정
-    // 극단 공포(< 25): 과매도 반등 기회 → 기준 완화
-    // 극단 탐욕(> 75): FOMO 구간 → 기준 강화
+    // ── 공포탐욕 하드스탑 (v9 핵심 수정) ────────────────
+    // 극단 공포(< 25) = 패닉셀 구간. 모멘텀 롱은 구조적으로 손실.
+    // 백테스트 실증: fear/greed 12 구간 실측 승률 2~4%, EV 항상 음수
+    // "과매도 반등 기회"가 아니라 "추가 하락 가속" 구간
     const fearGreedNow = this.macroEngine?.state?.fearGreed?.value ?? 50;
+    if (fearGreedNow < 25) {
+      reasons.push("FEAR_GREED_HALT");
+    }
+
+    // 레짐 적응 임계값: 탐욕 구간에서만 기준 강화 (공포 완화 로직 제거)
     let dynamicMinBullish = this.simulationConfig.minBullishProbability;
-    if (fearGreedNow < 25)      dynamicMinBullish -= 10; // 극단 공포: 과매도 반등
-    else if (fearGreedNow < 40) dynamicMinBullish -= 5;  // 공포: 약간 완화
-    else if (fearGreedNow > 75) dynamicMinBullish += 8;  // 극단 탐욕: 강화
+    if (fearGreedNow > 75)      dynamicMinBullish += 8;  // 극단 탐욕: 과열 경계
     else if (fearGreedNow > 60) dynamicMinBullish += 4;  // 탐욕: 약간 강화
     dynamicMinBullish = Math.max(45, Math.min(80, dynamicMinBullish));
 

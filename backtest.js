@@ -100,13 +100,14 @@ function getUpDayRatio(dailyCandles) {
   return up / dailyCandles.length;
 }
 
-async function fetchCandles(market, totalCount = TOTAL_CANDLES) {
+// toDate: "2024-11-15T00:00:00Z" 형식으로 특정 과거 시점부터 수집
+async function fetchCandles(market, totalCount = TOTAL_CANDLES, toDate = null) {
   const all = [];
-  let to = null;
+  let to = toDate;
   let retries = 0;
 
   while (all.length < totalCount) {
-    const url = `https://api.upbit.com/v1/candles/minutes/1?market=${market}&count=${CANDLES_PER_FETCH}${to ? `&to=${to}` : ""}`;
+    const url = `https://api.upbit.com/v1/candles/minutes/1?market=${market}&count=${CANDLES_PER_FETCH}${to ? `&to=${encodeURIComponent(to)}` : ""}`;
     try {
       const res  = await fetch(url);
       if (!res.ok) { await sleep(600); continue; }
@@ -334,12 +335,18 @@ async function gridSearch(market, candles, dailyTrend, upDayRatio) {
 
 // ─── 메인 ────────────────────────────────────────────────
 
-async function main() {
-  console.log("═══════════════════════════════════════════════════");
-  console.log("  ATS 백테스트 엔진 v1");
-  console.log(`  마켓: ${MARKETS.join(", ")}`);
-  console.log(`  데이터: 1분봉 × ${TOTAL_CANDLES}개 (~${(TOTAL_CANDLES/60).toFixed(0)}시간)`);
-  console.log("═══════════════════════════════════════════════════");
+// 불장/하락장 두 구간에서 동일 파라미터 검증
+// 불장: 2024-11-15 (BTC 사상최고가 직전 상승기)
+// 현재: 현재 시점 (하락장)
+const EPOCHS = [
+  { label: "🔴 현재 (하락장)", toDate: null },
+  { label: "🟢 2024-11 불장",  toDate: "2024-11-15T00:00:00Z" },
+];
+
+async function runEpoch(label, toDate) {
+  console.log(`\n${"═".repeat(51)}`);
+  console.log(`  구간: ${label}`);
+  console.log(`${"═".repeat(51)}`);
 
   const allBests = [];
 
@@ -348,7 +355,7 @@ async function main() {
     let candles, dailyCandles;
     try {
       [candles, dailyCandles] = await Promise.all([
-        fetchCandles(market, TOTAL_CANDLES),
+        fetchCandles(market, TOTAL_CANDLES, toDate),
         fetchDailyCandles(market),
       ]);
     } catch (e) {
@@ -396,9 +403,46 @@ async function main() {
     console.log(`  stopLossRate:          ${(parseFloat(avgStop)/100).toFixed(4)} (${avgStop}%)`);
     console.log(`  실측 평균 승률:         ${avgWinRate}%`);
     console.log(`  실측 평균 샤프:         ${avgSharpe}`);
-    console.log("\n  → 위 값으로 market-data-service.js 파라미터 업데이트 권장");
+    console.log("\n  → 불장 구간에서 양수 EV 확인 시 해당 파라미터로 업데이트");
   } else {
     console.log("\n  유효한 결과 없음 — 데이터 부족 또는 시장 조건 불리");
+  }
+
+  return allBests;
+}
+
+async function main() {
+  console.log("═══════════════════════════════════════════════════");
+  console.log("  ATS 백테스트 엔진 v2 — 구간 비교");
+  console.log(`  마켓: ${MARKETS.join(", ")}`);
+  console.log(`  데이터: 1분봉 × ${TOTAL_CANDLES}개 (~${(TOTAL_CANDLES/60).toFixed(0)}시간) × 2구간`);
+  console.log("═══════════════════════════════════════════════════");
+
+  const results = {};
+  for (const { label, toDate } of EPOCHS) {
+    results[label] = await runEpoch(label, toDate);
+    await sleep(500);
+  }
+
+  // ── 구간 비교 요약
+  console.log("\n\n" + "═".repeat(51));
+  console.log("  📊 구간 비교 요약");
+  console.log("═".repeat(51));
+  for (const [label, bests] of Object.entries(results)) {
+    const posEV = bests.filter(b => b.result.ev > 0).length;
+    const avgEV = bests.length
+      ? (bests.reduce((s, b) => s + b.result.ev, 0) / bests.length).toFixed(4)
+      : "N/A";
+    const avgWR = bests.length
+      ? (bests.reduce((s, b) => s + b.result.winRate, 0) / bests.length).toFixed(1)
+      : "N/A";
+    console.log(`\n  ${label}`);
+    console.log(`    EV+ 마켓: ${posEV}/${bests.length}개 | 평균 EV: ${avgEV}% | 평균 승률: ${avgWR}%`);
+    for (const b of bests) {
+      const ev = b.result.ev;
+      const icon = ev > 0 ? "✓" : "✗";
+      console.log(`    ${icon} ${b.market}: EV ${ev}% | 승률 ${b.result.winRate}% | 샤프 ${b.result.sharpe}`);
+    }
   }
 }
 
