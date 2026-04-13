@@ -13,6 +13,7 @@
     "node": ">=18.0.0"
   },
   "dependencies": {
+    "dotenv": "^17.4.2",
     "jsonwebtoken": "^9.0.3",
     "uuid": "^13.0.0"
   }
