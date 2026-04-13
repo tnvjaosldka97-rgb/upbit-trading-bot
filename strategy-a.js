@@ -14,7 +14,8 @@
  * 4) 동시 1포지션만 (집중)
  */
 
-const MARKETS      = ["KRW-BTC", "KRW-ETH"];
+// 백테스트 2구간 검증: ETH는 불장/하락장 모두 EV 음수 → BTC만 트레이드
+const MARKETS      = ["KRW-BTC"];
 const TARGET_RATE  = 0.035;              // +3.5% gross
 const NET_TARGET   = TARGET_RATE - 0.00139; // 수수료 차감 순이익
 const STOP_RATE    = -0.015;             // -1.5%
