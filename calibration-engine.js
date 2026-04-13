@@ -21,8 +21,8 @@ class CalibrationEngine {
     this.mds = marketDataService;
 
     this.ROLLING_WINDOW       = options.rollingWindow       || 200;  // 최근 N건만 사용
-    this.MIN_TRADES_FOR_OUTPUT = options.minTradesForOutput || 30;   // 출력 최소 조건
-    this.OUTCOME_WINDOW_MS    = options.outcomeWindowMs     || 30 * 60 * 1000; // 30분
+    this.MIN_TRADES_FOR_OUTPUT = options.minTradesForOutput || 20;   // 출력 최소 조건 (30→20)
+    this.OUTCOME_WINDOW_MS    = options.outcomeWindowMs     || 20 * 60 * 1000; // 20분 (30→20)
     this.KELLY_FRACTION       = options.kellyFraction       || 0.25; // quarter Kelly
 
     this.state = {

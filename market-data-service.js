@@ -76,10 +76,10 @@ class MarketDataService {
       useVolatilityTargets: true,
       volTargetMult: 3.3,               // target = 3.3σ  (백테스트 정렬)
       volStopMult: 1.0,                 // stop = 1.0σ
-      minTargetGross: 0.008,            // 하한: 0.8%  (구버전 0.5%)
+      minTargetGross: 0.006,            // 하한: 0.6%
       maxTargetGross: 0.025,            // 상한: 2.5%
       minStopRate: -0.005,              // 하한: -0.5%
-      maxStopRate: -0.003,              // 상한: -0.30% (구버전 -0.15%)
+      maxStopRate: -0.002,              // 상한: -0.20%
 
       cooldownAfterStopMs: 10 * 60 * 1000,   // 10분 (구버전 25분)
       profitPauseMs: 15 * 60 * 1000,         // 15분 (구버전 45분)
