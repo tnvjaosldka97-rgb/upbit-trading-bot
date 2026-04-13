@@ -89,15 +89,29 @@ class DashboardServer {
         halted:           sim?.daily?.halted || false,
       },
       calibration: {
-        mode:        cal?.mode || "-",
-        completed:   cal?.totalCompleted || 0,
-        winRate:     cal?.currentWinRate != null
+        mode:           cal?.mode || "-",
+        completed:      cal?.totalCompleted || 0,
+        winRate:        cal?.currentWinRate != null
           ? (cal.currentWinRate * 100).toFixed(1) + "%" : "-",
-        ev:          cal?.calibratedConfig?.ev != null
+        onlineWinRate:  cal?.onlineWinRate != null
+          ? (cal.onlineWinRate * 100).toFixed(1) + "%" : "-",
+        ev:             cal?.calibratedConfig?.ev != null
           ? (cal.calibratedConfig.ev * 100).toFixed(3) + "%" : "-",
-        kelly:       cal?.calibratedConfig?.kellyFraction != null
+        kelly:          cal?.calibratedConfig?.kellyFraction != null
           ? (cal.calibratedConfig.kellyFraction * 100).toFixed(1) + "%" : "-",
-        evPositive:  cal?.calibratedConfig?.evPositive || false,
+        evPositive:     cal?.calibratedConfig?.evPositive || false,
+      },
+      perf: {
+        sharpe:    sim?.sharpeRatio != null ? sim.sharpeRatio.toFixed(2) : "-",
+        fearGreed: bot.macroEngine?.state?.fearGreed?.value ?? "-",
+        regime:    (() => {
+          const fg = bot.macroEngine?.state?.fearGreed?.value ?? 50;
+          if (fg < 25) return "극단공포";
+          if (fg < 45) return "공포";
+          if (fg < 55) return "중립";
+          if (fg < 75) return "탐욕";
+          return "극단탐욕";
+        })(),
       },
       topCandidates: snapshots.slice(0, 3).map((s) => ({
         market:      s.market,
@@ -177,9 +191,16 @@ class DashboardServer {
     <div class="card ${cal.evPositive ? 'green' : 'yellow'}">
       <h3>캘리브레이션</h3>
       <div class="big">${cal.completed}건</div>
-      <p>모드: ${cal.mode}</p>
-      <p>승률: ${cal.winRate} | EV: ${cal.ev}</p>
-      <p>켈리: ${cal.kelly} | EV+: <span class="badge ${cal.evPositive ? 'ok' : 'warn'}">${cal.evPositive ? '양수' : '음수'}</span></p>
+      <p>실시간 승률(EMA): ${cal.onlineWinRate} | 누적 승률: ${cal.winRate}</p>
+      <p>EV: ${cal.ev} | 켈리: ${cal.kelly}</p>
+      <p>EV+: <span class="badge ${cal.evPositive ? 'ok' : 'warn'}">${cal.evPositive ? '양수' : '음수'}</span></p>
+    </div>
+
+    <div class="card">
+      <h3>퍼포먼스</h3>
+      <div class="big">${d.perf.sharpe}</div>
+      <p>샤프 비율 (연환산)</p>
+      <p>시장 레짐: <span class="badge ${d.perf.fearGreed < 25 ? 'warn' : d.perf.fearGreed > 75 ? 'warn' : 'ok'}">${d.perf.regime}</span> (${d.perf.fearGreed})</p>
     </div>
 
     ${posHtml}

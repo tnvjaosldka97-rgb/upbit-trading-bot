@@ -15,6 +15,7 @@ def check_all(
     signal: Signal | None,
     portfolio: PortfolioState,
     market: Market | None,
+    store=None,
 ) -> tuple[bool, str]:
     """
     Run all risk checks. Returns (allowed, rejection_reason).
@@ -63,16 +64,27 @@ def check_all(
         # Don't reject, but caller should halve size (enforced in gateway)
         pass  # handled separately in gateway.py
 
-    # 8. Category concentration (simplified — full version uses taxonomy)
-    if market:
+    # 8. Category concentration — per-category using market store lookup
+    if market and market.category:
         category = market.category
-        category_notional = sum(
-            p.notional_usd for p in portfolio.positions.values()
-            # In production: look up market category for each position
-        )
-        # Approximate: total portfolio notional * max_category_pct
-        if category_notional > portfolio.bankroll * config.MAX_CATEGORY_PCT:
-            return False, f"CATEGORY LIMIT: {category} exposure too high"
+        if store is not None:
+            category_notional = sum(
+                p.notional_usd for p in portfolio.positions.values()
+                if (m := store.get_market(p.condition_id)) and m.category == category
+            )
+        else:
+            # Fallback: count only current market's existing exposure
+            category_notional = sum(
+                p.notional_usd for p in portfolio.positions.values()
+                if p.condition_id == order.condition_id
+            )
+        new_category_notional = category_notional + order.size_usd
+        max_category_notional = portfolio.bankroll * config.MAX_CATEGORY_PCT
+        if new_category_notional > max_category_notional:
+            return False, (
+                f"CATEGORY LIMIT: {category!r} "
+                f"${new_category_notional:.0f} > ${max_category_notional:.0f}"
+            )
 
     return True, "ok"
 

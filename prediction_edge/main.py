@@ -39,19 +39,154 @@ from signals.relation_builder import RelationGraphManager
 from execution.gateway import ExecutionGateway
 from execution.reconciler import PositionReconciler
 from sizing.kelly import compute_kelly
-from core.models import Order, AggregatedSignal, Signal
+from core.models import Order, AggregatedSignal, Signal, Fill, Position, OrderBook
+from mm.market_maker import MarketMakerLoop
 import config
 
 
+async def fill_consumer(fill_bus: asyncio.Queue, portfolio: PortfolioState, store: MarketStore):
+    """Update portfolio state from every fill. This is what keeps positions and bankroll accurate."""
+    while True:
+        try:
+            fill = await asyncio.wait_for(fill_bus.get(), timeout=1.0)
+        except asyncio.TimeoutError:
+            continue
+
+        if not isinstance(fill, Fill):
+            continue
+
+        key = fill.token_id
+        if fill.side == "BUY":
+            if key in portfolio.positions:
+                existing = portfolio.positions[key]
+                total_shares = existing.size_shares + fill.fill_size
+                avg_price = (
+                    (existing.avg_entry_price * existing.size_shares + fill.fill_price * fill.fill_size)
+                    / total_shares
+                )
+                portfolio.positions[key] = existing.model_copy(update={
+                    "size_shares": total_shares,
+                    "avg_entry_price": avg_price,
+                    "current_price": fill.fill_price,
+                })
+            else:
+                market = store.get_market(fill.condition_id)
+                portfolio.positions[key] = Position(
+                    condition_id=fill.condition_id,
+                    token_id=fill.token_id,
+                    side="BUY",
+                    size_shares=fill.fill_size,
+                    avg_entry_price=fill.fill_price,
+                    current_price=fill.fill_price,
+                    dispute_risk_at_entry=market.dispute_risk if market else 0.0,
+                )
+            portfolio.bankroll -= fill.fill_price * fill.fill_size + fill.fee_paid
+        elif fill.side == "SELL":
+            if key in portfolio.positions:
+                existing = portfolio.positions[key]
+                new_size = existing.size_shares - fill.fill_size
+                if new_size <= 0.001:
+                    realized = (fill.fill_price - existing.avg_entry_price) * existing.size_shares
+                    portfolio.realized_pnl += realized - fill.fee_paid
+                    del portfolio.positions[key]
+                else:
+                    portfolio.positions[key] = existing.model_copy(update={
+                        "size_shares": new_size,
+                        "current_price": fill.fill_price,
+                    })
+            portfolio.bankroll += fill.fill_price * fill.fill_size - fill.fee_paid
+
+        # Update peak value for drawdown tracking
+        if portfolio.total_value > portfolio.peak_value:
+            portfolio.peak_value = portfolio.total_value
+
+
+async def position_price_updater(portfolio: PortfolioState, store: MarketStore):
+    """Keep position current_prices fresh so unrealized PnL is accurate."""
+    while True:
+        await asyncio.sleep(30)
+        for token_id, pos in list(portfolio.positions.items()):
+            mid = store.get_mid_price(token_id)
+            if mid:
+                portfolio.positions[token_id] = pos.model_copy(update={"current_price": mid})
+
+
+async def market_maker_manager(store: MarketStore, gateway: ExecutionGateway, portfolio: PortfolioState):
+    """Start/stop MM loops per market based on eligibility. Re-evaluates every 10 minutes."""
+    active_loops: dict[str, MarketMakerLoop] = {}
+    active_tasks: dict[str, asyncio.Task] = {}
+
+    while True:
+        await asyncio.sleep(600)
+        try:
+            eligible: dict[str, str] = {}  # token_id → condition_id
+            for m in store.get_active_markets():
+                if m.volume_24h < config.MM_MIN_VOLUME_24H:
+                    continue
+                if m.days_to_resolution < (config.MM_MIN_HOURS_TO_EXPIRY / 24):
+                    continue
+                if m.dispute_risk > config.ORACLE_DISPUTE_THRESHOLD_SKIP:
+                    continue
+                yes = m.yes_token
+                if yes:
+                    eligible[yes.token_id] = m.condition_id
+
+            # Start new loops
+            for token_id, condition_id in eligible.items():
+                if token_id not in active_loops:
+                    market = store.get_market(condition_id)
+                    if not market:
+                        continue
+                    loop = MarketMakerLoop(
+                        market=market,
+                        token_id=token_id,
+                        portfolio=portfolio,
+                        gateway=gateway,
+                        market_store=store,
+                    )
+                    task = asyncio.create_task(loop.run(), name=f"mm_{token_id[:8]}")
+                    active_loops[token_id] = loop
+                    active_tasks[token_id] = task
+                    log.info(f"[MM] Started: {market.question[:50]}")
+
+            # Stop ineligible loops
+            for token_id in list(active_loops):
+                if token_id not in eligible:
+                    active_loops[token_id].stop()
+                    active_tasks[token_id].cancel()
+                    del active_loops[token_id]
+                    del active_tasks[token_id]
+                    log.info(f"[MM] Stopped: {token_id[:8]}")
+
+        except Exception as e:
+            log.error(f"MM manager error: {e}")
+
+
 async def market_refresh_loop(store: MarketStore):
-    """REST market refresh every 60s (WebSocket handles real-time updates)."""
+    """REST market refresh every 60s. Also synthesizes orderbooks so signals work without WebSocket."""
     while True:
         try:
             markets = await fetch_active_markets(limit=500)
             for m in markets:
                 m.dispute_risk = score_oracle_dispute_risk(m)
             await store.update_markets(markets)
-            log.info(f"[REST] Market store refreshed: {len(markets)} markets")
+
+            # Populate orderbooks from REST prices (WebSocket fallback)
+            # Spread is approximate but lets all signal generators run
+            synth_count = 0
+            for m in markets:
+                for t in m.tokens:
+                    if t.price > 0:
+                        half_spread = max(0.005, round(t.price * 0.01, 4))
+                        book = OrderBook(
+                            token_id=t.token_id,
+                            bids=[(round(max(0.01, t.price - half_spread), 4), 500.0)],
+                            asks=[(round(min(0.99, t.price + half_spread), 4), 500.0)],
+                        )
+                        await store.update_orderbook(book)
+                        synth_count += 1
+
+            log.info(f"[REST] Market store refreshed: {len(markets)} markets, {synth_count} orderbooks")
         except Exception as e:
             log.error(f"Market refresh error: {e}")
         await asyncio.sleep(60)
@@ -157,6 +292,34 @@ async def process_aggregated_signals(
                 f"| fee=${fill.fee_paid:.3f}"
             )
 
+            # Internal arb: immediately submit the NO leg after YES fills
+            if strategy == "internal_arb" and market and market.no_token:
+                no_token = market.no_token
+                no_book = store.get_orderbook(no_token.token_id)
+                if no_book and not no_book.is_stale() and no_book.best_ask > 0:
+                    no_order = Order(
+                        condition_id=condition_id,
+                        token_id=no_token.token_id,
+                        side="BUY",
+                        price=no_book.best_ask,
+                        size_usd=size_usd,
+                        order_type="FOK",
+                        strategy="internal_arb",
+                    )
+                    no_fill = await gateway.submit(no_order, signal=None, market=market)
+                    if no_fill:
+                        portfolio.trade_count += 1
+                        log.info(
+                            f"[INTERNAL ARB] Both legs filled: "
+                            f"YES@{fill.fill_price:.4f} NO@{no_fill.fill_price:.4f} "
+                            f"net_gap={1.0 - fill.fill_price - no_fill.fill_price:.4f}"
+                        )
+                    else:
+                        log.warning(
+                            f"[INTERNAL ARB] YES filled but NO leg missed — "
+                            f"naked YES on {token_id[:8]}"
+                        )
+
 
 async def main():
     log.info("=" * 60)
@@ -180,7 +343,7 @@ async def main():
     fill_bus: asyncio.Queue = asyncio.Queue(maxsize=500)
 
     # Init execution gateway + reconciler
-    gateway = ExecutionGateway(portfolio, fill_bus)
+    gateway = ExecutionGateway(portfolio, fill_bus, store=store)
     reconciler = PositionReconciler(portfolio, gateway.get_clob)
     gateway.set_reconciler(reconciler)
 
@@ -242,6 +405,15 @@ async def main():
             name="execution"
         ),
 
+        # Fill consumer: updates portfolio.positions + bankroll from every fill
+        asyncio.create_task(fill_consumer(fill_bus, portfolio, store), name="fill_consumer"),
+
+        # Keep position prices fresh for accurate PnL
+        asyncio.create_task(position_price_updater(portfolio, store), name="price_updater"),
+
+        # Market making manager: starts/stops MM loops per eligible market
+        asyncio.create_task(market_maker_manager(store, gateway, portfolio), name="mm_manager"),
+
         # Position/balance reconciler (syncs local state with CLOB truth)
         asyncio.create_task(reconciler.start(), name="reconciler"),
     ]
@@ -273,7 +445,7 @@ async def main():
 
     log.info(f"System running with {len(tasks)} tasks. Ctrl+C to stop.")
     log.info(f"Strategies: oracle_convergence, fee_arb, closing_convergence, "
-             f"order_flow, correlated_arb, on_chain_copy")
+             f"order_flow, correlated_arb, on_chain_copy, market_making")
 
     try:
         await asyncio.gather(*tasks)

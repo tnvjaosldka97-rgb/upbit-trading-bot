@@ -168,6 +168,13 @@ class CalibrationEngine {
         this.state.stats.totalCompleted++;
         if (p.outcome === "WIN") this.state.stats.wins++;
         else                     this.state.stats.losses++;
+
+        // 온라인 EMA 캘리브레이션 — 30건 기다리지 않고 즉시 반영
+        const isWin = p.outcome === "WIN" ? 1 : 0;
+        const alpha = this.state.stats.totalCompleted < 10 ? 0.3 : 0.1;
+        this.state.onlineWinRate = this.state.onlineWinRate == null
+          ? isWin
+          : this.state.onlineWinRate * (1 - alpha) + isWin * alpha;
       } else {
         pending.push(p);
       }
@@ -348,6 +355,7 @@ class CalibrationEngine {
       totalObserved:   this.state.stats.totalObserved,
       pendingCount:    this.state.pendingOutcomes.length,
       currentWinRate:  done > 0 ? this.state.stats.wins / done : null,
+      onlineWinRate:   this.state.onlineWinRate ?? null,  // EMA 실시간 승률
       readyForLive:    done >= this.MIN_TRADES_FOR_OUTPUT,
       calibratedConfig: cal ? {
         winRate:       cal.observedWinRate,

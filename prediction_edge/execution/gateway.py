@@ -46,9 +46,10 @@ class TokenBucket:
 
 
 class ExecutionGateway:
-    def __init__(self, portfolio: PortfolioState, fill_bus: asyncio.Queue):
+    def __init__(self, portfolio: PortfolioState, fill_bus: asyncio.Queue, store=None):
         self._portfolio = portfolio
         self._fill_bus = fill_bus
+        self._store = store
         self._rate_limiter = TokenBucket(config.CLOB_ORDERS_PER_MIN)
         self._clob_client = None
         self._submitted_count = 0
@@ -100,7 +101,7 @@ class ExecutionGateway:
             return None
 
         # 2. Risk pre-flight
-        allowed, reason = check_all(order, signal, self._portfolio, market)
+        allowed, reason = check_all(order, signal, self._portfolio, market, store=self._store)
         if not allowed:
             self._rejected_count += 1
             log.warning(f"Order REJECTED [{reason}]: {order.strategy} {order.side} {order.token_id[:8]}")
@@ -123,7 +124,9 @@ class ExecutionGateway:
         register_inflight(order.token_id, order.side)
 
         if config.DRY_RUN:
-            return self._simulate_fill(order)
+            fill = self._simulate_fill(order)
+            await self._fill_bus.put(fill)
+            return fill
 
         return await self._submit_live(order, signal)
 
@@ -239,6 +242,86 @@ class ExecutionGateway:
                         return None
 
         return None
+
+    async def submit_quote(self, order: Order) -> tuple[Optional[Fill], Optional[str]]:
+        """
+        Submit a market making quote. Bypasses duplicate detection (MM replaces quotes intentionally).
+        Returns (fill_or_none, order_id_or_none) so the MM can track open quotes for cancellation.
+        """
+        allowed, reason = check_all(order, None, self._portfolio, None, store=self._store)
+        if not allowed:
+            log.debug(f"MM quote rejected: {reason}")
+            return None, None
+
+        await self._rate_limiter.acquire()
+
+        if config.DRY_RUN:
+            fill = self._simulate_fill(order)
+            await self._fill_bus.put(fill)
+            return fill, fill.order_id
+
+        if not self._clob_client:
+            self._init_clob_client()
+        if not self._clob_client:
+            return None, None
+
+        try:
+            from py_clob_client.clob_types import OrderArgs
+            args = OrderArgs(
+                token_id=order.token_id,
+                price=order.price,
+                size=order.size_usd / order.price,
+                side=order.side,
+            )
+            resp = self._clob_client.create_and_post_order(args)
+            order_id = resp.get("orderID", "")
+            fill_price = float(resp.get("price", order.price))
+            size_matched = float(resp.get("sizeMatched", 0))
+
+            if size_matched > 0:
+                fee = fill_price * (1 - fill_price) * config.TAKER_FEE_RATE * size_matched
+                fill = Fill(
+                    order_id=order_id,
+                    condition_id=order.condition_id,
+                    token_id=order.token_id,
+                    side=order.side,
+                    fill_price=fill_price,
+                    fill_size=size_matched,
+                    fee_paid=fee,
+                )
+                db.insert_trade(
+                    order_id, order.condition_id, order.token_id,
+                    order.side, fill_price, size_matched, fee, order.strategy,
+                )
+                await self._fill_bus.put(fill)
+                self._submitted_count += 1
+                return fill, order_id
+
+            if order_id:
+                self._submitted_count += 1
+                return None, order_id
+
+            return None, None
+
+        except Exception as e:
+            log.error(f"MM quote submission failed: {e}")
+            return None, None
+
+    async def cancel_order(self, order_id: str) -> bool:
+        """Cancel an open order by ID."""
+        if config.DRY_RUN:
+            log.debug(f"[DRY RUN] Cancel order {order_id[:12]}")
+            return True
+
+        if not self._clob_client:
+            return False
+
+        try:
+            self._clob_client.cancel({"orderID": order_id})
+            return True
+        except Exception as e:
+            log.debug(f"Cancel {order_id[:12]} failed: {e}")
+            return False
 
     @property
     def stats(self) -> dict:

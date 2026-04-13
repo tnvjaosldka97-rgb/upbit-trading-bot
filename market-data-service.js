@@ -251,6 +251,8 @@ class MarketDataService {
         halted: false,
         haltReason: null,
       },
+      // v9: 샤프 비율 계산용 거래별 수익률 (최근 100건)
+      tradeReturns: [],
     };
   }
 
@@ -1095,6 +1097,34 @@ class MarketDataService {
     return Number(values[index] || 0);
   }
 
+  // RSI(n) — Wilder 평활 방식
+  // 과매도(< 35): 반등 기회 / 과매수(> 65): 고점 위험
+  computeRSI(closes, period = 14) {
+    if (closes.length < period + 1) return 50;
+    let gains = 0, losses = 0;
+    for (let i = closes.length - period; i < closes.length; i++) {
+      const diff = closes[i] - closes[i - 1];
+      if (diff > 0) gains += diff;
+      else losses -= diff;
+    }
+    const avgGain = gains / period;
+    const avgLoss = losses / period;
+    if (avgLoss === 0) return 99;
+    const rs = avgGain / avgLoss;
+    return 100 - (100 / (1 + rs));
+  }
+
+  // 샤프 비율 (연환산, 거래 수익률 배열 기반)
+  computeSharpe(returns) {
+    if (returns.length < 5) return null;
+    const avg = returns.reduce((s, r) => s + r, 0) / returns.length;
+    const variance = returns.reduce((s, r) => s + (r - avg) ** 2, 0) / returns.length;
+    const std = Math.sqrt(variance);
+    if (std === 0) return null;
+    // 하루 평균 6거래 기준 연환산 (6 × 252 = 1512)
+    return (avg / std) * Math.sqrt(1512);
+  }
+
   ema(prev, next, alpha) {
     if (!Number.isFinite(prev) || prev === 0) return Number(next || 0);
     return prev * (1 - alpha) + Number(next || 0) * alpha;
@@ -1379,6 +1409,16 @@ class MarketDataService {
         ? (this.last(closes1d) - this.last(opens1d)) / Math.max(1, this.last(opens1d))
         : 0;
 
+    // RSI(14) — 과매도/과매수 신호
+    const rsi = this.computeRSI(closes5s, 14);
+    const rsiScore = rsi < 25 ? 18    // 극단 과매도 → 강한 반등 기회
+      : rsi < 35  ? 12
+      : rsi < 45  ?  5
+      : rsi > 80  ? -15   // 극단 과매수 → 고점 위험
+      : rsi > 70  ?  -8
+      : rsi > 60  ?  -3
+      : 0;
+
     let bullishProbability = 28;
     if (dailyShort > dailyLong)             bullishProbability += 18;
     if (upDayRatio >= 0.55)                 bullishProbability += 16;
@@ -1387,9 +1427,10 @@ class MarketDataService {
     if (momentum2m > 0)                     bullishProbability += 10;
     if (market24h.signedChangeRate > 0)     bullishProbability += 8;
     if (todayBias > 0)                      bullishProbability += 5;
-    if (volatility <= 0.0015)               bullishProbability += 7;  // v4: 더 엄격
+    if (volatility <= 0.0015)               bullishProbability += 7;
     else if (volatility <= 0.0025)          bullishProbability += 3;
-    if (shortVolume > 0 && shortVolume < baseVolume * 1.8) bullishProbability += 5;  // v4
+    if (shortVolume > 0 && shortVolume < baseVolume * 1.8) bullishProbability += 5;
+    bullishProbability += rsiScore;  // RSI 반영
     bullishProbability = Math.max(0, Math.min(99, bullishProbability));
 
     const marketCapUsd = Number(marketCapInfo?.marketCapUsd || 0);
@@ -1422,7 +1463,18 @@ class MarketDataService {
       reasons.push("TREND_NOT_CONFIRMED");
     }
 
-    if (bullishProbability < this.simulationConfig.minBullishProbability) {
+    // 레짐 적응 임계값: 공포탐욕 지수에 따라 진입 기준 동적 조정
+    // 극단 공포(< 25): 과매도 반등 기회 → 기준 완화
+    // 극단 탐욕(> 75): FOMO 구간 → 기준 강화
+    const fearGreedNow = this.macroEngine?.state?.fearGreed?.value ?? 50;
+    let dynamicMinBullish = this.simulationConfig.minBullishProbability;
+    if (fearGreedNow < 25)      dynamicMinBullish -= 10; // 극단 공포: 과매도 반등
+    else if (fearGreedNow < 40) dynamicMinBullish -= 5;  // 공포: 약간 완화
+    else if (fearGreedNow > 75) dynamicMinBullish += 8;  // 극단 탐욕: 강화
+    else if (fearGreedNow > 60) dynamicMinBullish += 4;  // 탐욕: 약간 강화
+    dynamicMinBullish = Math.max(45, Math.min(80, dynamicMinBullish));
+
+    if (bullishProbability < dynamicMinBullish) {
       reasons.push("BULLISH_PROB_LOW");
     }
 
@@ -1513,8 +1565,9 @@ class MarketDataService {
       }
     }
 
-    // 스프레드 게이트: 목표 순익의 20% 이상이 스프레드로 날아가면 진입 안 함
-    const MAX_SPREAD_RATE = this.simulationConfig.targetNetIntentRate * 0.20;
+    // 스프레드 게이트: 0.2% 고정 상한 (대부분 알트 커버)
+    // 구버전: targetNetIntentRate × 0.20 = 0.07% → 너무 좁아서 전부 차단
+    const MAX_SPREAD_RATE = 0.002;
     if (spreadRate > MAX_SPREAD_RATE) {
       reasons.push("SPREAD_TOO_WIDE");
     }
@@ -1601,7 +1654,8 @@ class MarketDataService {
       flowScore +
       macroScore +
       dataScore +
-      accelScore;
+      accelScore +
+      rsiScore;   // RSI 과매도/과매수 보정
     rawScore -= reasons.length * 8;
     rawScore = Math.max(0, Number(rawScore.toFixed(2)));
 
@@ -1962,10 +2016,37 @@ class MarketDataService {
         ? (currentPrice - position.averageBuyPrice) / position.averageBuyPrice
         : 0;
 
-    // ── 브레이크이븐 트레일링 스톱 ───────────────────
-    // +0.2% 이상 상승 시 손절가를 진입가(수수료 포함)로 이동
-    // 수익 구간에서 손절 = 확정 이익 (최소 0원 손실 보장)
-    const BREAKEVEN_TRIGGER = 0.002;  // +0.2% 도달 시 발동
+    // ── 부분 익절: 목표의 60% 도달 시 50% 청산 ────────
+    // 수익을 일부 확정하고 잔여 50%를 브레이크이븐 스톱으로 추적
+    // 기대값: 전체 WIN보다 작지만 실현 빈도가 크게 올라감
+    if (!position.partialExitDone && grossMoveRate >= position.targetGrossRate * 0.60) {
+      const halfQty   = position.quantity * 0.5;
+      const sellFee   = halfQty * currentPrice * this.simulationConfig.reservedSellFeeRate;
+      const netRecv   = halfQty * currentPrice - sellFee;
+      const halfCost  = position.totalSpentCash * 0.5;
+
+      sim.cash        += netRecv;
+      sim.realizedPnl += netRecv - halfCost;
+      sim.totalFees   += sellFee;
+
+      position.quantity        -= halfQty;
+      position.totalSpentCash  -= halfCost;
+      position.partialExitDone  = true;
+      position.partialExitPrice = currentPrice;
+
+      // 잔여 50%: 손절을 브레이크이븐으로 이동
+      const beStop = -(
+        (this.simulationConfig.reservedBuyFeeRate ?? this.simulationConfig.buyFeeRate) +
+        this.simulationConfig.marketSellFeeRate + 0.0002
+      );
+      position.dynamicStopRate   = beStop;
+      position.breakevenActivated = true;
+
+      sim.lastActionText = `${position.marketCode} 부분 익절 50% ·잔여 브레이크이븐 추적`;
+    }
+
+    // ── 브레이크이븐 트레일링 스톱 (부분 익절 없이 +0.2% 도달 시) ──
+    const BREAKEVEN_TRIGGER = 0.002;
     if (
       grossMoveRate >= BREAKEVEN_TRIGGER &&
       !position.breakevenActivated
@@ -1975,7 +2056,7 @@ class MarketDataService {
         this.simulationConfig.marketSellFeeRate
       );
       if ((position.dynamicStopRate ?? this.simulationConfig.stopLossRate) < breakEvenStop) {
-        position.dynamicStopRate = breakEvenStop;
+        position.dynamicStopRate    = breakEvenStop;
         position.breakevenActivated = true;
       }
     }
@@ -2039,6 +2120,11 @@ class MarketDataService {
     } else {
       sim.losses += 1;
     }
+
+    // v9: 샤프 비율 추적
+    sim.tradeReturns = sim.tradeReturns || [];
+    sim.tradeReturns.push(realizedRate);
+    if (sim.tradeReturns.length > 100) sim.tradeReturns.shift();
 
     // v4: 일일 서킷브레이커 통계 갱신
     sim.daily.trades += 1;
@@ -2357,6 +2443,9 @@ class MarketDataService {
       lastUpdatedAt: sim.lastUpdatedAt,
       // v4: 일일 서킷브레이커 상태
       daily: { ...sim.daily },
+      // v9: 샤프 비율
+      sharpeRatio: this.computeSharpe(sim.tradeReturns || []),
+      tradeCount: (sim.tradeReturns || []).length,
     };
   }
 

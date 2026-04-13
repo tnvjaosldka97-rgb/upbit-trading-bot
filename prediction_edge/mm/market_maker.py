@@ -145,14 +145,14 @@ class MarketMakerLoop:
         self,
         market: Market,
         token_id: str,  # which token to make markets on (YES token)
-        inventory_tracker: dict,
-        order_bus: asyncio.Queue,
+        portfolio,       # PortfolioState — for inventory + bankroll sizing
+        gateway,         # ExecutionGateway — for submit_quote + cancel_order
         market_store,
     ):
         self._market = market
         self._token_id = token_id
-        self._inventory = inventory_tracker
-        self._order_bus = order_bus
+        self._portfolio = portfolio
+        self._gateway = gateway
         self._store = market_store
         self._running = False
         self._open_bid_id: Optional[str] = None
@@ -225,8 +225,8 @@ class MarketMakerLoop:
 
         # Cancel old quotes, place new ones
         await self._cancel_all_quotes()
-        await self._place_quote("BUY", bid)
-        await self._place_quote("SELL", ask)
+        self._open_bid_id = await self._place_quote("BUY", bid)
+        self._open_ask_id = await self._place_quote("SELL", ask)
 
     def _compute_recent_std(self) -> float:
         history = news_monitor._price_history.get(self._token_id, [])
@@ -252,9 +252,21 @@ class MarketMakerLoop:
             or abs(new_ask - current_ask) > config.MM_REQUOTE_THRESHOLD
         )
 
-    async def _place_quote(self, side: str, price: float):
-        # Size = min(max_inventory, available_capital_fraction)
-        size_usd = 50.0  # $50 per quote — scaled by portfolio module in production
+    async def _place_quote(self, side: str, price: float) -> Optional[str]:
+        """Submit quote via gateway. Returns order_id or None."""
+        # Inventory-aware sizing: don't exceed MM_MAX_INVENTORY_PCT of bankroll
+        inventory = 0.0
+        pos = self._portfolio.positions.get(self._token_id)
+        if pos:
+            inventory = pos.size_shares if pos.side == "BUY" else -pos.size_shares
+
+        max_inv_usd = self._portfolio.bankroll * config.MM_MAX_INVENTORY_PCT
+        current_notional = abs(inventory) * price
+        remaining = max(0.0, max_inv_usd - current_notional)
+        size_usd = min(remaining, max_inv_usd)
+
+        if size_usd < config.MIN_ORDER_SIZE_USD:
+            return None
 
         order = Order(
             condition_id=self._market.condition_id,
@@ -265,17 +277,16 @@ class MarketMakerLoop:
             order_type="GTC",
             strategy="market_making",
         )
-        await self._order_bus.put(order)
-        log.debug(f"MM quote: {side} {price:.4f} ${size_usd} on {self._market.question[:30]}")
+        _, order_id = await self._gateway.submit_quote(order)
+        log.debug(f"MM quote: {side} {price:.4f} ${size_usd:.2f} on {self._market.question[:30]}")
+        return order_id
 
     async def _cancel_all_quotes(self):
-        # In production: send cancel orders via order_manager
-        # For now: emit cancel events
         if self._open_bid_id:
-            await self._order_bus.put({"action": "cancel", "order_id": self._open_bid_id})
+            await self._gateway.cancel_order(self._open_bid_id)
             self._open_bid_id = None
         if self._open_ask_id:
-            await self._order_bus.put({"action": "cancel", "order_id": self._open_ask_id})
+            await self._gateway.cancel_order(self._open_ask_id)
             self._open_ask_id = None
 
     def stop(self):
