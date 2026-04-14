@@ -38,6 +38,8 @@ class DashboardServer {
       if (req.url === "/health")      return this._health(res);
       if (req.url === "/api/status")  return this._status(res);
       if (req.url === "/api/stream")  return this._sse(req, res);
+      if (req.url === "/api/trades")  return this._trades(res);
+      if (req.url === "/api/trade-stats") return this._tradeStats(res);
       return this._page(res);
     });
 
@@ -88,6 +90,24 @@ class DashboardServer {
   _status(res) {
     res.writeHead(200, { "Content-Type": "application/json", "Access-Control-Allow-Origin": "*" });
     res.end(JSON.stringify(this._getData(), null, 2));
+  }
+
+  _trades(res) {
+    const trades = this.bot.tradeLogger?.getRecent(100) || [];
+    res.writeHead(200, { "Content-Type": "application/json", "Access-Control-Allow-Origin": "*" });
+    res.end(JSON.stringify(trades));
+  }
+
+  _tradeStats(res) {
+    const logger = this.bot.tradeLogger;
+    const stats = {
+      all: logger?.getStats() || {},
+      A: logger?.getStats("A") || {},
+      B: logger?.getStats("B") || {},
+      daily: logger?.getDailyPnl(30) || [],
+    };
+    res.writeHead(200, { "Content-Type": "application/json", "Access-Control-Allow-Origin": "*" });
+    res.end(JSON.stringify(stats));
   }
 
   // ── 데이터 수집 ─────────────────────────────────────────
@@ -245,6 +265,25 @@ class DashboardServer {
         pnlRate: h.realizedRate != null ? +(h.realizedRate * 100).toFixed(3) : 0,
         ts: h.exitedAt || h.closedAt || 0,
       })),
+      // ── 거래 로그 ──────────────────────────────────────────
+      recentTrades: (bot.tradeLogger?.getRecent(20) || []).map(t => ({
+        id: t.id,
+        strategy: t.strategy,
+        market: t.market,
+        side: t.side,
+        price: t.price,
+        quantity: t.quantity,
+        budget: t.budget,
+        reason: t.reason,
+        pnlRate: t.pnl_rate,
+        pnlKrw: t.pnl_krw,
+        qualityScore: t.quality_score,
+        partial: t.partial,
+        trail: t.trail,
+        dryRun: t.dry_run,
+        createdAt: t.created_at,
+      })),
+      tradeStats: bot.tradeLogger?.getStats() || {},
     };
   }
 
@@ -416,6 +455,23 @@ body{font-family:-apple-system,'SF Pro Display',sans-serif;background:var(--bg);
 .stat-line{display:flex;justify-content:space-between;font-size:.72rem;padding:2px 0}
 .sl-lbl{color:var(--muted)}
 .sl-val{font-weight:600}
+
+/* 거래 로그 */
+.trade-row{display:flex;align-items:center;gap:6px;padding:5px 6px;border-bottom:1px solid rgba(26,39,68,.4);font-size:.7rem;transition:background .1s}
+.trade-row:hover{background:rgba(255,255,255,.02)}
+.trade-row:last-child{border-bottom:none}
+.trade-side{font-size:.6rem;font-weight:800;padding:1px 5px;border-radius:3px;min-width:28px;text-align:center}
+.side-buy{color:#3b82f6;background:rgba(59,130,246,.1);border:1px solid rgba(59,130,246,.3)}
+.side-sell{color:#ef4444;background:rgba(239,68,68,.1);border:1px solid rgba(239,68,68,.3)}
+.trade-mkt{font-weight:700;color:var(--text);min-width:44px}
+.trade-price{color:var(--muted);min-width:60px;text-align:right}
+.trade-pnl{font-weight:700;min-width:48px;text-align:right}
+.trade-reason{font-size:.6rem;color:var(--muted);padding:1px 4px;border-radius:3px;background:var(--dim)}
+.trade-time{color:var(--muted);font-size:.62rem;margin-left:auto;white-space:nowrap}
+.trade-badge{font-size:.55rem;padding:0 4px;border-radius:2px;font-weight:700}
+.badge-partial{color:var(--yellow);border:1px solid rgba(245,158,11,.3)}
+.badge-trail{color:var(--cyan);border:1px solid rgba(6,182,212,.3)}
+.badge-dry{color:var(--muted);border:1px solid var(--dim)}
 
 /* 반응형 */
 @media(max-width:900px){
@@ -607,6 +663,15 @@ body{font-family:-apple-system,'SF Pro Display',sans-serif;background:var(--bg);
     <div class="sec" style="flex:1">
       <div class="sec-title">최근 거래</div>
       <div id="hist-list"></div>
+    </div>
+
+    <!-- 매수/매도 로그 -->
+    <div class="sec" style="flex:2;overflow-y:auto">
+      <div class="sec-title">
+        <span>거래 로그 (매수/매도)</span>
+        <span id="trade-stats" style="color:var(--cyan);font-weight:700">0건</span>
+      </div>
+      <div id="trade-log"></div>
     </div>
 
   </div>
@@ -1099,6 +1164,36 @@ function update(d){
       const col=h.pnlRate>=0?"var(--green)":"var(--red)";
       return \`<span style="font-size:.62rem;padding:1px 5px;border-radius:4px;background:rgba(0,0,0,.3);border:1px solid \${col};color:\${col}">\${h.market.replace("KRW-","")}&nbsp;\${h.pnlRate>=0?"+":""}\${(h.pnlRate*100).toFixed(1)}%</span>\`;
     }).join("");
+  }
+
+  // ─ 거래 로그
+  if(d.recentTrades && d.recentTrades.length){
+    c("trade-stats").textContent = (d.tradeStats?.total||0)+"건 | "+(d.tradeStats?.winRate!=null?d.tradeStats.winRate+"%":"—")+" 승률";
+    c("trade-log").innerHTML = d.recentTrades.map(t=>{
+      const isBuy = t.side==="BUY";
+      const sideClass = isBuy?"side-buy":"side-sell";
+      const sideLabel = isBuy?"매수":"매도";
+      const pnlHtml = !isBuy && t.pnlRate!=null
+        ? \`<span class="trade-pnl" style="color:\${t.pnlRate>=0?"var(--green)":"var(--red)"}">\${t.pnlRate>=0?"+":""}\${(t.pnlRate*100).toFixed(1)}%</span>\`
+        : (isBuy && t.qualityScore!=null ? \`<span class="trade-pnl" style="color:var(--purple)">Q:\${t.qualityScore}</span>\` : "");
+      const badges = [];
+      if(t.partial) badges.push('<span class="trade-badge badge-partial">부분</span>');
+      if(t.trail)   badges.push('<span class="trade-badge badge-trail">트레일</span>');
+      if(t.dryRun)  badges.push('<span class="trade-badge badge-dry">SIM</span>');
+      const reasonHtml = t.reason ? \`<span class="trade-reason">\${t.reason}</span>\` : "";
+      const timeStr = t.createdAt ? new Date(t.createdAt).toLocaleString("ko-KR",{month:"numeric",day:"numeric",hour:"2-digit",minute:"2-digit"}) : "";
+      return \`<div class="trade-row">
+        <span class="trade-side \${sideClass}">\${sideLabel}</span>
+        <span class="trade-mkt">\${t.market.replace("KRW-","")}</span>
+        <span class="trade-price">\${Math.round(t.price).toLocaleString()}</span>
+        \${pnlHtml}
+        \${reasonHtml}
+        \${badges.join("")}
+        <span class="trade-time">\${timeStr}</span>
+      </div>\`;
+    }).join("");
+  } else {
+    c("trade-log").innerHTML = '<div style="color:var(--muted);font-size:.72rem;text-align:center;padding:12px">아직 거래 기록이 없습니다</div>';
   }
 
   // ─ 자본곡선

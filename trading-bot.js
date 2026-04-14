@@ -22,6 +22,7 @@ const { DashboardServer }      = require("./dashboard-server");
 const { StrategyA }            = require("./strategy-a");
 const { StrategyB }            = require("./strategy-b");
 const { BybitFundingEngine }   = require("./bybit-funding-engine");
+const { TradeLogger }          = require("./trade-logger");
 
 try { require("dotenv").config(); } catch {}
 
@@ -54,6 +55,7 @@ class TradingBot {
     this.regimeEngine  = new RegimeEngine();
     this.fundingEngine = new BybitFundingEngine();
     this.upbitWs       = new UpbitWebSocket();
+    this.tradeLogger   = new TradeLogger("./trades.db");
     this._wsBtcPrice  = null;   // WS 실시간 BTC 가격
 
     // ── Strategy A/B ─────────────────────────────────
@@ -69,8 +71,9 @@ class TradingBot {
     });
     this.strategyB = new StrategyB({
       ...opts,
-      dataEngine:   this.dataEngine,   // DataEngine 연동 → 중복 폴링 제거
+      dataEngine:    this.dataEngine,   // DataEngine 연동 → 중복 폴링 제거
       initialCapital: CAPITAL_B,
+      tradeLogger:   this.tradeLogger,
     });
 
     // 실거래 포지션 (구 MDS 기반, 참조용 유지)
@@ -464,6 +467,7 @@ class TradingBot {
     this.dataEngine.stop();
     this.strategyA.stop();
     this.strategyB.stop();
+    this.tradeLogger.close();
 
     if (this.livePosition && !DRY_RUN && this.orderService.getSummary().hasApiKeys) {
       console.log("[Bot] 포지션 청산 중...");

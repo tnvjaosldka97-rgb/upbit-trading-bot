@@ -34,11 +34,12 @@ const QUALITY_THRESHOLD   = 35;           // CoinGecko 품질 점수 미만 → 
 const STABLECOINS = new Set(["USDT","USDC","DAI","BUSD","TUSD","FDUSD","PYUSD","USDD","FRAX"]);
 
 class StrategyB {
-  constructor({ orderService, dataEngine, initialCapital, dryRun }) {
+  constructor({ orderService, dataEngine, initialCapital, dryRun, tradeLogger }) {
     this.orderService   = orderService;
     this.dataEngine     = dataEngine;   // DataEngine 연동 (선택적)
     this.dryRun         = dryRun ?? true;
     this.initialCapital = initialCapital;
+    this._logger        = tradeLogger || null;
 
     // 독립 폴링용 (DataEngine 없을 때 폴백)
     this.knownMarkets = new Set();
@@ -205,6 +206,11 @@ class StrategyB {
         `[B] 부분청산(WS) +${(move * 100).toFixed(1)}% — ${market} ` +
         `50% 매도, 스탑→브레이크이븐, 트레일링 ${TRAIL_PCT * 100}% 시작`
       );
+      this._logger?.logSell({
+        strategy: "B", market, price, quantity: pos.quantity, budget: half,
+        reason: "부분청산(+15%)", pnlRate: move, pnlKrw: halfPnl,
+        partial: true, trail: false, dryRun: this.dryRun,
+      });
       this._updateDetection(market, `+${(move * 100).toFixed(1)}% 부분청산`);
     }
 
@@ -240,6 +246,11 @@ class StrategyB {
       const det = this.detections.find(d => d.market === market);
       if (det) { det.status = `청산(${reason})`; det.finalPnl = +(pnlRate * 100).toFixed(1); }
 
+      this._logger?.logSell({
+        strategy: "B", market, price, quantity: pos.quantity, budget: pos.budget,
+        reason, pnlRate, pnlKrw: pnlKrw,
+        partial: false, trail: pos.trailActive, dryRun: this.dryRun,
+      });
       console.log(
         `[B] 청산(${reason})(WS) — ${market} ` +
         `${pnlRate >= 0 ? "+" : ""}${(pnlRate * 100).toFixed(1)}%`
@@ -329,6 +340,13 @@ class StrategyB {
 
     console.log(`[B] 진입 — ${market} @${price.toLocaleString()} 목표:+30% 손절:-8% 트레일:${TRAIL_PCT * 100}%`);
 
+    // 매수 로그
+    this._logger?.logBuy({
+      strategy: "B", market, price, quantity: pos.quantity, budget,
+      qualityScore: quality.score, qualityFlags: quality.flags,
+      dryRun: this.dryRun,
+    });
+
     // 실거래
     if (!this.dryRun && this.orderService?.getSummary().hasApiKeys) {
       try {
@@ -402,6 +420,11 @@ class StrategyB {
         `[B] 부분청산(+${(move * 100).toFixed(0)}%) — ${market} ` +
         `50% 매도, 스탑→브레이크이븐, 트레일링 ${TRAIL_PCT * 100}% 시작`
       );
+      this._logger?.logSell({
+        strategy: "B", market, price: cur, quantity: pos.quantity, budget: pos.budget * 0.5,
+        reason: "부분청산(+15%)", pnlRate: move, pnlKrw: halfPnl,
+        partial: true, trail: false, dryRun: this.dryRun,
+      });
       this._updateDetection(market, `+${(move * 100).toFixed(0)}% 부분청산`);
     }
 
@@ -436,6 +459,11 @@ class StrategyB {
       const det = this.detections.find(d => d.market === market);
       if (det) { det.status = `청산(${reason})`; det.finalPnl = +(pnlRate * 100).toFixed(1); }
 
+      this._logger?.logSell({
+        strategy: "B", market, price: cur, quantity: pos.quantity, budget: pos.budget,
+        reason, pnlRate, pnlKrw: pnlKrw,
+        partial: false, trail: pos.trailActive, dryRun: this.dryRun,
+      });
       console.log(`[B] 청산(${reason}) — ${market} ${pnlRate >= 0 ? "+" : ""}${(pnlRate * 100).toFixed(1)}%`);
     }
   }
