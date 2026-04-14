@@ -28,6 +28,10 @@ const TRAIL_PCT           = 0.15;         // 부분청산 후 트레일링 폭 (
 const MAX_HOLD_MS         = 4 * 60 * 60_000;  // 4시간 타임스탑
 const BUDGET_PCT          = 0.40;         // 보유 현금의 40%
 const MAX_LISTING_AGE_MS  = 2 * 60 * 60_000; // 상장 후 2시간 이내만 진입
+const QUALITY_THRESHOLD   = 35;           // CoinGecko 품질 점수 미만 → 진입 스킵
+
+// 스테이블코인 블랙리스트
+const STABLECOINS = new Set(["USDT","USDC","DAI","BUSD","TUSD","FDUSD","PYUSD","USDD","FRAX"]);
 
 class StrategyB {
   constructor({ orderService, dataEngine, initialCapital, dryRun }) {
@@ -278,8 +282,21 @@ class StrategyB {
 
   // ── 진입 ─────────────────────────────────────────────
   async _enter(market) {
-    // 상장 직후 호가창 안정 대기 (1초)
-    await new Promise(r => setTimeout(r, 1000));
+    // 상장 직후 호가창 안정 대기(1초) + CoinGecko 품질 체크 — 병렬 실행 (레이턴시 추가 없음)
+    const [, quality] = await Promise.all([
+      new Promise(r => setTimeout(r, 1000)),
+      this._evaluateListingQuality(market),
+    ]);
+
+    if (quality.score < QUALITY_THRESHOLD) {
+      console.log(
+        `[B] 진입 스킵(품질필터) — ${market} ` +
+        `점수:${quality.score} [${quality.flags.join(",")}]`
+      );
+      this._updateDetection(market, `스킵(품질${quality.score}점)`);
+      return;
+    }
+    console.log(`[B] 품질 통과 — ${market} 점수:${quality.score} [${quality.flags.join(",")}]`);
 
     const price = await this._ticker(market);
     if (!price) {
@@ -466,6 +483,86 @@ class StrategyB {
   }
 
   // ── 유틸 ─────────────────────────────────────────────
+
+  /**
+   * CoinGecko 기반 신규상장 품질 필터
+   *
+   * 핵심 알파: 업비트 신규상장 펌핑은 "독점성"이 핵심
+   *   - 바이낸스/주요 거래소 미상장 → 한국 리테일 FOMO 폭발 → 강한 펌핑
+   *   - 이미 메이저 거래소 상장 → 독점 프리미엄 없음 → 약한 펌핑
+   *
+   * 점수 기준 (0~100):
+   *   스테이블코인     → 0   (즉시 차단)
+   *   시총 top 30     → ~15 (차단: BTC/ETH급, 이미 다 알아)
+   *   시총 top 100    → ~35 (경계선)
+   *   시총 100~300    → ~60 (진입)
+   *   시총 300위 이하  → ~75 (진입: 아직 덜 알려진 코인)
+   *   CoinGecko 미등록 → 70 (진입: 초신규 코인, FOMO 강함)
+   */
+  async _evaluateListingQuality(market) {
+    const symbol = market.replace("KRW-", "");
+
+    // 스테이블코인 즉시 차단
+    if (STABLECOINS.has(symbol)) {
+      return { score: 0, flags: ["스테이블코인"] };
+    }
+
+    try {
+      const res = await fetch(
+        `https://api.coingecko.com/api/v3/search?query=${encodeURIComponent(symbol)}`,
+        { signal: AbortSignal.timeout(3000) }
+      );
+      if (!res.ok) return { score: 60, flags: ["CoinGecko_오류"] };
+
+      const data  = await res.json();
+      const coins = data.coins || [];
+
+      // 심볼 정확 일치 우선, 없으면 첫 번째 결과
+      const match = coins.find(c => c.symbol?.toUpperCase() === symbol) || coins[0];
+
+      if (!match) {
+        // CoinGecko에 없음 = 완전 신규 코인 → 최대 FOMO 기대
+        return { score: 70, flags: ["초신규_CoinGecko미등록"] };
+      }
+
+      const rank = match.market_cap_rank;  // null 가능
+      let score  = 50;
+      const flags = [`CG:${match.name?.slice(0, 12)}`];
+
+      if (!rank) {
+        // 랭크 없음 = 매우 작은 코인 또는 신규
+        score += 20;
+        flags.push("랭크없음(소형/신규)");
+      } else if (rank <= 20) {
+        // BTC, ETH, XRP, SOL 급 — 업비트에 이미 있을 가능성, 펌핑 미미
+        score -= 35;
+        flags.push(`시총${rank}위(메가캡)`);
+      } else if (rank <= 50) {
+        score -= 20;
+        flags.push(`시총${rank}위(대형)`);
+      } else if (rank <= 100) {
+        score -= 10;
+        flags.push(`시총${rank}위(중대형)`);
+      } else if (rank <= 300) {
+        score += 5;
+        flags.push(`시총${rank}위(중형)`);
+      } else {
+        score += 20;
+        flags.push(`시총${rank}위(소형)`);
+      }
+
+      return {
+        score:  Math.max(0, Math.min(100, score)),
+        flags,
+        coinId: match.id,
+        rank,
+      };
+    } catch {
+      // 타임아웃 / 네트워크 오류 → 기본 진입 (놓치는 것보다 낫다)
+      return { score: 60, flags: ["품질체크_타임아웃"] };
+    }
+  }
+
   async _fetchMarkets() {
     try {
       const res  = await fetch("https://api.upbit.com/v1/market/all?isDetails=false");
