@@ -508,58 +508,73 @@ class StrategyB {
     }
 
     try {
-      const res = await fetch(
-        `https://api.coingecko.com/api/v3/search?query=${encodeURIComponent(symbol)}`,
-        { signal: AbortSignal.timeout(3000) }
-      );
-      if (!res.ok) return { score: 60, flags: ["CoinGecko_오류"] };
+      // CoinGecko + Binance 병렬 조회 (둘 다 3초 타임아웃)
+      const [cgResult, bnResult] = await Promise.allSettled([
+        fetch(
+          `https://api.coingecko.com/api/v3/search?query=${encodeURIComponent(symbol)}`,
+          { signal: AbortSignal.timeout(3000) }
+        ).then(r => r.ok ? r.json() : null),
+        fetch(
+          `https://api.binance.com/api/v3/ticker/price?symbol=${symbol}USDT`,
+          { signal: AbortSignal.timeout(3000) }
+        ).then(r => ({ ok: r.ok, status: r.status })),
+      ]);
 
-      const data  = await res.json();
-      const coins = data.coins || [];
+      let score = 50;
+      const flags = [];
 
-      // 심볼 정확 일치 우선, 없으면 첫 번째 결과
-      const match = coins.find(c => c.symbol?.toUpperCase() === symbol) || coins[0];
-
-      if (!match) {
-        // CoinGecko에 없음 = 완전 신규 코인 → 최대 FOMO 기대
-        return { score: 70, flags: ["초신규_CoinGecko미등록"] };
+      // ── Binance 직접 체크 (가장 정확한 독점성 지표) ─────
+      const bnData = bnResult.status === "fulfilled" ? bnResult.value : null;
+      if (bnData?.ok) {
+        // 바이낸스에 있음 → 독점 프리미엄 없음
+        score -= 25;
+        flags.push("바이낸스_상장됨");
+      } else if (bnData && !bnData.ok) {
+        // 바이낸스에 없음 → 업비트 독점 가능성!
+        score += 25;
+        flags.push("바이낸스_미상장(독점!)");
       }
+      // 네트워크 오류면 Binance 체크 스킵 (CoinGecko만으로 판단)
 
-      const rank = match.market_cap_rank;  // null 가능
-      let score  = 50;
-      const flags = [`CG:${match.name?.slice(0, 12)}`];
+      // ── CoinGecko 시총 랭크 ─────────────────────────────
+      const cgData = cgResult.status === "fulfilled" ? cgResult.value : null;
+      if (cgData) {
+        const coins = cgData.coins || [];
+        const match = coins.find(c => c.symbol?.toUpperCase() === symbol) || coins[0];
 
-      if (!rank) {
-        // 랭크 없음 = 매우 작은 코인 또는 신규
-        score += 20;
-        flags.push("랭크없음(소형/신규)");
-      } else if (rank <= 20) {
-        // BTC, ETH, XRP, SOL 급 — 업비트에 이미 있을 가능성, 펌핑 미미
-        score -= 35;
-        flags.push(`시총${rank}위(메가캡)`);
-      } else if (rank <= 50) {
-        score -= 20;
-        flags.push(`시총${rank}위(대형)`);
-      } else if (rank <= 100) {
-        score -= 10;
-        flags.push(`시총${rank}위(중대형)`);
-      } else if (rank <= 300) {
-        score += 5;
-        flags.push(`시총${rank}위(중형)`);
-      } else {
-        score += 20;
-        flags.push(`시총${rank}위(소형)`);
+        if (!match) {
+          // CoinGecko 미등록 = 초신규 코인
+          score += 15;
+          flags.push("초신규_CoinGecko미등록");
+        } else {
+          flags.push(`CG:${match.name?.slice(0, 12)}`);
+          const rank = match.market_cap_rank;
+
+          if (!rank) {
+            score += 10;
+            flags.push("랭크없음(소형)");
+          } else if (rank <= 20) {
+            score -= 20;
+            flags.push(`시총${rank}위(메가캡)`);
+          } else if (rank <= 50) {
+            score -= 10;
+            flags.push(`시총${rank}위(대형)`);
+          } else if (rank <= 100) {
+            score -= 5;
+            flags.push(`시총${rank}위(중대형)`);
+          } else if (rank > 300) {
+            score += 10;
+            flags.push(`시총${rank}위(소형)`);
+          }
+        }
       }
 
       return {
-        score:  Math.max(0, Math.min(100, score)),
+        score: Math.max(0, Math.min(100, score)),
         flags,
-        coinId: match.id,
-        rank,
       };
     } catch {
-      // 타임아웃 / 네트워크 오류 → 기본 진입 (놓치는 것보다 낫다)
-      return { score: 60, flags: ["품질체크_타임아웃"] };
+      return { score: 60, flags: ["품질체크_실패"] };
     }
   }
 
