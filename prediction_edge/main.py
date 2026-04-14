@@ -43,7 +43,10 @@ from core.models import Order, AggregatedSignal, Signal, Fill, Position, OrderBo
 from mm.market_maker import MarketMakerLoop
 from data.clob_orderbook_poller import ClobOrderbookPoller
 from signals.cross_platform_arb import CrossPlatformArbScanner
+from signals.limitless_arb import LimitlessArbScanner
 from signals.exit_signal import ExitSignalGenerator
+from signals.claude_oracle import ClaudeOracleScanner
+from signals.base_rate_oracle import BaseRateOracleScanner
 from backtest.auto_tuner import AutoTuner
 from core import db
 import config
@@ -60,51 +63,69 @@ async def fill_consumer(fill_bus: asyncio.Queue, portfolio: PortfolioState, stor
         if not isinstance(fill, Fill):
             continue
 
-        key = fill.token_id
-        if fill.side == "BUY":
-            if key in portfolio.positions:
-                existing = portfolio.positions[key]
-                total_shares = existing.size_shares + fill.fill_size
-                avg_price = (
-                    (existing.avg_entry_price * existing.size_shares + fill.fill_price * fill.fill_size)
-                    / total_shares
-                )
-                portfolio.positions[key] = existing.model_copy(update={
-                    "size_shares": total_shares,
-                    "avg_entry_price": avg_price,
-                    "current_price": fill.fill_price,
-                })
-            else:
-                market = store.get_market(fill.condition_id)
-                portfolio.positions[key] = Position(
-                    condition_id=fill.condition_id,
-                    token_id=fill.token_id,
-                    side="BUY",
-                    size_shares=fill.fill_size,
-                    avg_entry_price=fill.fill_price,
-                    current_price=fill.fill_price,
-                    dispute_risk_at_entry=market.dispute_risk if market else 0.0,
-                )
-            portfolio.bankroll -= fill.fill_price * fill.fill_size + fill.fee_paid
-        elif fill.side == "SELL":
-            if key in portfolio.positions:
-                existing = portfolio.positions[key]
-                new_size = existing.size_shares - fill.fill_size
-                realized = (fill.fill_price - existing.avg_entry_price) * fill.fill_size - fill.fee_paid
-                portfolio.realized_pnl += realized
-                db.update_pnl_for_token(key, realized)   # record for Sharpe tracking
-                if new_size <= 0.001:
-                    del portfolio.positions[key]
-                else:
+        # DRY_RUN fills: bankroll + positions already handled in gateway._simulate_fill()
+        # Skip everything except peak_value update and snapshot
+        is_dry = fill.order_id.startswith("dry_")
+
+        if not is_dry:
+            # LIVE fills: update positions and bankroll here
+            key = fill.token_id
+            if fill.side == "BUY":
+                if key in portfolio.positions:
+                    existing = portfolio.positions[key]
+                    total_shares = existing.size_shares + fill.fill_size
+                    avg_price = (
+                        (existing.avg_entry_price * existing.size_shares + fill.fill_price * fill.fill_size)
+                        / total_shares
+                    )
                     portfolio.positions[key] = existing.model_copy(update={
-                        "size_shares": new_size,
+                        "size_shares": total_shares,
+                        "avg_entry_price": avg_price,
                         "current_price": fill.fill_price,
                     })
-            portfolio.bankroll += fill.fill_price * fill.fill_size - fill.fee_paid
+                else:
+                    market = store.get_market(fill.condition_id)
+                    portfolio.positions[key] = Position(
+                        condition_id=fill.condition_id,
+                        token_id=fill.token_id,
+                        side="BUY",
+                        size_shares=fill.fill_size,
+                        avg_entry_price=fill.fill_price,
+                        current_price=fill.fill_price,
+                        dispute_risk_at_entry=market.dispute_risk if market else 0.0,
+                    )
+                portfolio.bankroll -= fill.fill_price * fill.fill_size + fill.fee_paid
+            elif fill.side == "SELL":
+                if key in portfolio.positions:
+                    existing = portfolio.positions[key]
+                    new_size = existing.size_shares - fill.fill_size
+                    realized = (fill.fill_price - existing.avg_entry_price) * fill.fill_size - fill.fee_paid
+                    portfolio.realized_pnl += realized
+                    db.update_pnl_for_token(key, realized)
+                    if new_size <= 0.001:
+                        del portfolio.positions[key]
+                    else:
+                        portfolio.positions[key] = existing.model_copy(update={
+                            "size_shares": new_size,
+                            "current_price": fill.fill_price,
+                        })
+                portfolio.bankroll += fill.fill_price * fill.fill_size - fill.fee_paid
 
         # Update peak value for drawdown tracking
         if portfolio.total_value > portfolio.peak_value:
             portfolio.peak_value = portfolio.total_value
+
+        # 체결 즉시 스냅샷 — 자산곡선 실시간 반영
+        try:
+            db.insert_snapshot(
+                total_value=portfolio.total_value,
+                bankroll=portfolio.bankroll,
+                unrealized=portfolio.unrealized_pnl,
+                realized=portfolio.realized_pnl,
+                positions=len(portfolio.positions),
+            )
+        except Exception:
+            pass
 
 
 async def position_price_updater(portfolio: PortfolioState, store: MarketStore):
@@ -112,9 +133,20 @@ async def position_price_updater(portfolio: PortfolioState, store: MarketStore):
     while True:
         await asyncio.sleep(30)
         for token_id, pos in list(portfolio.positions.items()):
-            mid = store.get_mid_price(token_id)
-            if mid:
+            # Try orderbook mid first (most accurate)
+            book = store.get_orderbook(token_id)
+            if book and not book.is_stale() and book.bids and book.asks:
+                mid = book.mid
                 portfolio.positions[token_id] = pos.model_copy(update={"current_price": mid})
+                continue
+
+            # Fallback: use Gamma API price from market store
+            market = store.get_market(pos.condition_id)
+            if market:
+                for t in market.tokens:
+                    if t.token_id == token_id and t.price > 0:
+                        portfolio.positions[token_id] = pos.model_copy(update={"current_price": t.price})
+                        break
 
 
 async def market_maker_manager(store: MarketStore, gateway: ExecutionGateway, portfolio: PortfolioState):
@@ -166,6 +198,57 @@ async def market_maker_manager(store: MarketStore, gateway: ExecutionGateway, po
 
         except Exception as e:
             log.error(f"MM manager error: {e}")
+
+
+async def snapshot_loop(portfolio: PortfolioState, initial_bankroll: float = 75.0):
+    """Portfolio 스냅샷을 5분마다 DB에 기록 + sanity check."""
+    while True:
+        await asyncio.sleep(300)
+        try:
+            tv = portfolio.total_value
+            br = portfolio.bankroll
+            pos_val = sum(p.current_price * p.size_shares for p in portfolio.positions.values())
+            n_pos = len(portfolio.positions)
+
+            # ── Sanity checks ────────────────────────────────────────────
+            # 1. total_value should equal bankroll + position_value
+            expected_tv = br + pos_val
+            if abs(tv - expected_tv) > 0.10:
+                log.error(
+                    f"[SANITY] total_value mismatch! "
+                    f"reported={tv:.2f} expected={expected_tv:.2f} "
+                    f"bankroll={br:.2f} pos_val={pos_val:.2f}"
+                )
+
+            # 2. bankroll should never be negative
+            if br < -0.01:
+                log.error(f"[SANITY] NEGATIVE BANKROLL: ${br:.2f}")
+
+            # 3. total_value shouldn't exceed 2x initial (likely bug)
+            if tv > initial_bankroll * 2:
+                log.warning(f"[SANITY] total_value suspiciously high: ${tv:.2f}")
+
+            # 4. positions should have reasonable current_price (not 0.5 default)
+            for tid, pos in portfolio.positions.items():
+                if abs(pos.current_price - 0.5) < 0.001 and abs(pos.avg_entry_price - 0.5) > 0.1:
+                    log.warning(
+                        f"[SANITY] Position {tid[:12]} has default price 0.50 "
+                        f"(entry={pos.avg_entry_price:.4f})"
+                    )
+
+            db.insert_snapshot(
+                total_value=tv,
+                bankroll=br,
+                unrealized=portfolio.unrealized_pnl,
+                realized=portfolio.realized_pnl,
+                positions=n_pos,
+            )
+            log.info(
+                f"[SNAP] ${tv:.2f} | cash=${br:.2f} pos=${pos_val:.2f} "
+                f"| dd={portfolio.drawdown:.1%} | {n_pos} positions"
+            )
+        except Exception as e:
+            log.debug(f"Snapshot error: {e}")
 
 
 async def market_refresh_loop(store: MarketStore):
@@ -341,6 +424,18 @@ async def main():
     bankroll = float(os.getenv("BANKROLL", "1000"))
     portfolio = PortfolioState(bankroll=bankroll, peak_value=bankroll)
 
+    # 시작 즉시 초기 스냅샷 — 자산곡선 첫 점 확보
+    try:
+        db.insert_snapshot(
+            total_value=portfolio.total_value,
+            bankroll=portfolio.bankroll,
+            unrealized=0.0,
+            realized=0.0,
+            positions=0,
+        )
+    except Exception:
+        pass
+
     # Market store
     store = MarketStore()
 
@@ -390,12 +485,12 @@ async def main():
     # 지갑 DB 백그라운드 빌드 태스크 등록
     asyncio.create_task(_build_wallet_db_bg(), name="wallet_db_build")
 
-    # ── CORE 3 STRATEGIES ONLY ────────────────────────────────────────────────
-    # Each strategy here has verified mathematical edge.
-    # Disabled strategies remain in codebase but are NOT running:
+    # ── ACTIVE STRATEGIES ─────────────────────────────────────────────────────
+    # Tier 1 (검증됨, 구조적 엣지): oracle_convergence, fee_arb, correlated_arb
+    # Tier 2 (실험적, 캘리브레이션 전): claude_oracle, base_rate
+    # Disabled:
     #   - ClosingConvergence: no model edge without external probability source
     #   - OrderFlowMonitor:   REST polling 60s delay, always arrives too late
-    #   - CorrelatedArb:      correlation breaks at resolution, unverified
     #   - MarketMaking:       requires real orderbook depth, not synthetic
     #   - CrossPlatformArb:   re-enable when Kalshi keys are configured
     # ─────────────────────────────────────────────────────────────────────────
@@ -421,10 +516,42 @@ async def main():
             name="exit_signals"
         ),
 
-        # Cross-platform arb: active only when Kalshi keys are set
+        # Strategy 4: Correlated Market Arbitrage (re-enabled, Tier 1)
+        # 관련 마켓 간 논리적 제약 위반 탐지: P(specific) > P(general) 같은 구조적 차익
+        # 진짜 구조적 알파 — 시장 가격 불일치에서 오는 확실한 엣지
+        asyncio.create_task(
+            corr_arb_scanner.start(),
+            name="correlated_arb"
+        ),
+
+        # Strategy 5: Claude Oracle (EXPERIMENTAL — Tier 2)
+        # 뉴스 컨텍스트 + 2-샘플 LLM 추정. 캘리브레이션 검증 전.
+        # aggregator weight 0.35, kelly shrinkage 높음 → 자동으로 작은 사이즈
+        asyncio.create_task(
+            ClaudeOracleScanner(store, raw_signal_bus).start(),
+            name="claude_oracle"
+        ),
+
+        # Strategy 6: Statistical Base Rate (EXPERIMENTAL — Tier 2)
+        # 무조건 기저율 → aggregator weight 0.30 → 최소 사이즈
+        asyncio.create_task(
+            BaseRateOracleScanner(store, raw_signal_bus).start(),
+            name="base_rate"
+        ),
+
+        # Cross-platform arb: Kalshi (active only when keys are set)
         asyncio.create_task(
             CrossPlatformArbScanner(store, raw_signal_bus).start(),
             name="cross_platform_arb"
+        ),
+
+        # Strategy 7: Limitless Exchange cross-arb (no API key needed for scanning)
+        # Polymarket fork on Base chain — same events, different prices
+        # Public market data = always active. Hedge leg needs LIMITLESS_API_KEY.
+        # portfolio passed for SELL signal (exit when Poly overpriced vs Limitless)
+        asyncio.create_task(
+            LimitlessArbScanner(store, raw_signal_bus, portfolio=portfolio).start(),
+            name="limitless_arb"
         ),
 
         # Pipeline
@@ -441,6 +568,7 @@ async def main():
         asyncio.create_task(position_price_updater(portfolio, store),  name="price_updater"),
         asyncio.create_task(reconciler.start(),                        name="reconciler"),
         asyncio.create_task(AutoTuner().start(),                       name="auto_tuner"),
+        asyncio.create_task(snapshot_loop(portfolio, bankroll),          name="snapshot"),
     ]
 
     # WebSocket real-time orderbook (requires aiohttp connection)
@@ -473,7 +601,8 @@ async def main():
 
     log.info(f"System running with {len(tasks)} tasks. Ctrl+C to stop.")
     log.info(f"Active strategies: oracle_convergence, fee_arb (near-certain + internal_arb), "
-             f"exit_signals, cross_platform_arb (if Kalshi keys set)")
+             f"exit_signals, cross_platform_arb (if Kalshi keys set), "
+             f"claude_oracle (if ANTHROPIC_API_KEY set)")
 
     try:
         await asyncio.gather(*tasks)

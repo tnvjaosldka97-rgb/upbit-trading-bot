@@ -25,31 +25,35 @@
   --purple: #ce93d8;
   --teal: #80cbc4;
 }
-html, body { height: 100%; background: var(--bg0); color: var(--text); font-family: 'Segoe UI', 'SF Pro Display', monospace; font-size: 12px; overflow-x: hidden; }
+html, body { height: 100%; background: var(--bg0); color: var(--text); font-family: 'Segoe UI', 'SF Pro Display', -apple-system, sans-serif; font-size: 13px; overflow-x: hidden; }
 
 /* ── Layout ────────────────────────────────────────────── */
 .topbar {
   position: sticky; top: 0; z-index: 100;
   background: var(--bg1);
   border-bottom: 1px solid var(--border2);
+  padding: 0 16px; min-height: 48px;
   display: flex; align-items: center; justify-content: space-between;
-  padding: 0 20px; height: 48px;
+  flex-wrap: wrap; gap: 6px;
 }
-.topbar-left { display: flex; align-items: center; gap: 20px; }
-.logo { font-size: 16px; font-weight: 700; color: var(--accent); letter-spacing: 1.5px; white-space: nowrap; }
+.topbar-left { display: flex; align-items: center; gap: 16px; flex-wrap: wrap; }
+.logo { font-size: 15px; font-weight: 700; color: var(--accent); letter-spacing: 1.5px; white-space: nowrap; }
 .logo span { color: var(--yellow); }
 
-.kpi-strip { display: flex; gap: 0; }
+.kpi-strip {
+  display: flex; gap: 0; flex-wrap: wrap;
+}
 .kpi {
-  padding: 6px 16px;
+  padding: 5px 12px;
   border-right: 1px solid var(--border);
   display: flex; flex-direction: column;
+  min-width: 70px;
 }
 .kpi:first-child { border-left: 1px solid var(--border); }
-.kpi .label { font-size: 9px; color: var(--muted); text-transform: uppercase; letter-spacing: 0.8px; margin-bottom: 2px; }
-.kpi .val { font-size: 14px; font-weight: 700; }
+.kpi .label { font-size: 9px; color: var(--muted); text-transform: uppercase; letter-spacing: 0.6px; margin-bottom: 1px; }
+.kpi .val { font-size: 13px; font-weight: 700; font-variant-numeric: tabular-nums; }
 
-.topbar-right { display: flex; align-items: center; gap: 12px; }
+.topbar-right { display: flex; align-items: center; gap: 10px; flex-shrink: 0; }
 .badge { padding: 3px 10px; border-radius: 10px; font-size: 10px; font-weight: 700; letter-spacing: 1px; }
 .badge-dry  { background: #1b3a1b; color: #66bb6a; border: 1px solid #2e7d32; }
 .badge-live { background: #3a1a1a; color: #ef5350; border: 1px solid #c62828; }
@@ -59,16 +63,17 @@ html, body { height: 100%; background: var(--bg0); color: var(--text); font-fami
 
 /* ── Tabs ──────────────────────────────────────────────── */
 .tabbar {
-  display: flex; gap: 2px; padding: 8px 20px 0;
+  display: flex; gap: 2px; padding: 6px 16px 0;
   background: var(--bg1); border-bottom: 1px solid var(--border);
+  overflow-x: auto;
 }
 .tab {
-  padding: 7px 18px;
+  padding: 7px 16px;
   cursor: pointer; color: var(--muted);
   border-radius: 5px 5px 0 0;
   font-size: 11px; font-weight: 600; letter-spacing: 0.5px;
   border: 1px solid transparent; border-bottom: none;
-  transition: color 0.15s;
+  transition: color 0.15s; white-space: nowrap;
 }
 .tab:hover { color: var(--text); }
 .tab.active { color: var(--accent); background: var(--bg2); border-color: var(--border); }
@@ -76,13 +81,13 @@ html, body { height: 100%; background: var(--bg0); color: var(--text); font-fami
 .tab-pane.active { display: block; }
 
 /* ── Panels ────────────────────────────────────────────── */
-.page { padding: 14px 20px 20px; }
-.row { display: flex; gap: 12px; margin-bottom: 12px; }
+.page { padding: 12px 16px 20px; }
+.row { display: flex; gap: 12px; margin-bottom: 12px; flex-wrap: wrap; }
 .row > * { min-width: 0; }
-.col-6 { flex: 6; }
-.col-4 { flex: 4; }
-.col-3 { flex: 3; }
-.col-5 { flex: 5; }
+.col-6 { flex: 6; min-width: 320px; }
+.col-4 { flex: 4; min-width: 260px; }
+.col-3 { flex: 3; min-width: 220px; }
+.col-5 { flex: 5; min-width: 280px; }
 
 .panel {
   background: var(--bg2);
@@ -91,7 +96,7 @@ html, body { height: 100%; background: var(--bg0); color: var(--text); font-fami
 }
 .ph {
   background: var(--bg3);
-  padding: 9px 14px;
+  padding: 8px 14px;
   display: flex; align-items: center; justify-content: space-between;
   border-bottom: 1px solid var(--border);
   font-size: 11px; color: var(--accent);
@@ -103,19 +108,20 @@ html, body { height: 100%; background: var(--bg0); color: var(--text); font-fami
 /* ── Tables ────────────────────────────────────────────── */
 .tbl { width: 100%; border-collapse: collapse; }
 .tbl th {
-  padding: 7px 10px; text-align: left;
+  padding: 6px 8px; text-align: left;
   color: var(--muted); font-size: 10px;
-  text-transform: uppercase; letter-spacing: 0.6px;
+  text-transform: uppercase; letter-spacing: 0.5px;
   border-bottom: 1px solid var(--border);
   font-weight: 500; cursor: pointer; user-select: none; white-space: nowrap;
+  position: sticky; top: 0; background: var(--bg2); z-index: 2;
 }
 .tbl th:hover { color: var(--text); }
 .tbl th.sorted { color: var(--accent); }
-.tbl td { padding: 6px 10px; border-bottom: 1px solid #0d1a2a; font-size: 11px; }
+.tbl td { padding: 5px 8px; border-bottom: 1px solid #0d1a2a; font-size: 11px; }
 .tbl tr:last-child td { border-bottom: none; }
 .tbl tr:hover td { background: var(--bg3); }
-.tbl-scroll { max-height: 380px; overflow-y: auto; }
-.tbl-scroll2 { max-height: 480px; overflow-y: auto; }
+.tbl-scroll { max-height: 340px; overflow-y: auto; }
+.tbl-scroll2 { max-height: 440px; overflow-y: auto; }
 
 /* ── Pills ─────────────────────────────────────────────── */
 .pill {
@@ -148,48 +154,70 @@ html, body { height: 100%; background: var(--bg0); color: var(--text); font-fami
 .s-corr   { color: var(--teal); }
 .s-exit   { color: var(--red); }
 .s-copy   { color: #80deea; }
+.s-meta   { color: #64b5f6; }
 
 /* ── Score bars ────────────────────────────────────────── */
 .score-bar { display: inline-flex; align-items: center; gap: 6px; }
-.score-bg { width: 60px; height: 5px; background: var(--border); border-radius: 3px; overflow: hidden; }
+.score-bg { width: 50px; height: 5px; background: var(--border); border-radius: 3px; overflow: hidden; }
 .score-fill { height: 100%; border-radius: 3px; }
 
 /* ── Feed ──────────────────────────────────────────────── */
 .feed-item {
   display: flex; align-items: flex-start; gap: 8px;
-  padding: 6px 12px; border-bottom: 1px solid #0c1827;
+  padding: 5px 12px; border-bottom: 1px solid #0c1827;
   font-size: 11px; transition: background 0.1s;
 }
 .feed-item:hover { background: var(--bg3); }
-.feed-icon { font-size: 13px; margin-top: 1px; }
+.feed-icon { font-size: 12px; margin-top: 1px; }
 .feed-time { color: var(--muted); font-size: 10px; white-space: nowrap; margin-top: 1px; }
-.feed-body { flex: 1; }
+.feed-body { flex: 1; min-width: 0; }
 .feed-main { display: flex; align-items: center; gap: 6px; flex-wrap: wrap; }
-.feed-sub { color: var(--muted); font-size: 10px; margin-top: 1px; }
+.feed-sub { color: var(--muted); font-size: 10px; margin-top: 1px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 
 /* ── Equity curve ──────────────────────────────────────── */
-.chart-wrap { position: relative; height: 220px; padding: 12px; }
+.chart-wrap { position: relative; height: 200px; padding: 10px; }
 
 /* ── Stat cards (strategy perf) ────────────────────────── */
-.strat-rows { overflow-y: auto; max-height: 260px; }
+.strat-rows { overflow-y: auto; max-height: 240px; }
 .strat-row {
   display: flex; align-items: center; gap: 8px;
-  padding: 8px 14px; border-bottom: 1px solid #0d1a2a;
+  padding: 7px 12px; border-bottom: 1px solid #0d1a2a;
 }
 .strat-row:last-child { border-bottom: none; }
-.strat-name { width: 140px; font-size: 11px; font-weight: 600; }
+.strat-name { width: 130px; font-size: 11px; font-weight: 600; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
 .strat-num { font-variant-numeric: tabular-nums; font-size: 11px; }
-.winbar { flex: 1; height: 6px; background: var(--border); border-radius: 3px; overflow: hidden; }
+.winbar { flex: 1; height: 5px; background: var(--border); border-radius: 3px; overflow: hidden; min-width: 40px; }
 .winbar-fill { height: 100%; border-radius: 3px; background: linear-gradient(90deg, #2e7d32, #4caf50); }
 
 /* ── Risk metrics ──────────────────────────────────────── */
-.risk-grid { display: grid; grid-template-columns: repeat(3,1fr); gap: 10px; padding: 12px; }
-.risk-card { background: var(--bg3); border: 1px solid var(--border); border-radius: 6px; padding: 12px; }
-.risk-card .label { font-size: 9px; color: var(--muted); text-transform: uppercase; letter-spacing: 0.8px; margin-bottom: 6px; }
-.risk-card .value { font-size: 20px; font-weight: 700; }
+.risk-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(160px, 1fr));
+  gap: 10px; padding: 12px;
+}
+.risk-card {
+  background: var(--bg3); border: 1px solid var(--border);
+  border-radius: 6px; padding: 10px 12px;
+}
+.risk-card .label { font-size: 9px; color: var(--muted); text-transform: uppercase; letter-spacing: 0.7px; margin-bottom: 4px; }
+.risk-card .value { font-size: 18px; font-weight: 700; font-variant-numeric: tabular-nums; }
 .risk-card .sub   { font-size: 10px; color: var(--muted); margin-top: 3px; }
-.dd-bar { height: 6px; background: var(--border); border-radius: 3px; overflow: hidden; margin-top: 4px; }
+.dd-bar { height: 5px; background: var(--border); border-radius: 3px; overflow: hidden; margin-top: 4px; }
 .dd-fill { height: 100%; border-radius: 3px; background: var(--red); }
+
+/* ── Dashboard top risk strip ─────────────────────────── */
+.risk-strip {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(140px, 1fr));
+  gap: 8px; margin-bottom: 12px;
+}
+.risk-mini {
+  background: var(--bg2); border: 1px solid var(--border);
+  border-radius: 6px; padding: 8px 10px;
+}
+.risk-mini .label { font-size: 9px; color: var(--muted); text-transform: uppercase; letter-spacing: 0.6px; }
+.risk-mini .value { font-size: 16px; font-weight: 700; margin-top: 2px; font-variant-numeric: tabular-nums; }
+.risk-mini .sub { font-size: 9px; color: var(--muted); margin-top: 2px; }
 
 /* ── Scrollbar ─────────────────────────────────────────── */
 ::-webkit-scrollbar { width: 5px; height: 5px; }
@@ -197,40 +225,60 @@ html, body { height: 100%; background: var(--bg0); color: var(--text); font-fami
 ::-webkit-scrollbar-thumb { background: var(--border2); border-radius: 3px; }
 
 /* ── Coin chart tab ────────────────────────────────────── */
-.coin-grid { display: grid; grid-template-columns: repeat(2,1fr); gap: 12px; }
+.coin-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(300px, 1fr)); gap: 12px; }
 .coin-card { background: var(--bg2); border: 1px solid var(--border); border-radius: 8px; overflow: hidden; }
-.coin-hdr { display: flex; justify-content: space-between; align-items: center; padding: 12px 14px; border-bottom: 1px solid var(--border); }
+.coin-hdr { display: flex; justify-content: space-between; align-items: center; padding: 10px 14px; border-bottom: 1px solid var(--border); }
 .coin-sym { font-size: 14px; font-weight: 700; color: var(--accent); }
-.coin-price { font-size: 18px; font-weight: 700; }
-.coin-change { font-size: 12px; font-weight: 600; margin-top: 2px; text-align: right; }
-.coin-chart-wrap { position: relative; height: 160px; padding: 8px 10px; }
+.coin-price { font-size: 16px; font-weight: 700; }
+.coin-change { font-size: 11px; font-weight: 600; margin-top: 2px; text-align: right; }
+.coin-chart-wrap { position: relative; height: 140px; padding: 8px 10px; }
 
 /* ── Scanner filter bar ───────────────────────────────── */
-.filter-bar { display: flex; align-items: center; gap: 10px; padding: 10px 14px; border-bottom: 1px solid var(--border); }
+.filter-bar {
+  display: flex; align-items: center; gap: 8px; padding: 8px 12px;
+  border-bottom: 1px solid var(--border); flex-wrap: wrap;
+}
 .filter-bar input, .filter-bar select {
   background: var(--bg3); border: 1px solid var(--border2); color: var(--text);
-  padding: 5px 10px; border-radius: 5px; font-size: 11px; outline: none;
+  padding: 5px 8px; border-radius: 5px; font-size: 11px; outline: none;
 }
 .filter-bar input:focus, .filter-bar select:focus { border-color: var(--accent); }
 .filter-bar label { font-size: 10px; color: var(--muted); }
 .btn { padding: 5px 12px; background: var(--bg3); border: 1px solid var(--border2); color: var(--accent); border-radius: 5px; cursor: pointer; font-size: 11px; }
 .btn:hover { background: var(--border); }
 
-/* ── Opportunities heatmap ────────────────────────────── */
-.opp-grid { display: grid; grid-template-columns: repeat(2,1fr); gap: 12px; padding: 12px; }
+/* ── Opportunities ────────────────────────────────────── */
 .opp-item {
   background: var(--bg3); border: 1px solid var(--border);
-  border-radius: 6px; padding: 10px 12px; cursor: pointer;
+  border-radius: 6px; padding: 8px 10px; cursor: pointer;
   transition: border-color 0.15s;
 }
 .opp-item:hover { border-color: var(--accent); }
-.opp-q { font-size: 11px; font-weight: 600; margin-bottom: 5px; color: var(--text); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
-.opp-meta { display: flex; gap: 8px; align-items: center; flex-wrap: wrap; }
-.opp-price { font-size: 12px; font-weight: 700; }
-.opp-edge  { font-size: 11px; color: var(--yellow); }
+.opp-q { font-size: 11px; font-weight: 600; margin-bottom: 4px; color: var(--text); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.opp-meta { display: flex; gap: 6px; align-items: center; flex-wrap: wrap; }
+.opp-price { font-size: 11px; font-weight: 700; }
+.opp-edge  { font-size: 10px; color: var(--yellow); }
 
 /* ── Empty state ──────────────────────────────────────── */
-.empty { color: var(--muted); text-align: center; padding: 30px; font-size: 11px; }
+.empty { color: var(--muted); text-align: center; padding: 24px; font-size: 11px; }
+
+/* ── Responsive ───────────────────────────────────────── */
+@media (max-width: 900px) {
+  .row { flex-direction: column; }
+  .col-6, .col-5, .col-4, .col-3 { min-width: 100%; }
+  .risk-grid { grid-template-columns: repeat(2, 1fr); }
+  .risk-strip { grid-template-columns: repeat(3, 1fr); }
+  .kpi { padding: 4px 8px; }
+  .kpi .val { font-size: 12px; }
+}
+@media (max-width: 600px) {
+  .topbar { padding: 6px 10px; }
+  .page { padding: 8px 10px; }
+  .risk-grid { grid-template-columns: 1fr 1fr; }
+  .risk-strip { grid-template-columns: 1fr 1fr; }
+  .kpi-strip { display: none; }
+  .coin-grid { grid-template-columns: 1fr; }
+}
 </style>
 </head>
 <body>
@@ -242,10 +290,10 @@ html, body { height: 100%; background: var(--bg0); color: var(--text); font-fami
     <div class="kpi-strip">
       <div class="kpi"><div class="label">총 자산</div><div class="val a" id="kpi-total">--</div></div>
       <div class="kpi"><div class="label">실현 P&L</div><div class="val" id="kpi-rpnl">--</div></div>
-      <div class="kpi"><div class="label">미실현 P&L</div><div class="val" id="kpi-upnl">--</div></div>
+      <div class="kpi"><div class="label">미실현</div><div class="val" id="kpi-upnl">--</div></div>
       <div class="kpi"><div class="label">드로다운</div><div class="val" id="kpi-dd">--</div></div>
       <div class="kpi"><div class="label">체결/거부</div><div class="val" id="kpi-orders">--</div></div>
-      <div class="kpi"><div class="label">활성마켓</div><div class="val a" id="kpi-markets">--</div></div>
+      <div class="kpi"><div class="label">마켓</div><div class="val a" id="kpi-markets">--</div></div>
     </div>
   </div>
   <div class="topbar-right">
@@ -258,25 +306,61 @@ html, body { height: 100%; background: var(--bg0); color: var(--text); font-fami
 <!-- ══ TAB BAR ══════════════════════════════════════════════════════════ -->
 <div class="tabbar">
   <div class="tab active" data-tab="dashboard">&#128202; 대시보드</div>
-  <div class="tab" data-tab="scanner">&#128269; 마켓 스캐너</div>
-  <div class="tab" data-tab="signals">&#128225; 신호 분석</div>
+  <div class="tab" data-tab="scanner">&#128269; 스캐너</div>
+  <div class="tab" data-tab="signals">&#128225; 신호</div>
   <div class="tab" data-tab="risk">&#9878;&#65039; 리스크</div>
-  <div class="tab" data-tab="coins">&#128200; 코인 차트</div>
+  <div class="tab" data-tab="coins">&#128200; 코인</div>
 </div>
 
 <!-- ══════════════════════════════════════════════════════════════════════
      TAB: DASHBOARD
 ══════════════════════════════════════════════════════════════════════════ -->
 <div id="pane-dashboard" class="tab-pane active page">
+
+  <!-- ── Risk summary strip (항상 보이는 핵심 리스크 지표) ── -->
+  <div class="risk-strip" id="dash-risk-strip">
+    <div class="risk-mini">
+      <div class="label">잔여 현금</div>
+      <div class="value g" id="dr-cash">--</div>
+      <div class="sub" id="dr-cash-pct">--</div>
+    </div>
+    <div class="risk-mini">
+      <div class="label">포지션 수</div>
+      <div class="value a" id="dr-pos">--</div>
+      <div class="sub" id="dr-pos-val">--</div>
+    </div>
+    <div class="risk-mini">
+      <div class="label">드로다운</div>
+      <div class="value" id="dr-dd">--</div>
+      <div class="dd-bar"><div class="dd-fill" id="dr-dd-bar" style="width:0%;"></div></div>
+      <div class="sub">한도 20%</div>
+    </div>
+    <div class="risk-mini">
+      <div class="label">95% VaR (1일)</div>
+      <div class="value r" id="dr-var">--</div>
+      <div class="sub">최대 예상 손실</div>
+    </div>
+    <div class="risk-mini">
+      <div class="label">오늘 체결</div>
+      <div class="value" id="dr-filled">--</div>
+      <div class="sub" id="dr-rejected">거부: --</div>
+    </div>
+    <div class="risk-mini">
+      <div class="label">Sharpe (추정)</div>
+      <div class="value y" id="dr-sharpe">--</div>
+      <div class="sub">최근 성과 기반</div>
+    </div>
+  </div>
+
   <div class="row">
     <!-- Equity Curve -->
     <div class="panel col-6">
-      <div class="ph">자산 곡선 (30일) <span class="right" id="eq-return">--</span></div>
+      <div class="ph">자산 곡선 <span class="right" id="eq-return">--</span></div>
       <div class="chart-wrap"><canvas id="chart-equity"></canvas></div>
     </div>
     <!-- Strategy Performance -->
     <div class="panel col-4">
-      <div class="ph">전략별 성과 <span class="right">신호 → 트레이드 → 순익</span></div>
+      <div class="ph">전략별 성과 <span class="right">신호 → 승률 → 순익</span></div>
       <div class="strat-rows" id="strat-rows">
         <div class="empty">로딩 중...</div>
       </div>
@@ -284,14 +368,14 @@ html, body { height: 100%; background: var(--bg0); color: var(--text); font-fami
   </div>
   <div class="row">
     <!-- Live Feed -->
-    <div class="panel" style="flex:1;">
-      <div class="ph">실시간 신호 · 트레이드 피드 <span class="right" id="feed-count">--</span></div>
-      <div id="live-feed" style="max-height:260px;overflow-y:auto;"></div>
+    <div class="panel" style="flex:1;min-width:320px;">
+      <div class="ph">실시간 피드 <span class="right" id="feed-count">--</span></div>
+      <div id="live-feed" style="max-height:240px;overflow-y:auto;"></div>
     </div>
     <!-- Opportunities -->
     <div class="panel col-4">
-      <div class="ph">지금 최고 기회 <span class="right" id="opp-count">--</span></div>
-      <div id="top-opps" style="max-height:260px;overflow-y:auto;padding:10px;display:flex;flex-direction:column;gap:8px;"></div>
+      <div class="ph">최고 기회 <span class="right" id="opp-count">--</span></div>
+      <div id="top-opps" style="max-height:240px;overflow-y:auto;padding:8px;display:flex;flex-direction:column;gap:6px;"></div>
     </div>
   </div>
 </div>
@@ -299,12 +383,12 @@ html, body { height: 100%; background: var(--bg0); color: var(--text); font-fami
 <!-- ══════════════════════════════════════════════════════════════════════
      TAB: SCANNER
 ══════════════════════════════════════════════════════════════════════════ -->
-<div id="pane-scanner" class="tab-pane page" style="padding-top:10px;">
+<div id="pane-scanner" class="tab-pane page">
   <div class="panel">
     <div class="ph">마켓 스캐너 <span class="right" id="scanner-count">--</span></div>
     <div class="filter-bar">
       <label>검색</label>
-      <input id="scanner-q" type="text" placeholder="마켓 검색..." style="width:240px;">
+      <input id="scanner-q" type="text" placeholder="마켓 검색..." style="width:200px;">
       <label>최소 점수</label>
       <select id="scanner-score">
         <option value="0">전체</option>
@@ -323,11 +407,11 @@ html, body { height: 100%; background: var(--bg0); color: var(--text); font-fami
       <label>만료</label>
       <select id="scanner-days">
         <option value="0">전체</option>
-        <option value="3">3일 이내</option>
-        <option value="7">7일 이내</option>
-        <option value="14">14일 이내</option>
+        <option value="3">3일</option>
+        <option value="7">7일</option>
+        <option value="14">14일</option>
       </select>
-      <button class="btn" onclick="renderScanner()">필터 적용</button>
+      <button class="btn" onclick="renderScanner()">적용</button>
     </div>
     <div class="tbl-scroll2">
     <table class="tbl" id="scanner-tbl">
@@ -337,11 +421,11 @@ html, body { height: 100%; background: var(--bg0); color: var(--text); font-fami
         <th onclick="sortScanner('yes')">YES</th>
         <th onclick="sortScanner('no')">NO</th>
         <th onclick="sortScanner('gap')">갭</th>
-        <th onclick="sortScanner('volume_24h')">24h 거래량</th>
+        <th onclick="sortScanner('volume_24h')">거래량</th>
         <th onclick="sortScanner('liquidity')">유동성</th>
         <th onclick="sortScanner('days')">만료</th>
         <th>기회</th>
-        <th>분쟁리스크</th>
+        <th>분쟁</th>
       </tr></thead>
       <tbody id="scanner-tbody"><tr><td colspan="10" class="empty">로딩 중...</td></tr></tbody>
     </table>
@@ -354,30 +438,38 @@ html, body { height: 100%; background: var(--bg0); color: var(--text); font-fami
 ══════════════════════════════════════════════════════════════════════════ -->
 <div id="pane-signals" class="tab-pane page">
   <div class="row">
-    <!-- Win rate chart -->
     <div class="panel col-5">
-      <div class="ph">전략별 승률 (신호 기반)</div>
-      <div style="position:relative;height:220px;padding:12px;"><canvas id="chart-winrate"></canvas></div>
+      <div class="ph">전략별 승률</div>
+      <div style="position:relative;height:200px;padding:10px;"><canvas id="chart-winrate"></canvas></div>
     </div>
-    <!-- Signal distribution -->
     <div class="panel col-3">
       <div class="ph">긴급도 분포</div>
-      <div style="position:relative;height:220px;padding:12px;"><canvas id="chart-urgency"></canvas></div>
+      <div style="position:relative;height:200px;padding:10px;"><canvas id="chart-urgency"></canvas></div>
     </div>
-    <!-- Avg edge -->
     <div class="panel col-3">
-      <div class="ph">전략별 평균 엣지(%)</div>
-      <div style="position:relative;height:220px;padding:12px;"><canvas id="chart-edge"></canvas></div>
+      <div class="ph">평균 엣지(%)</div>
+      <div style="position:relative;height:200px;padding:10px;"><canvas id="chart-edge"></canvas></div>
     </div>
   </div>
   <div class="panel">
-    <div class="ph">최근 신호 상세 <span class="right" id="sig-count">--</span></div>
+    <div class="ph">최근 신호 <span class="right" id="sig-count">--</span></div>
     <div class="tbl-scroll2">
     <table class="tbl">
       <thead><tr>
-        <th>시각</th><th>전략</th><th>방향</th><th>모델확률</th><th>시장확률</th><th>순엣지</th><th>신뢰도</th><th>긴급도</th><th>마켓</th>
+        <th>시각</th><th>전략</th><th>방향</th><th>모델</th><th>시장</th><th>엣지</th><th>신뢰</th><th>긴급</th><th>마켓ID</th>
       </tr></thead>
-      <tbody id="signals-tbody"><tr><td colspan="9" class="empty">신호 대기 중...</td></tr></tbody>
+      <tbody id="signals-tbody"><tr><td colspan="9" class="empty">대기 중...</td></tr></tbody>
+    </table>
+    </div>
+  </div>
+  <div class="panel" style="margin-top:12px;">
+    <div class="ph">Kelly 캘리브레이션 <span class="right" id="cal-updated">--</span></div>
+    <div style="overflow-x:auto;">
+    <table class="tbl" id="cal-tbl">
+      <thead><tr>
+        <th>전략</th><th>트레이드</th><th>적중률</th><th>사전확률</th><th>Prior %</th><th>캘리브 오차</th><th>Kelly</th><th>상태</th>
+      </tr></thead>
+      <tbody id="cal-tbody"><tr><td colspan="8" class="empty">로딩 중...</td></tr></tbody>
     </table>
     </div>
   </div>
@@ -388,7 +480,7 @@ html, body { height: 100%; background: var(--bg0); color: var(--text); font-fami
 ══════════════════════════════════════════════════════════════════════════ -->
 <div id="pane-risk" class="tab-pane page">
   <div class="row">
-    <div class="panel" style="flex:1;">
+    <div class="panel" style="flex:1;min-width:320px;">
       <div class="ph">핵심 리스크 지표</div>
       <div class="risk-grid" id="risk-grid">
         <div class="empty" style="grid-column:1/-1;">로딩 중...</div>
@@ -396,15 +488,15 @@ html, body { height: 100%; background: var(--bg0); color: var(--text); font-fami
     </div>
     <div class="panel col-3">
       <div class="ph">포지션 집중도</div>
-      <div style="position:relative;height:200px;padding:12px;"><canvas id="chart-conc"></canvas></div>
+      <div style="position:relative;height:200px;padding:10px;"><canvas id="chart-conc"></canvas></div>
     </div>
   </div>
   <div class="row">
-    <div class="panel" style="flex:1;">
+    <div class="panel" style="flex:1;min-width:320px;">
       <div class="ph">현재 포지션</div>
       <div class="tbl-scroll">
       <table class="tbl">
-        <thead><tr><th>토큰</th><th>방향</th><th>평균단가</th><th>현재가</th><th>수량</th><th>평가금액</th><th>미실현손익</th></tr></thead>
+        <thead><tr><th>토큰</th><th>방향</th><th>진입</th><th>현재</th><th>수량</th><th>평가액</th><th>손익</th></tr></thead>
         <tbody id="pos-tbody"><tr><td colspan="7" class="empty">포지션 없음</td></tr></tbody>
       </table>
       </div>
@@ -413,8 +505,19 @@ html, body { height: 100%; background: var(--bg0); color: var(--text); font-fami
       <div class="ph">거래 내역 <span class="right">최근 30건</span></div>
       <div class="tbl-scroll">
       <table class="tbl">
-        <thead><tr><th>시각</th><th>전략</th><th>방향</th><th>체결가</th><th>수량</th><th>금액</th></tr></thead>
-        <tbody id="trades-tbody"><tr><td colspan="6" class="empty">거래 내역 없음</td></tr></tbody>
+        <thead><tr><th>시각</th><th>전략</th><th>방향</th><th>체결가</th><th>수량</th><th>금액</th><th>손익</th></tr></thead>
+        <tbody id="trades-tbody"><tr><td colspan="7" class="empty">거래 없음</td></tr></tbody>
+      </table>
+      </div>
+    </div>
+  </div>
+  <div class="row">
+    <div class="panel" style="flex:1;">
+      <div class="ph">청산 내역 (실현손익) <span class="right" id="closed-count">--</span></div>
+      <div class="tbl-scroll2">
+      <table class="tbl">
+        <thead><tr><th>시각</th><th>전략</th><th>진입</th><th>청산</th><th>보유</th><th>수량</th><th>투자액</th><th>손익</th><th>수익률</th></tr></thead>
+        <tbody id="closed-tbody"><tr><td colspan="9" class="empty">청산 없음</td></tr></tbody>
       </table>
       </div>
     </div>
@@ -444,7 +547,7 @@ html, body { height: 100%; background: var(--bg0); color: var(--text); font-fami
     </div>
   </div>
   <div style="text-align:center;color:var(--muted);font-size:10px;padding:8px 0;">
-    출처: CoinGecko Free API · 60초 서버캐싱 · 7일 4시간 봉
+    CoinGecko Free API · 60s 캐싱 · 7일 차트
   </div>
 </div>
 
@@ -482,6 +585,7 @@ async function api(url) {
 
 function stratClass(s) {
   if (!s) return '';
+  if (s === 'metaculus' || s === 'base_rate') return 's-meta';
   if (s.includes('oracle')) return 's-oracle';
   if (s.includes('conv') || s.includes('closing')) return 's-conv';
   if (s.includes('fee')) return 's-fee';
@@ -496,20 +600,18 @@ function urgClass(u) {
   return {IMMEDIATE:'p-imm',HIGH:'p-high',MEDIUM:'p-med',LOW:'p-low'}[u] || 'p-low';
 }
 
-// ── TOP BAR ───────────────────────────────────────────────────────────
+// ── TOP BAR + Dashboard Risk Strip ───────────────────────────────────
 async function updateTopbar() {
-  const [port, stats] = await Promise.all([api('/api/portfolio'), api('/api/stats')]);
+  const [port, stats, risk] = await Promise.all([api('/api/portfolio'), api('/api/stats'), api('/api/risk')]);
   if (port) {
     const tot = port.total_value;
     $('kpi-total').textContent = '$' + Number(tot).toLocaleString('en', {minimumFractionDigits:2, maximumFractionDigits:2});
-    const rpnl = $('kpi-rpnl');
-    rpnl.innerHTML = sign(port.realized_pnl,'g','r') + '<span style="color:var(--muted)"> R</span>';
-    const upnl = $('kpi-upnl');
-    upnl.innerHTML = sign(port.unrealized_pnl,'g','r') + '<span style="color:var(--muted)"> U</span>';
+    $('kpi-rpnl').innerHTML = sign(port.realized_pnl,'g','r');
+    $('kpi-upnl').innerHTML = sign(port.unrealized_pnl,'g','r');
     const dd = $('kpi-dd');
     dd.textContent = fmt(port.drawdown, 2) + '%';
     dd.className = 'val ' + (port.drawdown > 12 ? 'r' : port.drawdown > 6 ? 'y' : 'g');
-    $('kpi-orders').textContent = (port.submitted||0) + ' / ' + (port.rejected||0);
+    $('kpi-orders').textContent = (port.submitted||0) + '/' + (port.rejected||0);
     const badge = $('mode-badge');
     if (!port.dry_run) { badge.textContent='LIVE'; badge.className='badge badge-live'; }
     else { badge.textContent='DRY RUN'; badge.className='badge badge-dry'; }
@@ -517,6 +619,21 @@ async function updateTopbar() {
   if (stats) {
     $('kpi-markets').textContent = stats.total_markets || '--';
     $('clock').textContent = stats.timestamp || '--';
+  }
+  // Dashboard risk strip
+  if (risk) {
+    $('dr-cash').textContent = '$' + fmt(risk.bankroll, 2);
+    $('dr-cash-pct').textContent = '현금 ' + risk.cash_pct + '%';
+    $('dr-pos').textContent = risk.position_count;
+    $('dr-pos-val').textContent = '$' + fmt(risk.position_value, 2) + ' 투자중';
+    const ddPct = risk.drawdown_pct || 0;
+    const ddEl = $('dr-dd');
+    ddEl.textContent = fmt(ddPct, 2) + '%';
+    ddEl.style.color = ddPct > 12 ? 'var(--red)' : ddPct > 6 ? 'var(--yellow)' : 'var(--green)';
+    $('dr-dd-bar').style.width = Math.min(ddPct / 20 * 100, 100) + '%';
+    $('dr-var').textContent = '-$' + fmt(risk.var_95, 2);
+    $('dr-filled').textContent = risk.submitted || 0;
+    $('dr-rejected').textContent = '거부: ' + (risk.rejected || 0);
   }
 }
 
@@ -532,7 +649,7 @@ async function updateEquityCurve() {
   const values = data.map(p => p.v);
   const first = values[0], last = values[values.length-1];
   const ret = ((last - first) / first * 100);
-  $('eq-return').innerHTML = '<span class="'+(ret>=0?'g':'r')+'">'+(ret>=0?'+':'')+fmt(ret,2)+'%</span> 30일 수익';
+  $('eq-return').innerHTML = '<span class="'+(ret>=0?'g':'r')+'">'+(ret>=0?'+':'')+fmt(ret,2)+'%</span>';
 
   const ctx = $('chart-equity');
   if (_eqChart) _eqChart.destroy();
@@ -576,12 +693,25 @@ async function updateStratPerf() {
     return '<div class="strat-row">' +
       '<div class="strat-name ' + stratClass(s.strategy) + '">' + s.strategy.replace(/_/g,' ') + '</div>' +
       '<div style="flex:1;"><div class="winbar"><div class="winbar-fill" style="width:'+wr+'%;background:'+wrColor+';"></div></div></div>' +
-      '<div class="strat-num m">' + s.signals + '건</div>' +
-      '<div class="strat-num" style="width:42px;color:'+wrColor+';">' + (s.win_rate != null ? wr+'%' : '--') + '</div>' +
-      '<div class="strat-num y" style="width:50px;">' + (s.avg_edge > 0 ? '+'+s.avg_edge+'%' : '--') + '</div>' +
-      '<div class="strat-num ' + pnlSign + '" style="width:65px;">' + (s.net_pnl >= 0 ? '+' : '') + '$' + fmt(s.net_pnl,1) + '</div>' +
+      '<div class="strat-num m" style="width:36px;">' + s.signals + '</div>' +
+      '<div class="strat-num" style="width:38px;color:'+wrColor+';">' + (s.win_rate != null ? wr+'%' : '--') + '</div>' +
+      '<div class="strat-num y" style="width:44px;">' + (s.avg_edge > 0 ? '+'+s.avg_edge+'%' : '--') + '</div>' +
+      '<div class="strat-num ' + pnlSign + '" style="width:56px;">' + (s.net_pnl >= 0 ? '+' : '') + '$' + fmt(s.net_pnl,1) + '</div>' +
     '</div>';
   }).join('');
+
+  // Estimate Sharpe from strategy stats
+  const totalPnl = data.reduce((s,d) => s + (d.net_pnl||0), 0);
+  const sharpeEl = $('dr-sharpe');
+  if (sharpeEl) {
+    if (data.some(d => d.trades > 0)) {
+      const totalTrades = data.reduce((s,d) => s + (d.trades||0), 0);
+      const avgRet = totalTrades > 0 ? totalPnl / totalTrades : 0;
+      sharpeEl.textContent = totalPnl > 0 ? '>' + fmt(avgRet * 10, 1) : fmt(0, 1);
+    } else {
+      sharpeEl.textContent = '--';
+    }
+  }
 }
 
 // ── LIVE FEED ─────────────────────────────────────────────────────────
@@ -590,7 +720,7 @@ async function updateFeed() {
   if (!data) return;
   $('feed-count').textContent = data.length + '건';
   const el = $('live-feed');
-  el.innerHTML = data.slice(0,40).map(e => {
+  el.innerHTML = data.slice(0,30).map(e => {
     const isTrade = e.type === 'trade';
     const icon = isTrade ? '&#x1F4B0;' : e.urgency === 'IMMEDIATE' ? '&#x1F534;' : e.urgency === 'HIGH' ? '&#x1F7E1;' : '&#x1F7E2;';
     const strat = '<span class="'+stratClass(e.strategy)+'">'+(e.strategy||'').replace(/_/g,' ')+'</span>';
@@ -615,7 +745,7 @@ async function updateFeed() {
 async function updateTopOpps() {
   const data = await api('/api/scanner');
   if (!data) return;
-  const top = data.filter(m => m.score >= 30).slice(0, 8);
+  const top = data.filter(m => m.score >= 30).slice(0, 6);
   $('opp-count').textContent = data.filter(m => m.score >= 30).length + '개';
   const el = $('top-opps');
   el.innerHTML = top.map(m => {
@@ -624,8 +754,8 @@ async function updateTopOpps() {
     return '<div class="opp-item">' +
       '<div class="opp-q" title="'+m.question+'">'+m.question+'</div>' +
       '<div class="opp-meta">' +
-        '<span class="opp-price g">YES '+fmt(m.yes,3)+'</span>' +
-        '<span class="opp-price r">NO '+fmt(m.no,3)+'</span>' +
+        '<span class="opp-price g">Y '+fmt(m.yes,3)+'</span>' +
+        '<span class="opp-price r">N '+fmt(m.no,3)+'</span>' +
         gap + ' ' + flags +
         '<span class="m">'+(m.days < 1 ? (m.days*24).toFixed(0)+'h' : fmt(m.days,1)+'d')+'</span>' +
       '</div>' +
@@ -684,8 +814,8 @@ function renderScanner() {
                     m.days < 3   ? '<span class="y">'+fmt(m.days,1)+'d</span>' : fmt(m.days,1)+'d';
     const gap = m.gap > 0.005 ? '<span class="y">+'+fmt(m.gap*100,2)+'%</span>' : '<span class="m">'+fmt(m.gap*100,2)+'%</span>';
     return '<tr>' +
-      '<td><div class="score-bar"><span style="font-weight:700;color:'+scoreColor+';min-width:24px;">'+m.score+'</span><div class="score-bg"><div class="score-fill" style="width:'+m.score+'%;background:'+scoreColor+';"></div></div></div></td>' +
-      '<td style="max-width:280px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;" title="'+m.question+'">'+m.question+'</td>' +
+      '<td><div class="score-bar"><span style="font-weight:700;color:'+scoreColor+';min-width:22px;">'+m.score+'</span><div class="score-bg"><div class="score-fill" style="width:'+m.score+'%;background:'+scoreColor+';"></div></div></div></td>' +
+      '<td style="max-width:260px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;" title="'+m.question+'">'+m.question+'</td>' +
       '<td class="g">'+fmt(m.yes,3)+'</td>' +
       '<td class="r">'+fmt(m.no,3)+'</td>' +
       '<td>'+gap+'</td>' +
@@ -735,7 +865,6 @@ async function drawSignalCharts() {
     }
   });
 
-  // Urgency donut from feed
   const feed = await api('/api/feed');
   const urgCounts = {IMMEDIATE:0,HIGH:0,MEDIUM:0,LOW:0};
   (feed||[]).filter(e => e.type==='signal').forEach(e => { if (urgCounts[e.urgency] != null) urgCounts[e.urgency]++; });
@@ -755,7 +884,7 @@ async function updateSignalsTab() {
   if (!data) return;
   $('sig-count').textContent = data.length + '건';
   const tbody = $('signals-tbody');
-  if (!data.length) { tbody.innerHTML = '<tr><td colspan="9" class="empty">신호 대기 중...</td></tr>'; return; }
+  if (!data.length) { tbody.innerHTML = '<tr><td colspan="9" class="empty">대기 중...</td></tr>'; return; }
   tbody.innerHTML = data.map(s => {
     const urg = '<span class="pill '+urgClass(s.urgency)+'">'+s.urgency+'</span>';
     return '<tr>' +
@@ -772,6 +901,41 @@ async function updateSignalsTab() {
   }).join('');
 }
 
+// ── CALIBRATION TABLE ─────────────────────────────────────────────────
+async function updateCalibration() {
+  const data = await api('/api/calibration');
+  if (!data || !data.length) return;
+  $('cal-updated').textContent = new Date().toLocaleTimeString('ko-KR');
+  const tbody = $('cal-tbody');
+  tbody.innerHTML = data.map(c => {
+    const isPrior = c.is_prior;
+    const accuracy = c.accuracy;
+    const accColor = accuracy >= 75 ? 'var(--green)' : accuracy >= 60 ? 'var(--yellow)' : 'var(--red)';
+    const errColor = c.calib_error <= 5 ? 'var(--green)' : c.calib_error <= 10 ? 'var(--yellow)' : 'var(--red)';
+    const status = isPrior
+      ? '<span class="pill p-med">PRIOR</span>'
+      : c.trade_count >= 150
+        ? '<span class="pill p-near1">CALIBRATED</span>'
+        : '<span class="pill p-high">LEARNING</span>';
+    const blendBar = `<div style="display:inline-flex;align-items:center;gap:4px;">
+      <div style="width:50px;height:4px;background:var(--border);border-radius:3px;overflow:hidden;">
+        <div style="width:${c.prior_blend_pct}%;height:100%;background:var(--purple);border-radius:3px;"></div>
+      </div>
+      <span class="m">${c.prior_blend_pct}%</span>
+    </div>`;
+    return '<tr>' +
+      '<td class="' + stratClass(c.strategy) + '">' + c.strategy.replace(/_/g,' ') + '</td>' +
+      '<td class="a">' + c.trade_count + '</td>' +
+      '<td style="color:' + accColor + ';">' + fmt(c.accuracy, 1) + '%</td>' +
+      '<td class="m">' + fmt(c.prior_accuracy, 1) + '%</td>' +
+      '<td>' + blendBar + '</td>' +
+      '<td style="color:' + errColor + ';">' + fmt(c.calib_error, 2) + '%</td>' +
+      '<td class="y">' + fmt(c.kelly_phase, 1) + '%</td>' +
+      '<td>' + status + '</td>' +
+    '</tr>';
+  }).join('');
+}
+
 // ── RISK TAB ──────────────────────────────────────────────────────────
 let _concChart = null;
 async function updateRiskTab() {
@@ -784,23 +948,23 @@ async function updateRiskTab() {
       '<div class="risk-card">' +
         '<div class="label">총 자산</div>' +
         '<div class="value a">$'+Number(risk.total_value).toLocaleString('en',{minimumFractionDigits:2,maximumFractionDigits:2})+'</div>' +
-        '<div class="sub">현금 '+risk.cash_pct+'% &middot; 포지션 '+(100-risk.cash_pct).toFixed(1)+'%</div>' +
+        '<div class="sub">현금 '+risk.cash_pct+'% · 포지션 '+(100-risk.cash_pct).toFixed(1)+'%</div>' +
       '</div>' +
       '<div class="risk-card">' +
         '<div class="label">드로다운</div>' +
         '<div class="value" style="color:'+ddColor+';">'+fmt(ddPct,2)+'%</div>' +
         '<div class="dd-bar"><div class="dd-fill" style="width:'+Math.min(ddPct/20*100,100)+'%;"></div></div>' +
-        '<div class="sub">한도 20% &middot; 감축 12%</div>' +
+        '<div class="sub">한도 20% · 감축 12%</div>' +
       '</div>' +
       '<div class="risk-card">' +
         '<div class="label">95% VaR (1일)</div>' +
         '<div class="value r">-$'+fmt(risk.var_95,2)+'</div>' +
-        '<div class="sub">포지션 가치의 15% 가정</div>' +
+        '<div class="sub">포지션의 15% 가정</div>' +
       '</div>' +
       '<div class="risk-card">' +
         '<div class="label">포지션 수</div>' +
         '<div class="value">'+risk.position_count+'</div>' +
-        '<div class="sub">포지션 총액 $'+Number(risk.position_value).toFixed(2)+'</div>' +
+        '<div class="sub">총액 $'+Number(risk.position_value).toFixed(2)+'</div>' +
       '</div>' +
       '<div class="risk-card">' +
         '<div class="label">체결 / 거부</div>' +
@@ -813,7 +977,6 @@ async function updateRiskTab() {
         '<div class="sub">투자 가용 자금</div>' +
       '</div>';
 
-    // Concentration donut
     const conc = risk.concentration || [];
     if (conc.length) {
       const cashVal = risk.bankroll;
@@ -831,7 +994,6 @@ async function updateRiskTab() {
   }
 
   if (port) {
-    // Positions
     const tbody = $('pos-tbody');
     if (!port.positions || !port.positions.length) {
       tbody.innerHTML = '<tr><td colspan="7" class="empty">포지션 없음</td></tr>';
@@ -851,22 +1013,50 @@ async function updateRiskTab() {
     }
   }
 
-  // Trades
   const trades = await api('/api/trades');
   const trBody = $('trades-tbody');
   if (!trades || !trades.length) {
-    trBody.innerHTML = '<tr><td colspan="6" class="empty">거래 없음</td></tr>';
+    trBody.innerHTML = '<tr><td colspan="7" class="empty">거래 없음</td></tr>';
   } else {
-    trBody.innerHTML = trades.slice(0,30).map(t =>
-      '<tr>' +
+    trBody.innerHTML = trades.slice(0,30).map(t => {
+      const pnlHtml = t.pnl != null
+        ? '<span class="'+(t.pnl>=0?'g':'r')+'">'+(t.pnl>=0?'+':'')+fmt(t.pnl,3)+'</span>'
+        : '<span class="m">-</span>';
+      return '<tr>' +
         '<td class="m">'+t.time+'</td>' +
-        '<td class="'+stratClass(t.strategy)+'">'+(t.strategy||'-').replace('_convergence','').replace('_arbitrage','_arb')+'</td>' +
+        '<td class="'+stratClass(t.strategy)+'">'+(t.strategy||'-').replace(/_convergence/g,'').replace(/_arbitrage/g,'_arb')+'</td>' +
         '<td><span class="pill '+(t.side==='BUY'?'p-buy':'p-sell')+'">'+t.side+'</span></td>' +
         '<td>'+fmt(t.fill_price,4)+'</td>' +
         '<td>'+fmt(t.fill_size,4)+'</td>' +
-        '<td class="g">$'+fmt(t.fill_price*t.fill_size,2)+'</td>' +
-      '</tr>'
-    ).join('');
+        '<td class="a">$'+fmt(t.fill_price*t.fill_size,2)+'</td>' +
+        '<td>'+pnlHtml+'</td>' +
+      '</tr>';
+    }).join('');
+  }
+
+  const closed = await api('/api/closed_trades');
+  const clBody = $('closed-tbody');
+  $('closed-count').textContent = (closed ? closed.length : 0) + '건';
+  if (!closed || !closed.length) {
+    clBody.innerHTML = '<tr><td colspan="9" class="empty">청산 없음</td></tr>';
+  } else {
+    clBody.innerHTML = closed.map(t => {
+      const pnlPos = t.pnl >= 0;
+      const exitLabel = t.exit_source === 'actual'
+        ? fmt(t.exit_price,4)
+        : '<span title="추정" style="opacity:0.7;">~'+fmt(t.exit_price,4)+'</span>';
+      return '<tr>' +
+        '<td class="m" style="font-size:10px;">'+t.time+'</td>' +
+        '<td class="'+stratClass(t.strategy)+'">'+(t.strategy||'-').replace(/_convergence/g,'').replace(/_arbitrage/g,'_arb')+'</td>' +
+        '<td>'+fmt(t.entry_price,4)+'</td>' +
+        '<td class="'+(t.exit_price>=t.entry_price?'g':'r')+'">'+exitLabel+'</td>' +
+        '<td class="m">'+t.hold_time+'</td>' +
+        '<td>'+fmt(t.size_shares,2)+'</td>' +
+        '<td class="m">$'+fmt(t.cost_usd,2)+'</td>' +
+        '<td class="'+(pnlPos?'g':'r')+'">'+(pnlPos?'+':'')+fmt(t.pnl,3)+'</td>' +
+        '<td class="'+(pnlPos?'g':'r')+'">'+(pnlPos?'+':'')+fmt(t.pnl_pct,2)+'%</td>' +
+      '</tr>';
+    }).join('');
   }
 }
 
@@ -884,7 +1074,7 @@ async function loadCoinCharts() {
       if (el) el.textContent = '$' + Number(d.price).toLocaleString('en',{minimumFractionDigits:2, maximumFractionDigits:2});
       if (ch) {
         const up = d.change_24h >= 0;
-        ch.textContent = (up ? '▲ +' : '▼ ') + d.change_24h.toFixed(2) + '%';
+        ch.textContent = (up ? '+' : '') + d.change_24h.toFixed(2) + '%';
         ch.style.color = up ? 'var(--green)' : 'var(--red)';
       }
     }
@@ -916,14 +1106,25 @@ async function loadCoinCharts() {
 }
 
 // ── MAIN TICK ─────────────────────────────────────────────────────────
-async function tick() {
+let _tickCount = 0;
+
+async function tickFast() {
   await updateTopbar();
+}
+
+async function tickSlow() {
+  _tickCount++;
+  const heavy = (_tickCount % 6 === 0);
+
   if (activeTab === 'dashboard') {
-    await Promise.all([updateEquityCurve(), updateStratPerf(), updateFeed(), updateTopOpps()]);
+    const tasks = [updateStratPerf(), updateFeed(), updateTopOpps()];
+    if (heavy) tasks.push(updateEquityCurve());
+    await Promise.all(tasks);
+    if (_tickCount === 1) await updateEquityCurve();
   } else if (activeTab === 'scanner') {
     await loadScanner();
   } else if (activeTab === 'signals') {
-    await Promise.all([updateSignalsTab(), drawSignalCharts()]);
+    await Promise.all([updateSignalsTab(), drawSignalCharts(), updateCalibration()]);
   } else if (activeTab === 'risk') {
     await updateRiskTab();
   } else if (activeTab === 'coins') {
@@ -931,9 +1132,10 @@ async function tick() {
   }
 }
 
-// Init
-tick();
-setInterval(tick, 5000);  // refresh every 5s
+tickFast();
+tickSlow();
+setInterval(tickFast, 2000);
+setInterval(tickSlow, 5000);
 </script>
 </body>
 </html>

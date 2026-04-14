@@ -43,6 +43,12 @@ _STRATEGY_WEIGHTS = {
     "closing_convergence":  0.65,
     "order_flow":           0.50,
     "news_alpha":           0.40,
+    # ── 실험적 전략 (검증 전, 낮은 가중치) ────────────
+    # 캘리브레이션 백테스트 통과 후 상향 조정
+    "cross_platform":       0.85,  # Kalshi vs Polymarket — 크로스 거래소 구조적 차익
+    "limitless_arb":        0.85,  # Limitless vs Polymarket — 동일 구조 크로스 차익
+    "claude_oracle":        0.35,  # LLM 추정 — 편향 검증 전
+    "base_rate":            0.30,  # 무조건 기저율 — 조건부 모델 전환 전
 }
 
 _DEDUP_WINDOW_SEC  = 300   # 5 minutes

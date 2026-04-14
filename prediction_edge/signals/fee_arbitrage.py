@@ -29,7 +29,7 @@ from typing import Optional
 import config
 from core.logger import log
 from core.models import Market, Signal, Token, OrderBook
-from core.logger import log
+from risk.manipulation_guard import get_guard
 
 
 def compute_exact_fee(price: float, size_usd: float, is_taker: bool = True) -> float:
@@ -156,6 +156,18 @@ class FeeArbitrageScanner:
         if market.dispute_risk > config.ORACLE_DISPUTE_THRESHOLD_WARN:
             return None
 
+        # ── 만기 필터 — 근본 수정 ─────────────────────────────────────────────
+        # 97¢ 토큰이 "거의 확실"하려면 만기가 가까워야 한다.
+        # 만기 7일 이상 남은 마켓의 97¢는 뉴스 한 방에 19¢까지 떨어질 수 있다.
+        # 만기까지 7일 이내만 허용 (days_to_resolution < 7)
+        if market.days_to_resolution > 7:
+            return None
+
+        # ── 조작 감지 필터 ────────────────────────────────────────────────────
+        if get_guard().is_rejected(token.token_id):
+            log.warning(f"[FEE ARB] Skipped — manipulation on {token.token_id[:12]}")
+            return None
+
         # ── 유동성 필터 ───────────────────────────────────────────────────────
         # 거래량 없는 시장 = 스프레드 크고, 진입/청산 어려움
         if market.volume_24h < 5_000:
@@ -216,6 +228,11 @@ class FeeArbitrageScanner:
         if not yes_book or not no_book:
             return None
         if yes_book.is_stale() or no_book.is_stale():
+            return None
+
+        # Manipulation check on either leg
+        if get_guard().is_rejected(yes.token_id) or get_guard().is_rejected(no.token_id):
+            log.warning(f"[INTERNAL ARB] Skipped — manipulation detected")
             return None
 
         # Reject synthetic orderbooks (depth=500 is our sentinel value for fake books)

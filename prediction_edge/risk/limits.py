@@ -9,6 +9,7 @@ import time
 from core.models import Order, Signal, PortfolioState, Market
 from core.logger import log
 import config
+from risk.manipulation_guard import get_guard
 
 # ── 일일 트레이드 카운터 (프로세스 내 상태) ───────────────────────────────────
 _daily_trade_count: int = 0
@@ -49,7 +50,15 @@ def check_all(
     if _daily_trade_count >= MAX_DAILY_TRADES:
         return False, f"DAILY LIMIT: {_daily_trade_count}/{MAX_DAILY_TRADES} trades today"
 
-    # 1. 동시 포지션 한도
+    # 1. 잔고 부족 하드스탑 — asyncio 레이스 방지 (DRY_RUN 포함)
+    if portfolio.bankroll < config.MIN_ORDER_SIZE_USD:
+        return False, f"INSUFFICIENT BANKROLL: ${portfolio.bankroll:.2f}"
+
+    # 1b. 주문 금액이 잔고 초과 방지
+    if order.size_usd > portfolio.bankroll:
+        return False, f"ORDER_EXCEEDS_BANKROLL: ${order.size_usd:.2f} > ${portfolio.bankroll:.2f}"
+
+    # 1c. 동시 포지션 한도
     open_positions = len(portfolio.positions)
     if open_positions >= MAX_CONCURRENT_POSITIONS:
         # oracle_convergence는 항상 허용 (수렴 기회 놓치면 안 됨)
@@ -92,6 +101,11 @@ def check_all(
     # 6. Signal expiry
     if signal and signal.is_expired():
         return False, "EXPIRED SIGNAL"
+
+    # 7b. Manipulation guard — final safety net
+    guard = get_guard()
+    if guard.is_rejected(order.token_id):
+        return False, f"MANIPULATION DETECTED: score={guard.get_score(order.token_id):.2f}"
 
     # 7. Drawdown reduction (halve sizes but don't halt)
     if portfolio.drawdown >= config.MAX_DRAWDOWN_REDUCE:

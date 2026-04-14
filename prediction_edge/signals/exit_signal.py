@@ -64,9 +64,16 @@ def _should_exit(
         if days_to_res < _NEAR_RESOLUTION_DAYS and current_price > _HIGH_CONFIDENCE_PRICE:
             return f"near_resolution: {days_to_res:.1f}d left, price={current_price:.3f}"
 
-        # Rule 3: Near certain — lock in at >0.95 regardless
+        # Rule 3: Near certain — only exit if entry was NOT already near-certain
+        # fee_arb positions enter at 0.95+, so we hold them until 0.99+ (near full settlement)
+        # Regular positions entered < 0.90 can exit at 0.95
         if current_price >= _NEAR_CERTAIN_PRICE:
-            return f"near_certain: price={current_price:.3f} > {_NEAR_CERTAIN_PRICE}"
+            if entry >= 0.90:
+                # fee_arb / oracle entry — hold to near-full settlement
+                if current_price >= 0.99:
+                    return f"near_settlement: price={current_price:.3f} (entry was {entry:.3f})"
+            else:
+                return f"near_certain: price={current_price:.3f} > {_NEAR_CERTAIN_PRICE}"
 
         # Rule 4: Stale hold — held too long without enough gain
         if days_held > _STALE_HOLD_DAYS:

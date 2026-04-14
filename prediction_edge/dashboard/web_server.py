@@ -99,7 +99,7 @@ async def api_trades():
     try:
         conn = sqlite3.connect(config.DB_PATH)
         rows = conn.execute(
-            "SELECT order_id, condition_id, token_id, side, fill_price, fill_size, fee_paid, strategy, timestamp "
+            "SELECT order_id, condition_id, token_id, side, fill_price, size_shares, fee_paid, strategy, timestamp, pnl "
             "FROM trades ORDER BY timestamp DESC LIMIT 50"
         ).fetchall()
         conn.close()
@@ -115,9 +115,139 @@ async def api_trades():
                 "fee_paid": round(float(r[6] or 0), 4),
                 "strategy": r[7],
                 "time": time.strftime("%H:%M:%S", time.localtime(float(r[8] or 0))),
+                "pnl": round(float(r[9]), 3) if r[9] is not None else None,
             })
         return result
     except Exception as e:
+        return []
+
+
+@app.get("/api/closed_trades")
+async def api_closed_trades():
+    """
+    Closed trade pairs: BUY with realized P&L.
+    exit_price: 실제 SELL 체결가 (같은 token_id의 다음 SELL 거래 매칭).
+    SELL 없으면 pnl로 역산.
+    """
+    try:
+        conn = sqlite3.connect(config.DB_PATH)
+        rows = conn.execute("""
+            SELECT
+                b.condition_id, b.token_id,
+                b.fill_price   AS entry_price,
+                b.size_shares,
+                b.fee_paid     AS entry_fee,
+                b.strategy,
+                b.timestamp    AS entry_ts,
+                b.pnl,
+                (SELECT s.fill_price FROM trades s
+                 WHERE s.token_id = b.token_id AND s.side = 'SELL'
+                   AND s.timestamp > b.timestamp
+                 ORDER BY s.timestamp ASC LIMIT 1) AS exit_price_actual,
+                (SELECT s.timestamp FROM trades s
+                 WHERE s.token_id = b.token_id AND s.side = 'SELL'
+                   AND s.timestamp > b.timestamp
+                 ORDER BY s.timestamp ASC LIMIT 1) AS exit_ts
+            FROM trades b
+            WHERE b.side = 'BUY' AND b.pnl IS NOT NULL
+            ORDER BY b.timestamp DESC
+            LIMIT 50
+        """).fetchall()
+        conn.close()
+
+        result = []
+        for r in rows:
+            entry = float(r[2] or 0)
+            size  = float(r[3] or 0)
+            pnl   = float(r[7] or 0)
+            cost  = entry * size
+
+            # 실제 SELL 체결가 우선, 없으면 pnl로 역산
+            if r[8] is not None:
+                exit_price = float(r[8])
+                price_source = "actual"
+            else:
+                exit_price = (entry * size + pnl) / size if size > 0 else 0
+                price_source = "estimated"
+
+            pnl_pct = (pnl / cost * 100) if cost > 0 else 0
+            hold_sec = (float(r[9]) - float(r[6])) if r[9] else None
+            hold_str = (
+                f"{int(hold_sec//3600)}h{int((hold_sec%3600)//60)}m"
+                if hold_sec and hold_sec >= 3600
+                else f"{int(hold_sec//60)}m" if hold_sec else "-"
+            )
+
+            result.append({
+                "condition_id":  (r[0] or "")[:12],
+                "token_id":      (r[1] or "")[:12],
+                "entry_price":   round(entry, 4),
+                "exit_price":    round(exit_price, 4),
+                "exit_source":   price_source,
+                "size_shares":   round(size, 4),
+                "cost_usd":      round(cost, 2),
+                "pnl":           round(pnl, 3),
+                "pnl_pct":       round(pnl_pct, 2),
+                "strategy":      r[5],
+                "hold_time":     hold_str,
+                "time":          time.strftime("%m/%d %H:%M", time.localtime(float(r[6] or 0))),
+            })
+        return result
+    except Exception:
+        return []
+
+
+# 전략별 사전확률 (web_server 자체 참조용 — db.py와 동기화 유지)
+_CAL_PRIORS = {
+    "fee_arbitrage":       {"accuracy": 0.882, "n": 30},
+    "oracle_convergence":  {"accuracy": 0.780, "n": 20},
+    "closing_convergence": {"accuracy": 0.655, "n": 20},
+    "order_flow":          {"accuracy": 0.548, "n": 10},
+    "cross_platform":      {"accuracy": 0.680, "n": 15},
+    "correlated_arb":      {"accuracy": 0.620, "n": 15},
+}
+
+
+@app.get("/api/calibration")
+async def api_calibration():
+    """
+    전략별 캘리브레이션 상태.
+    Kelly 단계, prior blend 비율, 적중률, 캘리브레이션 오차.
+    """
+    try:
+        from core import db as _db
+        import config as _cfg
+
+        strategies = list(_CAL_PRIORS.keys())
+        phases = sorted(_cfg.KELLY_CALIBRATION_PHASES.items())
+        result = []
+
+        for strat in strategies:
+            cal = _db.get_calibration_stats(strat)
+            count = cal["count"]
+
+            # Kelly phase fraction
+            phase_frac = phases[0][1]
+            for min_t, f in phases:
+                if count >= min_t:
+                    phase_frac = f
+
+            prior = _CAL_PRIORS[strat]
+            n_prior = prior["n"]
+            blend_pct = round(n_prior / (n_prior + max(count, 1)) * 100, 1)
+
+            result.append({
+                "strategy":        strat,
+                "trade_count":     count,
+                "accuracy":        round(cal["accuracy"] * 100, 1),
+                "calib_error":     round(cal["calibration_error"] * 100, 2),
+                "kelly_phase":     round(phase_frac * 100, 1),
+                "prior_blend_pct": blend_pct,
+                "is_prior":        cal.get("is_prior", count == 0),
+                "prior_accuracy":  round(prior["accuracy"] * 100, 1),
+            })
+        return result
+    except Exception:
         return []
 
 
@@ -275,37 +405,21 @@ async def api_stats():
 
 @app.get("/api/equity_curve")
 async def api_equity_curve():
-    """Hourly portfolio value history for equity curve chart."""
+    """Portfolio value history from snapshots (5min interval)."""
     try:
         conn = sqlite3.connect(config.DB_PATH)
-        # Get cumulative P&L from trades grouped by hour
-        rows = conn.execute("""
-            SELECT
-                CAST(timestamp / 3600 AS INTEGER) * 3600 as hour_ts,
-                SUM(CASE WHEN side='BUY' THEN -(fill_price * size_shares + fee_paid)
-                         WHEN side='SELL' THEN fill_price * size_shares - fee_paid
-                         ELSE 0 END) as cash_flow,
-                COUNT(*) as trade_count
-            FROM trades
-            GROUP BY hour_ts
-            ORDER BY hour_ts ASC
-        """).fetchall()
+        rows = conn.execute(
+            "SELECT timestamp, total_value, positions FROM portfolio_snapshots ORDER BY timestamp ASC"
+        ).fetchall()
         conn.close()
 
         if not rows:
+            # No snapshots yet — show current value as single point
+            if _portfolio:
+                return [{"t": int(time.time() * 1000), "v": round(_portfolio.total_value, 2), "trades": 0}]
             return _synthetic_equity_curve()
 
-        bankroll = float(os.getenv("BANKROLL", "1000"))
-        points = []
-        cumulative = bankroll
-        for r in rows:
-            cumulative += r[1]  # cash_flow
-            points.append({
-                "t": r[0] * 1000,  # JS timestamp
-                "v": round(cumulative, 2),
-                "trades": r[2],
-            })
-        return points
+        return [{"t": int(r[0] * 1000), "v": round(r[1], 2), "trades": r[2]} for r in rows]
     except Exception:
         return _synthetic_equity_curve()
 
@@ -489,6 +603,16 @@ async def api_risk():
         "submitted": stats.get("submitted", 0),
         "rejected": stats.get("rejected", 0),
     }
+
+
+@app.get("/api/manipulation")
+async def api_manipulation():
+    """Manipulation guard status — wash trading & spoofing scores."""
+    try:
+        from risk.manipulation_guard import get_guard
+        return get_guard().get_report()
+    except Exception:
+        return []
 
 
 @app.get("/api/feed")

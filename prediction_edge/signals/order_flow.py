@@ -27,6 +27,7 @@ from core.models import Signal, OnChainTrade
 from core import db
 from core.logger import log
 from data.polymarket_rest import fetch_global_trades
+from risk.manipulation_guard import get_guard
 
 
 class OrderFlowMonitor:
@@ -87,6 +88,9 @@ class OrderFlowMonitor:
                 if not token_id or price <= 0:
                     continue
 
+                # Feed manipulation guard
+                get_guard().record_trade(token_id, maker, taker, price, size_usd)
+
                 # Track volume for spike detection
                 hist = self._volume_history.setdefault(token_id, [])
                 hist.append((ts, size_usd))
@@ -141,6 +145,11 @@ class OrderFlowMonitor:
 
         # Don't follow whales into near-certain markets (no room to move)
         if price > 0.92 or price < 0.08:
+            return None
+
+        # Manipulation check — skip if market shows wash/spoof patterns
+        if get_guard().is_rejected(token_id):
+            log.warning(f"[WHALE] Skipped — manipulation detected on {token_id[:12]}")
             return None
 
         # Check if price has already moved significantly (whale already front-ran us)
@@ -219,6 +228,11 @@ class OrderFlowMonitor:
 
         market = self._find_market_for_token(token_id)
         if not market:
+            return None
+
+        # Manipulation check — volume spikes + manipulation = pump & dump
+        if get_guard().is_rejected(token_id):
+            log.warning(f"[SPIKE] Skipped — manipulation detected on {token_id[:12]}")
             return None
 
         book = self._store.get_orderbook(token_id)

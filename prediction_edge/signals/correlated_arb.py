@@ -26,6 +26,7 @@ from typing import Literal, Optional
 import config
 from core.models import Market, Signal
 from core.logger import log
+from risk.manipulation_guard import get_guard
 
 
 RelType = Literal["subset", "superset", "exhaustive", "implication", "cascade"]
@@ -185,6 +186,10 @@ def _find_subset_violation(
     p_lead = yes_lead.price
     p_lag = yes_lag.price
 
+    # Skip near-zero or near-one prices — unreliable and cause huge share counts
+    if p_lag < 0.03 or p_lag > 0.97 or p_lead < 0.03 or p_lead > 0.97:
+        return None
+
     # Subset violation: specific event more likely than general event
     if p_lead > p_lag + config.MIN_EDGE_AFTER_FEES:
         # Lag market (the superset) is underpriced → BUY
@@ -330,6 +335,15 @@ class CorrelatedArbScanner:
         """
         yes_lag = lag.yes_token
         if not yes_lag:
+            return None
+
+        # Skip near-zero/near-one prices
+        if yes_lag.price < 0.03 or yes_lag.price > 0.97:
+            return None
+
+        # Manipulation check — don't follow cascade into manipulated markets
+        if get_guard().is_rejected(yes_lag.token_id):
+            log.warning(f"[CASCADE] Skipped — manipulation on lag market {yes_lag.token_id[:12]}")
             return None
 
         direction_up = new_lead_price > old_lead_price

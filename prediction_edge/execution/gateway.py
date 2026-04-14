@@ -207,10 +207,60 @@ class ExecutionGateway:
         return await self._submit_live(order, signal)
 
     def _simulate_fill(self, order: Order) -> Fill:
-        """Paper trading — assume immediate full fill at order price."""
+        """Paper trading — assume immediate full fill at order price.
+        IMPORTANT: deduct bankroll AND create position immediately
+        to prevent race condition where multiple concurrent orders
+        all see the same bankroll/total_value before fill_consumer runs."""
+        from core.models import Position
         self._submitted_count += 1
         shares = order.size_usd / order.price
         fee = order.price * (1 - order.price) * config.TAKER_FEE_RATE * shares
+
+        # ── Immediate bankroll + position update ──────────────────────────
+        key = order.token_id
+        if order.side == "BUY":
+            self._portfolio.bankroll -= order.price * shares + fee
+            # Create/update position immediately so total_value stays correct
+            if key in self._portfolio.positions:
+                existing = self._portfolio.positions[key]
+                total_shares = existing.size_shares + shares
+                avg_price = (
+                    (existing.avg_entry_price * existing.size_shares + order.price * shares)
+                    / total_shares
+                )
+                self._portfolio.positions[key] = existing.model_copy(update={
+                    "size_shares": total_shares,
+                    "avg_entry_price": avg_price,
+                    "current_price": order.price,
+                })
+            else:
+                self._portfolio.positions[key] = Position(
+                    condition_id=order.condition_id,
+                    token_id=order.token_id,
+                    side="BUY",
+                    size_shares=shares,
+                    avg_entry_price=order.price,
+                    current_price=order.price,
+                )
+        else:
+            self._portfolio.bankroll += order.price * shares - fee
+            if key in self._portfolio.positions:
+                existing = self._portfolio.positions[key]
+                new_size = existing.size_shares - shares
+                realized = (order.price - existing.avg_entry_price) * shares - fee
+                self._portfolio.realized_pnl += realized
+                if new_size <= 0.001:
+                    del self._portfolio.positions[key]
+                else:
+                    self._portfolio.positions[key] = existing.model_copy(update={
+                        "size_shares": new_size,
+                        "current_price": order.price,
+                    })
+
+        # Update peak for correct drawdown calculation
+        if self._portfolio.total_value > self._portfolio.peak_value:
+            self._portfolio.peak_value = self._portfolio.total_value
+
         fill = Fill(
             order_id=f"dry_{self._submitted_count}",
             condition_id=order.condition_id,
@@ -222,7 +272,7 @@ class ExecutionGateway:
         )
         log.info(
             f"[DRY RUN] {order.side} ${order.size_usd:.2f} @ {order.price:.4f} "
-            f"| {order.strategy} | fee=${fee:.4f}"
+            f"| {order.strategy} | fee=${fee:.4f} | bankroll=${self._portfolio.bankroll:.2f}"
         )
         db.insert_trade(
             fill.order_id, fill.condition_id, fill.token_id,

@@ -60,6 +60,10 @@ class Market(BaseModel):
     def days_to_resolution(self) -> float:
         from datetime import datetime, timezone, date
         try:
+            # Empty end_date = unknown resolution → treat as far away (SAFE default)
+            # This prevents fee_arb from entering markets with no known end date
+            if not self.end_date_iso or len(self.end_date_iso) < 8:
+                return 9999.0
             s = self.end_date_iso.replace("Z", "+00:00")
             # Handle both "2026-04-12" (date only) and "2026-04-12T00:00:00+00:00"
             if "T" in s:
@@ -70,7 +74,7 @@ class Market(BaseModel):
             now = datetime.now(timezone.utc)
             return max(0.0, (end - now).total_seconds() / 86400)
         except Exception:
-            return 30.0
+            return 9999.0  # unknown → assume far away (conservative)
 
     @computed_field
     @property
@@ -152,6 +156,7 @@ SignalStrategy = Literal[
     "internal_arb",
     "correlated_arb",
     "cross_platform",
+    "limitless_arb",
     "closing_convergence",
     "oracle_convergence",
     "order_flow",
@@ -159,6 +164,8 @@ SignalStrategy = Literal[
     "fee_arbitrage",
     "mm_rebalance",
     "news_alpha",
+    "claude_oracle",
+    "base_rate",
 ]
 
 class Signal(BaseModel):
@@ -271,7 +278,10 @@ class PortfolioState(BaseModel):
     @computed_field
     @property
     def total_value(self) -> float:
-        return self.bankroll + self.unrealized_pnl
+        position_value = sum(
+            p.current_price * p.size_shares for p in self.positions.values()
+        )
+        return self.bankroll + position_value
 
     @computed_field
     @property

@@ -34,6 +34,13 @@ API_PASSPHRASE = os.getenv("POLY_API_PASSPHRASE", "")
 KALSHI_ACCESS_KEY      = os.getenv("KALSHI_ACCESS_KEY", "")       # Kalshi key ID (UUID)
 KALSHI_PRIVATE_KEY_B64 = os.getenv("KALSHI_PRIVATE_KEY_B64", "")  # base64(private_key_pem)
 
+# ── Limitless Exchange (Base chain, Polymarket fork) ───────────────────────
+LIMITLESS_API_BASE     = "https://api.limitless.exchange"
+LIMITLESS_API_KEY      = os.getenv("LIMITLESS_API_KEY", "")       # X-API-Key header
+LIMITLESS_PRIVATE_KEY  = os.getenv("LIMITLESS_PRIVATE_KEY", "")   # EVM wallet key for signing orders
+LIMITLESS_CHAIN_ID     = 8453  # Base
+LIMITLESS_USDC         = "0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913"
+
 # ── Trading parameters ───────────────────────────────────────────────────────
 # $100 시드 최적화:
 # - 최소 주문 $2 (Polymarket 최소값)
