@@ -288,6 +288,7 @@ class DashboardServer {
       // ── 글로벌 거래소 ──────────────────────────────────────
       globalListings: bot.listingScanner?.getSummary() || null,
       crossArb:       bot.crossArb?.getSummary() || null,
+      arbExecutor:    bot.arbExecutor?.getSummary() || null,
     };
   }
 
@@ -626,6 +627,29 @@ body{font-family:-apple-system,'SF Pro Display','Pretendard',sans-serif;backgrou
       <div id="ex-arb-spread" style="font-size:.66rem;color:var(--yellow);margin-top:1px">—</div>
     </div>
   </div>
+</div>
+
+<!-- ─── 아비트라지 실행 엔진 패널 ─── -->
+<div style="background:var(--card);border:1px solid var(--border);border-radius:8px;padding:10px 12px;margin-bottom:8px">
+  <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:6px">
+    <span style="font-size:.78rem;font-weight:700;color:var(--text)">Arb Executor</span>
+    <span id="arb-mode" style="font-size:.64rem;padding:1px 6px;border-radius:3px;background:var(--muted);color:var(--bg)">—</span>
+  </div>
+  <div style="display:grid;grid-template-columns:1fr 1fr 1fr;gap:4px 10px">
+    <div style="font-size:.66rem;color:var(--muted)">오늘 실행</div>
+    <div style="font-size:.66rem;color:var(--muted)">오늘 수익</div>
+    <div style="font-size:.66rem;color:var(--muted)">승률</div>
+    <div id="arb-daily-trades" style="font-size:.82rem;font-weight:700;color:var(--text)">0</div>
+    <div id="arb-daily-profit" style="font-size:.82rem;font-weight:700;color:var(--green)">$0</div>
+    <div id="arb-winrate" style="font-size:.82rem;font-weight:700;color:var(--text)">—</div>
+    <div style="font-size:.66rem;color:var(--muted)">누적 거래</div>
+    <div style="font-size:.66rem;color:var(--muted)">누적 수익</div>
+    <div style="font-size:.66rem;color:var(--muted)">평균 스프레드</div>
+    <div id="arb-total-trades" style="font-size:.82rem;font-weight:700;color:var(--text)">0</div>
+    <div id="arb-total-profit" style="font-size:.82rem;font-weight:700;color:var(--green)">$0</div>
+    <div id="arb-avg-spread" style="font-size:.82rem;font-weight:700;color:var(--yellow)">—</div>
+  </div>
+  <div id="arb-history" style="margin-top:6px;font-size:.62rem;color:var(--muted);max-height:60px;overflow-y:auto"></div>
 </div>
 
 <!-- ─── 전략 패널 ─── -->
@@ -1011,6 +1035,35 @@ function update(d){
   } else {
     c("ex-arb-spread").textContent = "차익 기회 없음";
     c("ex-arb-spread").style.color = "var(--muted)";
+  }
+
+  // ── ArbExecutor 통계 ──────────────────────────────────────
+  if (d.arbExecutor) {
+    const a = d.arbExecutor;
+    c("arb-mode").textContent  = a.dryRun ? "시뮬" : "실거래";
+    c("arb-mode").style.background = a.dryRun ? "var(--yellow)" : "var(--green)";
+    c("arb-daily-trades").textContent = a.dailyTrades;
+    c("arb-daily-profit").textContent = "$"+a.dailyProfitUsd.toFixed(2);
+    c("arb-daily-profit").style.color = a.dailyProfitUsd>=0?"var(--green)":"var(--red)";
+    c("arb-total-trades").textContent = a.totalTrades;
+    c("arb-total-profit").textContent = "$"+a.totalProfitUsd.toFixed(2);
+    c("arb-total-profit").style.color = a.totalProfitUsd>=0?"var(--green)":"var(--red)";
+    c("arb-winrate").textContent = a.winRate!=null ? a.winRate+"%" : "—";
+    c("arb-winrate").style.color = a.winRate>=80?"var(--green)":a.winRate>=50?"var(--yellow)":"var(--red)";
+    c("arb-avg-spread").textContent = a.avgSpread>0 ? a.avgSpread+"%" : "—";
+    // 최근 거래 내역
+    const hEl = c("arb-history");
+    if (a.history && a.history.length>0) {
+      hEl.innerHTML = a.history.map(function(h){
+        var col = h.profitUsd>=0?"var(--green)":"var(--red)";
+        var t = new Date(h.timestamp).toLocaleTimeString("ko-KR",{hour:"2-digit",minute:"2-digit"});
+        return '<div style="display:flex;justify-content:space-between;padding:1px 0">'+
+          '<span>'+t+' '+h.coin+' '+h.buyExchange+'→'+h.sellExchange+'</span>'+
+          '<span style="color:'+col+'">$'+(h.profitUsd>=0?"+":"")+h.profitUsd.toFixed(2)+' ('+h.spreadPct+'%)</span></div>';
+      }).join("");
+    } else {
+      hEl.innerHTML = '<div style="text-align:center;padding:4px">실행 내역 없음</div>';
+    }
   }
 
   if (d.funding) {

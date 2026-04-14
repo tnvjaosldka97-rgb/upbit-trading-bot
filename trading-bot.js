@@ -27,6 +27,7 @@ const { TradeLogger }          = require("./trade-logger");
 const { createExchange }       = require("./exchange-adapter");
 const { GlobalListingScanner } = require("./global-listing-scanner");
 const { CrossExchangeArb }     = require("./cross-exchange-arb");
+const { ArbExecutor }          = require("./arb-executor");
 
 try { require("dotenv").config(); } catch {}
 
@@ -77,6 +78,15 @@ class TradingBot {
       scanInterval: 30_000,
     });
 
+    // ── 아비트라지 동시 실행 엔진 ──────────────────────────────
+    this.arbExecutor = new ArbExecutor({
+      exchanges:      this.exchanges,
+      tradeLogger:    this.tradeLogger,
+      usdKrw:         1350,
+      dryRun:         DRY_RUN,
+      maxPositionUsd: Number(process.env.ARB_MAX_POSITION_USD || 500),
+    });
+
     // ── 교차 거래소 차익 거래 감지 ────────────────────────────
     this.crossArb = new CrossExchangeArb({
       exchanges:    Object.values(this.exchanges),
@@ -86,6 +96,10 @@ class TradingBot {
         console.log(
           `[Bot] 차익 기회 알림 — ${opp.coin}: ` +
           `${opp.buyExchange} → ${opp.sellExchange} | 스프레드 ${opp.spreadPct}%`
+        );
+        // ArbExecutor로 동시 실행 전달
+        this.arbExecutor.execute(opp).catch(e =>
+          console.error("[Bot] ArbExecutor 실행 오류:", e.message)
         );
       },
     });
@@ -203,11 +217,14 @@ class TradingBot {
     });
     console.log("[Bot] 글로벌 신규 상장 스캐너 시작 (Binance/Bybit/Upbit 병렬 스캔)");
 
-    // CrossArb에 환율 주입 (매크로엔진 연동)
+    // CrossArb + ArbExecutor에 환율 주입 (매크로엔진 연동)
     const _syncArbRate = () => {
       const rate = this.macroEngine._cachedUsdKrw
         || (this.mds.state.fxUsd?.basePrice ? Number(this.mds.state.fxUsd.basePrice) : null);
-      if (rate) this.crossArb.setUsdKrw(rate);
+      if (rate) {
+        this.crossArb.setUsdKrw(rate);
+        this.arbExecutor.setUsdKrw(rate);
+      }
     };
     _syncArbRate();
     setInterval(_syncArbRate, 60_000);
@@ -216,6 +233,7 @@ class TradingBot {
       console.error("[Bot] CrossExchangeArb 시작 실패:", e.message);
     });
     console.log("[Bot] 교차 거래소 차익 감지 시작 (15초 주기)");
+    console.log(`[Bot] ArbExecutor 시작 — ${DRY_RUN ? "시뮬레이션" : "실거래⚡"} | 최대 $${this.arbExecutor._maxPosUsd}/건`);
 
     // ── 시작 시 포지션 복구 ──────────────────────────
     if (!DRY_RUN && this.orderService.getSummary().hasApiKeys) {
