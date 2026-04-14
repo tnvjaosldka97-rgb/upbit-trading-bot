@@ -285,6 +285,9 @@ class DashboardServer {
       })),
       tradeStats: bot.tradeLogger?.getStats() || {},
       alpha: bot.alphaEngine?.getSummary() || null,
+      // ── 글로벌 거래소 ──────────────────────────────────────
+      globalListings: bot.listingScanner?.getSummary() || null,
+      crossArb:       bot.crossArb?.getSummary() || null,
     };
   }
 
@@ -603,18 +606,24 @@ body{font-family:-apple-system,'SF Pro Display','Pretendard',sans-serif;backgrou
   </div>
 
   <div class="info-cell">
-    <div class="info-label">전략 가동 상태</div>
-    <div style="display:flex;flex-direction:column;gap:4px">
+    <div class="info-label">Global Exchanges</div>
+    <div style="display:flex;flex-direction:column;gap:3px">
       <div style="display:flex;align-items:center;gap:6px">
-        <div id="strat-a-dot" style="width:7px;height:7px;border-radius:50%;background:var(--muted);flex-shrink:0"></div>
-        <span style="font-size:.72rem;color:var(--muted)">A:</span>
-        <span id="strat-a-status" style="font-size:.72rem;font-weight:700;color:var(--muted)">—</span>
+        <div id="ex-binance-dot" style="width:7px;height:7px;border-radius:50%;background:var(--muted);flex-shrink:0"></div>
+        <span style="font-size:.72rem;color:var(--muted)">Binance:</span>
+        <span id="ex-binance-status" style="font-size:.72rem;font-weight:700;color:var(--muted)">—</span>
       </div>
       <div style="display:flex;align-items:center;gap:6px">
-        <div id="strat-b-dot" style="width:7px;height:7px;border-radius:50%;background:var(--green);flex-shrink:0;box-shadow:0 0 5px var(--green)"></div>
-        <span style="font-size:.72rem;color:var(--muted)">B:</span>
-        <span id="strat-b-status" style="font-size:.72rem;font-weight:700;color:var(--green)">모니터링</span>
+        <div id="ex-bybit-dot" style="width:7px;height:7px;border-radius:50%;background:var(--muted);flex-shrink:0"></div>
+        <span style="font-size:.72rem;color:var(--muted)">Bybit:</span>
+        <span id="ex-bybit-status" style="font-size:.72rem;font-weight:700;color:var(--muted)">—</span>
       </div>
+      <div style="display:flex;align-items:center;gap:6px">
+        <div id="ex-upbit-dot" style="width:7px;height:7px;border-radius:50%;background:var(--green);flex-shrink:0;box-shadow:0 0 5px var(--green)"></div>
+        <span style="font-size:.72rem;color:var(--muted)">Upbit:</span>
+        <span id="ex-upbit-status" style="font-size:.72rem;font-weight:700;color:var(--green)">연결됨</span>
+      </div>
+      <div id="ex-arb-spread" style="font-size:.66rem;color:var(--yellow);margin-top:1px">—</div>
     </div>
   </div>
 </div>
@@ -972,12 +981,36 @@ function update(d){
     const vs = d.btcRegime.btcVsSma200;
     c("regime-detail").textContent = vs!=null ? "SMA200 대비 "+(vs>=0?"+":"")+vs+"%" : "SMA200 대비 —";
     c("regime-detail").style.color = vs>=0?"var(--green)":"var(--red)";
-    // 전략 A 상태
-    const aActive = rc==="BULL";
-    c("strat-a-dot").style.background  = aActive?"var(--green)":"var(--muted)";
-    c("strat-a-dot").style.boxShadow   = aActive?"0 0 5px var(--green)":"none";
-    c("strat-a-status").textContent    = aActive?"가동 중":rc+" 레짐 (대기)";
-    c("strat-a-status").style.color    = aActive?"var(--green)":"var(--muted)";
+  }
+
+  // ─ 글로벌 거래소 상태
+  if (d.globalListings) {
+    const gl = d.globalListings;
+    const exs = gl.exchanges || {};
+    for (const key of ["binance","bybit","upbit"]) {
+      const ex = exs[key];
+      const dot = c("ex-"+key+"-dot");
+      const st  = c("ex-"+key+"-status");
+      if (ex && ex.connected) {
+        dot.style.background = "var(--green)";
+        dot.style.boxShadow  = "0 0 5px var(--green)";
+        st.textContent       = ex.marketCount+"개 마켓";
+        st.style.color       = "var(--green)";
+      } else {
+        dot.style.background = "var(--muted)";
+        dot.style.boxShadow  = "none";
+        st.textContent       = "대기중";
+        st.style.color       = "var(--muted)";
+      }
+    }
+  }
+  if (d.crossArb && d.crossArb.topOpportunity) {
+    const top = d.crossArb.topOpportunity;
+    c("ex-arb-spread").textContent = "Arb: "+top.coin+" "+top.spreadPct+"% ("+top.buy+"->"+top.sell+")";
+    c("ex-arb-spread").style.color = "var(--yellow)";
+  } else {
+    c("ex-arb-spread").textContent = "차익 기회 없음";
+    c("ex-arb-spread").style.color = "var(--muted)";
   }
 
   if (d.funding) {

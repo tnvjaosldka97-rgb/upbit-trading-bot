@@ -24,6 +24,9 @@ const { StrategyB }            = require("./strategy-b");
 const { AlphaEngine }          = require("./alpha-engine");
 const { BybitFundingEngine }   = require("./bybit-funding-engine");
 const { TradeLogger }          = require("./trade-logger");
+const { createExchange }       = require("./exchange-adapter");
+const { GlobalListingScanner } = require("./global-listing-scanner");
+const { CrossExchangeArb }     = require("./cross-exchange-arb");
 
 try { require("dotenv").config(); } catch {}
 
@@ -59,6 +62,33 @@ class TradingBot {
     this.upbitWs       = new UpbitWebSocket();
     this.tradeLogger   = new TradeLogger("./trades.db");
     this._wsBtcPrice  = null;   // WS 실시간 BTC 가격
+
+    // ── 글로벌 거래소 어댑터 ─────────────────────────────────
+    this.exchanges = {
+      upbit:   createExchange("upbit",   { apiKey: process.env.UPBIT_ACCESS_KEY,  secretKey: process.env.UPBIT_SECRET_KEY }),
+      binance: createExchange("binance", { apiKey: process.env.BINANCE_API_KEY,   secretKey: process.env.BINANCE_SECRET_KEY }),
+      bybit:   createExchange("bybit",   { apiKey: process.env.BYBIT_API_KEY,     secretKey: process.env.BYBIT_SECRET_KEY }),
+    };
+
+    // ── 글로벌 신규 상장 스캐너 ──────────────────────────────
+    this.listingScanner = new GlobalListingScanner({
+      exchanges: Object.values(this.exchanges),
+      onNewListing: (listing) => this._onGlobalListing(listing),
+      scanInterval: 30_000,
+    });
+
+    // ── 교차 거래소 차익 거래 감지 ────────────────────────────
+    this.crossArb = new CrossExchangeArb({
+      exchanges:    Object.values(this.exchanges),
+      usdKrw:       1350,
+      minSpreadPct: 1.5,
+      onOpportunity: (opp) => {
+        console.log(
+          `[Bot] 차익 기회 알림 — ${opp.coin}: ` +
+          `${opp.buyExchange} → ${opp.sellExchange} | 스프레드 ${opp.spreadPct}%`
+        );
+      },
+    });
 
     // ── Strategy A/B ─────────────────────────────────
     // 모든 엔진을 각 전략에 주입 → 신호 퓨전 가능
@@ -103,11 +133,15 @@ class TradingBot {
 
   async start() {
     console.log("══════════════════════════════════════════");
-    console.log("  ATS v9 — 상위 0.1% 트레이딩 봇");
+    console.log("  ATS v9 — Global Multi-Exchange Trading Bot");
     console.log(`  모드:     ${BOT_MODE}`);
     console.log(`  자본:     ${INITIAL_KRW.toLocaleString()}원`);
     console.log(`  실거래:   ${DRY_RUN ? "OFF (시뮬레이션만)" : "ON ⚡"}`);
     console.log(`  API 키:   ${this.orderService.getSummary().hasApiKeys ? "연결됨" : "없음 ⚠"}`);
+    console.log("  ── 거래소 연결 상태 ──");
+    console.log(`  Upbit:    ${process.env.UPBIT_ACCESS_KEY ? "API 키 있음" : "공개 API만"}`);
+    console.log(`  Binance:  ${process.env.BINANCE_API_KEY ? "API 키 있음" : "공개 API만"}`);
+    console.log(`  Bybit:    ${process.env.BYBIT_API_KEY ? "API 키 있음" : "공개 API만"}`);
     console.log("══════════════════════════════════════════");
 
     // ── 실거래 모드 프리플라이트 체크 ──────────────────
@@ -163,6 +197,26 @@ class TradingBot {
     this.strategyB.setWebSocket(this.upbitWs);   // 신규상장 포지션 실시간 감시
     console.log(`[Bot] Strategy B 시작 (신규상장) — 자본 ${CAPITAL_B.toLocaleString()}원`);
 
+    // ── 글로벌 스캐너 + 차익 감지 시작 ──────────────────────
+    await this.listingScanner.start().catch(e => {
+      console.error("[Bot] GlobalListingScanner 시작 실패:", e.message);
+    });
+    console.log("[Bot] 글로벌 신규 상장 스캐너 시작 (Binance/Bybit/Upbit 병렬 스캔)");
+
+    // CrossArb에 환율 주입 (매크로엔진 연동)
+    const _syncArbRate = () => {
+      const rate = this.macroEngine._cachedUsdKrw
+        || (this.mds.state.fxUsd?.basePrice ? Number(this.mds.state.fxUsd.basePrice) : null);
+      if (rate) this.crossArb.setUsdKrw(rate);
+    };
+    _syncArbRate();
+    setInterval(_syncArbRate, 60_000);
+
+    await this.crossArb.start().catch(e => {
+      console.error("[Bot] CrossExchangeArb 시작 실패:", e.message);
+    });
+    console.log("[Bot] 교차 거래소 차익 감지 시작 (15초 주기)");
+
     // ── 시작 시 포지션 복구 ──────────────────────────
     if (!DRY_RUN && this.orderService.getSummary().hasApiKeys) {
       const recovered = await this.orderService
@@ -195,6 +249,35 @@ class TradingBot {
       try { await this.tick(); }
       catch (e) { console.error("[Bot] tick 오류:", e.message); }
     }, 5_000);
+  }
+
+  // ─── 글로벌 신규 상장 콜백 ──────────────────────────────
+  // GlobalListingScanner에서 호출 — Binance/Bybit/Upbit 신규 상장 시
+  _onGlobalListing(listing) {
+    console.log(
+      `[Bot] 글로벌 신규 상장: ${listing.base} @ ${listing.exchangeName} ` +
+      `(우선순위: ${listing.priority}) ` +
+      (listing.alreadyOnOther ? `[이미: ${listing.alreadyOn.join(",")}]` : "[최초!]")
+    );
+
+    // Upbit 상장인 경우 Strategy B에 연동 (기존 로직 활용)
+    if (listing.exchange === "upbit") {
+      const market = `KRW-${listing.base}`;
+      if (!this.strategyB.actedListings.has(market)) {
+        this.strategyB.actedListings.add(market);
+        this.strategyB.detections.unshift({
+          market,
+          detectedAt: listing.detectedAt,
+          status: "글로벌감지",
+        });
+        this.strategyB._enter(market).catch(e =>
+          console.error("[Bot] 글로벌→StrategyB 진입 오류:", e.message)
+        );
+      }
+    }
+
+    // 차익 거래 모니터링에 코인 추가
+    this.crossArb.addCoin(listing.base);
   }
 
   // ─── 5초 메인 틱 ────────────────────────────────────
@@ -479,6 +562,8 @@ class TradingBot {
     this.dataEngine.stop();
     this.strategyA.stop();
     this.strategyB.stop();
+    this.listingScanner.stop();
+    this.crossArb.stop();
     this.tradeLogger.close();
 
     if (this.livePosition && !DRY_RUN && this.orderService.getSummary().hasApiKeys) {
