@@ -526,13 +526,13 @@ class StrategyB {
       // ── Binance 직접 체크 (가장 정확한 독점성 지표) ─────
       const bnData = bnResult.status === "fulfilled" ? bnResult.value : null;
       if (bnData?.ok) {
-        // 바이낸스에 있음 → 독점 프리미엄 없음
-        score -= 25;
-        flags.push("바이낸스_상장됨");
+        // 바이낸스에 있음 → 업비트 상장 펌핑은 나오되 독점보단 약함
+        score -= 8;
+        flags.push("바이낸스O(독점아님)");
       } else if (bnData && !bnData.ok) {
-        // 바이낸스에 없음 → 업비트 독점 가능성!
+        // 바이낸스에 없음 → 업비트 독점! 최강 FOMO
         score += 25;
-        flags.push("바이낸스_미상장(독점!)");
+        flags.push("바이낸스X(독점!)");
       }
       // 네트워크 오류면 Binance 체크 스킵 (CoinGecko만으로 판단)
 
