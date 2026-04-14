@@ -21,6 +21,7 @@ const { UpbitWebSocket }       = require("./upbit-websocket");
 const { DashboardServer }      = require("./dashboard-server");
 const { StrategyA }            = require("./strategy-a");
 const { StrategyB }            = require("./strategy-b");
+const { AlphaEngine }          = require("./alpha-engine");
 const { BybitFundingEngine }   = require("./bybit-funding-engine");
 const { TradeLogger }          = require("./trade-logger");
 
@@ -54,6 +55,7 @@ class TradingBot {
     this.dataEngine   = new DataAggregationEngine(this.mds);
     this.regimeEngine  = new RegimeEngine();
     this.fundingEngine = new BybitFundingEngine();
+    this.alphaEngine   = new AlphaEngine();
     this.upbitWs       = new UpbitWebSocket();
     this.tradeLogger   = new TradeLogger("./trades.db");
     this._wsBtcPrice  = null;   // WS 실시간 BTC 가격
@@ -74,6 +76,7 @@ class TradingBot {
       dataEngine:    this.dataEngine,   // DataEngine 연동 → 중복 폴링 제거
       initialCapital: CAPITAL_B,
       tradeLogger:   this.tradeLogger,
+      alphaEngine:   this.alphaEngine,  // AlphaEngine 연동 → 체결강도+김프+변동성 적응
     });
 
     // 실거래 포지션 (구 MDS 기반, 참조용 유지)
@@ -127,6 +130,15 @@ class TradingBot {
     this.macroEngine.start();
     this.mds.setMacroEngine(this.macroEngine);
     console.log("[Bot] 매크로 시그널 엔진 시작 (김치 프리미엄 / 펀딩비 / 공포탐욕)");
+
+    // AlphaEngine에 USD/KRW 환율 주입 (매크로엔진 환율 연동)
+    const _syncUsdKrw = () => {
+      const rate = this.macroEngine._cachedUsdKrw
+        || (this.mds.state.fxUsd?.basePrice ? Number(this.mds.state.fxUsd.basePrice) : null);
+      if (rate) this.alphaEngine.setUsdKrw(rate);
+    };
+    _syncUsdKrw();
+    setInterval(_syncUsdKrw, 60_000);  // 1분마다 환율 동기화
 
     this.dataEngine.start();
     this.mds.setDataEngine(this.dataEngine);

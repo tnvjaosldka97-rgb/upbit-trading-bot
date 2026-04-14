@@ -284,6 +284,7 @@ class DashboardServer {
         createdAt: t.created_at,
       })),
       tradeStats: bot.tradeLogger?.getStats() || {},
+      alpha: bot.alphaEngine?.getSummary() || null,
     };
   }
 
@@ -779,6 +780,20 @@ body{font-family:-apple-system,'SF Pro Display','Pretendard',sans-serif;backgrou
       <div id="checks-ops"    class="check-group"><div class="check-glbl">운영</div><div class="checks" id="cg-ops"></div></div>
     </div>
 
+    <!-- 알파 퍼포먼스 -->
+    <div class="cal-section" id="alpha-section" style="display:none">
+      <div class="sec-title">Alpha Performance</div>
+      <div class="cal-stats" style="width:100%">
+        <div class="stat-line"><span class="sl-lbl">Tape 정확도</span><span class="sl-val" id="al-tape">—</span></div>
+        <div class="stat-line"><span class="sl-lbl">평균 진입타이밍</span><span class="sl-val" id="al-timing">—</span></div>
+        <div class="stat-line"><span class="sl-lbl">김치 엣지</span><span class="sl-val" id="al-kimchi">—</span></div>
+        <div class="stat-line"><span class="sl-lbl">추적 거래</span><span class="sl-val" id="al-trades">—</span></div>
+        <div class="stat-line"><span class="sl-lbl">최고 신호</span><span class="sl-val" id="al-best">—</span></div>
+        <div class="stat-line"><span class="sl-lbl">평균 PnL</span><span class="sl-val" id="al-pnl">—</span></div>
+        <div class="stat-line"><span class="sl-lbl">승률</span><span class="sl-val" id="al-wr">—</span></div>
+      </div>
+    </div>
+
     <!-- 공포탐욕 -->
     <div class="fg-section">
       <div class="fg-top">
@@ -1127,6 +1142,26 @@ function update(d){
   c("c-ev").style.color   = d.cal.ev!=null && d.cal.ev>0 ? "var(--green)" : "var(--red)";
   c("c-kelly").textContent = d.cal.kelly!=null ? d.cal.kelly+"%" : "—";
   c("c-pend").textContent  = d.cal.pending+"건";
+
+  // ─ Alpha Performance
+  if(d.alpha){
+    const al = d.alpha;
+    c("alpha-section").style.display = "";
+    c("al-tape").textContent = al.tapeAccuracy!=null ? al.tapeAccuracy+"%" : "—";
+    c("al-tape").style.color = al.tapeAccuracy!=null && al.tapeAccuracy>=60 ? "var(--green)" : al.tapeAccuracy!=null && al.tapeAccuracy<40 ? "var(--red)" : "var(--text)";
+    c("al-timing").textContent = al.avgEntryTiming>0 ? al.avgEntryTiming+"분" : "—";
+    c("al-kimchi").textContent = al.kimchiEdge!=null ? (al.kimchiEdge>=0?"+":"")+al.kimchiEdge+"%" : "—";
+    c("al-kimchi").style.color = al.kimchiEdge!=null && al.kimchiEdge>0 ? "var(--green)" : al.kimchiEdge!=null && al.kimchiEdge<0 ? "var(--red)" : "var(--text)";
+    c("al-trades").textContent = al.totalTrades+"건";
+    c("al-best").textContent = al.bestStrategy || "—";
+    c("al-best").style.color = al.bestStrategy==="STRONG_BUY" ? "var(--green)" : al.bestStrategy==="BUY" ? "var(--cyan)" : "var(--text)";
+    c("al-pnl").textContent = al.avgPnl!=null ? (al.avgPnl>=0?"+":"")+al.avgPnl+"%" : "—";
+    c("al-pnl").style.color = al.avgPnl>0 ? "var(--green)" : al.avgPnl<0 ? "var(--red)" : "var(--text)";
+    c("al-wr").textContent = al.winRate>0 ? al.winRate+"%" : "—";
+    c("al-wr").style.color = al.winRate>=50 ? "var(--green)" : al.winRate>0 ? "var(--red)" : "var(--text)";
+  } else {
+    c("alpha-section").style.display = "none";
+  }
 
   // ─ Strategy A
   if(d.strategyA){

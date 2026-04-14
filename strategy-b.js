@@ -41,12 +41,13 @@ const MIN_TRADE_COUNT     = 20;          // 최소 체결 건수 (워시트레�
 const STABLECOINS = new Set(["USDT","USDC","DAI","BUSD","TUSD","FDUSD","PYUSD","USDD","FRAX"]);
 
 class StrategyB {
-  constructor({ orderService, dataEngine, initialCapital, dryRun, tradeLogger }) {
+  constructor({ orderService, dataEngine, initialCapital, dryRun, tradeLogger, alphaEngine }) {
     this.orderService   = orderService;
     this.dataEngine     = dataEngine;   // DataEngine 연동 (선택적)
     this.dryRun         = dryRun ?? true;
     this.initialCapital = initialCapital;
     this._logger        = tradeLogger || null;
+    this._alpha         = alphaEngine || null;  // AlphaEngine 연동
 
     // 독립 폴링용 (DataEngine 없을 때 폴백)
     this.knownMarkets = new Set();
@@ -192,12 +193,31 @@ class StrategyB {
     const pos = this.sim.positions.get(market);
     if (!pos) return;
 
+    // 적응형 파라미터 (AlphaEngine 사용 시)
+    const partialAt = pos._adaptivePartial || PARTIAL_AT;
+    const trailPct  = pos._adaptiveTrail   || TRAIL_PCT;
+
     // 최고가 갱신
     if (price > pos.peakPrice) pos.peakPrice = price;
     const move = (price - pos.entryPrice) / pos.entryPrice;
 
-    // ── 부분청산: +15% 달성 시 50% 매도, 트레일링 시작 ──
-    if (!pos.partialDone && move >= PARTIAL_AT) {
+    // ── Phase 2 분할진입: 확인 후 추가 매수 ────────────
+    if (pos._phase2 && !pos._phase2Done && move >= pos._phase2.triggerPct) {
+      const p2budget = pos._phase2.budget;
+      if (p2budget >= 5000 && this.sim.cash >= p2budget) {
+        this.sim.cash -= p2budget;
+        pos.budget   += p2budget;
+        pos.quantity += p2budget / price;
+        pos._phase2Done = true;
+        console.log(
+          `[B] Phase2 추가매수(WS) — ${market} @${price.toLocaleString()} +${Math.round(p2budget).toLocaleString()}원`
+        );
+        this._updateDetection(market, `Phase2 진입완료`);
+      }
+    }
+
+    // ── 부분청산: 적응형 partialAt 달성 시 50% 매도, 트레일링 시작 ──
+    if (!pos.partialDone && move >= partialAt) {
       const half    = pos.budget * 0.5;
       const halfPnl = half * move;
       this.sim.cash        += half + halfPnl;
@@ -211,19 +231,19 @@ class StrategyB {
       pos.targetPrice  = Infinity;   // 하드 목표 제거 → 트레일링으로만 청산
       console.log(
         `[B] 부분청산(WS) +${(move * 100).toFixed(1)}% — ${market} ` +
-        `50% 매도, 스탑→브레이크이븐, 트레일링 ${TRAIL_PCT * 100}% 시작`
+        `50% 매도, 스탑→브레이크이븐, 트레일링 ${(trailPct * 100).toFixed(0)}% 시작`
       );
       this._logger?.logSell({
         strategy: "B", market, price, quantity: pos.quantity, budget: half,
-        reason: "부분청산(+15%)", pnlRate: move, pnlKrw: halfPnl,
+        reason: `부분청산(+${(partialAt * 100).toFixed(0)}%)`, pnlRate: move, pnlKrw: halfPnl,
         partial: true, trail: false, dryRun: this.dryRun,
       });
       this._updateDetection(market, `+${(move * 100).toFixed(1)}% 부분청산`);
     }
 
-    // ── 트레일링 스탑 갱신 ────────────────────────────
+    // ── 트레일링 스탑 갱신 (적응형 trailPct) ─────────────
     if (pos.trailActive) {
-      const newStop = pos.peakPrice * (1 - TRAIL_PCT);
+      const newStop = pos.peakPrice * (1 - trailPct);
       if (newStop > pos.stopPrice) pos.stopPrice = newStop;
     }
 
@@ -252,6 +272,11 @@ class StrategyB {
 
       const det = this.detections.find(d => d.market === market);
       if (det) { det.status = `청산(${reason})`; det.finalPnl = +(pnlRate * 100).toFixed(1); }
+
+      // AlphaEngine 청산 기록
+      if (this._alpha) {
+        this._alpha.recordExit({ market, exitPrice: price, pnlRate, reason });
+      }
 
       this._logger?.logSell({
         strategy: "B", market, price, quantity: pos.quantity, budget: pos.budget,
@@ -335,36 +360,135 @@ class StrategyB {
       console.log(`[B] 작전 경고(진입 허용) — ${market}: ${manipulation.warnings.join(", ")}`);
     }
 
-    const price = manipulation.currentPrice || await this._ticker(market);
+    // ── AlphaEngine: 체결강도 + 가격 병렬 조회 ────────────
+    let tape = null;
+    let kimchi = null;
+    const priceFromManip = manipulation.currentPrice;
+
+    if (this._alpha) {
+      const [tapeResult, kimchiResult, priceResult] = await Promise.allSettled([
+        this._alpha.analyzeTape(market),
+        this._alpha.getKimchiPremium(market),
+        priceFromManip ? Promise.resolve(priceFromManip) : this._ticker(market),
+      ]);
+      tape   = tapeResult.status === "fulfilled" ? tapeResult.value : null;
+      kimchi = kimchiResult.status === "fulfilled" ? kimchiResult.value : null;
+
+      // 체결강도 AVOID → 진입 스킵
+      if (tape?.signal === "AVOID") {
+        console.warn(`[B] 진입 스킵(체결강도AVOID) — ${market} buyPressure:${tape.buyPressure}`);
+        this._updateDetection(market, "스킵(체결약세)");
+        return;
+      }
+
+      // 김치프리미엄 과열 → 경고 (차단은 안 함, 로그만)
+      if (kimchi?.signal === "OVERHEATED") {
+        console.warn(`[B] 김치프리미엄 과열 경고 — ${market} ${(kimchi.premium * 100).toFixed(1)}%`);
+      }
+
+      if (tape) {
+        console.log(
+          `[B] 체결강도 — ${market} signal:${tape.signal} ` +
+          `매수압력:${(tape.buyPressure * 100).toFixed(0)}% 속도:${tape.velocityScore}/min ` +
+          `대형비율:${(tape.largeTradeRatio * 100).toFixed(0)}%`
+        );
+      }
+    }
+
+    const price = priceFromManip || await this._ticker(market);
     if (!price) {
       console.warn(`[B] ${market} 가격 조회 실패`);
       return;
     }
 
-    const budget = this.sim.cash * BUDGET_PCT;
-    if (budget < 5000) { console.warn("[B] 예산 부족"); return; }
+    // ── AlphaEngine: 변동성 적응형 파라미터 ──────────────
+    let adaptiveStop   = STOP_RATE;
+    let adaptiveTarget = TARGET_RATE;
+    let adaptivePartial = PARTIAL_AT;
+    let adaptiveTrail  = TRAIL_PCT;
+
+    if (this._alpha) {
+      try {
+        const adaptive = await this._alpha.getAdaptiveParams(market);
+        adaptiveStop    = adaptive.stopRate;
+        adaptiveTarget  = adaptive.targetRate;
+        adaptivePartial = adaptive.partialAt;
+        adaptiveTrail   = adaptive.trailPct;
+        console.log(
+          `[B] 적응형 파라미터 — ${market} ` +
+          `손절:${(adaptiveStop * 100).toFixed(1)}% 목표:+${(adaptiveTarget * 100).toFixed(0)}% ` +
+          `부분:+${(adaptivePartial * 100).toFixed(0)}% 트레일:${(adaptiveTrail * 100).toFixed(0)}% ` +
+          `변동성비:${adaptive.volRatio}x`
+        );
+      } catch (e) {
+        console.warn(`[B] 적응형 파라미터 실패 — 기본값 사용: ${e.message}`);
+      }
+    }
+
+    // ── AlphaEngine: 분할 진입 ────────────────────────────
+    const totalBudget = this.sim.cash * BUDGET_PCT;
+    if (totalBudget < 5000) { console.warn("[B] 예산 부족"); return; }
+
+    const tapeSignal = tape?.signal || "NEUTRAL";
+    const phases     = this._alpha
+      ? this._alpha.getEntryPhases(totalBudget, tapeSignal)
+      : [{ phase: 1, pct: 1.0, triggerPct: 0, budget: Math.floor(totalBudget) }];
+
+    if (phases.length === 0) {
+      console.warn(`[B] 분할진입 스킵(AVOID) — ${market}`);
+      this._updateDetection(market, "스킵(분할진입거부)");
+      return;
+    }
+
+    // Phase 1: 즉시 진입
+    const phase1 = phases[0];
+    const budget = phase1.budget;
+    if (budget < 5000) { console.warn("[B] Phase 1 예산 부족"); return; }
 
     const pos = {
       market,
-      entryPrice:  price,
-      quantity:    budget / price,
+      entryPrice:     price,
+      quantity:       budget / price,
       budget,
-      targetPrice: price * (1 + TARGET_RATE),
-      stopPrice:   price * (1 + STOP_RATE),
-      peakPrice:   price,
-      partialDone: false,
-      trailActive: false,
-      openedAt:    Date.now(),
+      targetPrice:    price * (1 + adaptiveTarget),
+      stopPrice:      price * (1 + adaptiveStop),
+      peakPrice:      price,
+      partialDone:    false,
+      trailActive:    false,
+      openedAt:       Date.now(),
+      // AlphaEngine 메타데이터
+      _adaptiveStop:    adaptiveStop,
+      _adaptiveTarget:  adaptiveTarget,
+      _adaptivePartial: adaptivePartial,
+      _adaptiveTrail:   adaptiveTrail,
+      _tapeSignal:      tapeSignal,
+      _phase2:          phases.length > 1 ? phases[1] : null,
+      _phase2Done:      false,
     };
 
     this.sim.cash -= budget;
     this.sim.positions.set(market, pos);
-    this._updateDetection(market, "진입완료");
+    this._updateDetection(market, `진입(Phase1 ${phase1.pct * 100}%)`);
 
     // WebSocket 구독 → 실시간 가격 수신 시작
     if (this._ws) this._ws.subscribe(market);
 
-    console.log(`[B] 진입 — ${market} @${price.toLocaleString()} 목표:+30% 손절:-8% 트레일:${TRAIL_PCT * 100}%`);
+    console.log(
+      `[B] 진입(Phase1) — ${market} @${price.toLocaleString()} ` +
+      `목표:+${(adaptiveTarget * 100).toFixed(0)}% 손절:${(adaptiveStop * 100).toFixed(1)}% ` +
+      `트레일:${(adaptiveTrail * 100).toFixed(0)}% [${tapeSignal}]`
+    );
+
+    // AlphaEngine 진입 기록
+    if (this._alpha) {
+      this._alpha.recordEntry({
+        market,
+        entryPrice: price,
+        tapeSignal,
+        kimchiPremium: kimchi?.premium ?? null,
+        qualityScore: quality.score,
+      });
+    }
 
     // 매수 로그
     this._logger?.logBuy({
@@ -387,8 +511,8 @@ class StrategyB {
               quantity:    result.executedVolume,
               entryPrice:  ep,
               budget:      liveBudget,
-              targetPrice: ep * (1 + TARGET_RATE),
-              stopPrice:   ep * (1 + STOP_RATE),
+              targetPrice: ep * (1 + adaptiveTarget),
+              stopPrice:   ep * (1 + adaptiveStop),
               partialDone: false,
               openedAt:    Date.now(),
             };
@@ -418,6 +542,10 @@ class StrategyB {
     const pos = this.sim.positions.get(market);
     if (!pos) return;
 
+    // 적응형 파라미터 (AlphaEngine 사용 시)
+    const partialAt = pos._adaptivePartial || PARTIAL_AT;
+    const trailPct  = pos._adaptiveTrail   || TRAIL_PCT;
+
     // WS 활성 시 실시간으로 처리됨 — 폴링은 보험용
     const cur = this._wsActive
       ? (this._ws?.getPrice(market) ?? await this._ticker(market))
@@ -429,8 +557,21 @@ class StrategyB {
     const move    = (cur - pos.entryPrice) / pos.entryPrice;
     const timeout = Date.now() - pos.openedAt > MAX_HOLD_MS;
 
-    // 부분청산: +15% → 50% 매도, 트레일링 시작
-    if (!pos.partialDone && move >= PARTIAL_AT) {
+    // Phase 2 분할진입: 확인 후 추가 매수
+    if (pos._phase2 && !pos._phase2Done && move >= pos._phase2.triggerPct) {
+      const p2budget = pos._phase2.budget;
+      if (p2budget >= 5000 && this.sim.cash >= p2budget) {
+        this.sim.cash -= p2budget;
+        pos.budget   += p2budget;
+        pos.quantity += p2budget / cur;
+        pos._phase2Done = true;
+        console.log(`[B] Phase2 추가매수 — ${market} @${cur.toLocaleString()} +${Math.round(p2budget).toLocaleString()}원`);
+        this._updateDetection(market, `Phase2 진입완료`);
+      }
+    }
+
+    // 부분청산: 적응형 partialAt → 50% 매도, 트레일링 시작
+    if (!pos.partialDone && move >= partialAt) {
       const half    = pos.budget * 0.5;
       const halfPnl = half * move;
       this.sim.cash        += half + halfPnl;
@@ -444,19 +585,19 @@ class StrategyB {
       pos.targetPrice  = Infinity;   // 하드 목표 제거 → 트레일링으로만 청산
       console.log(
         `[B] 부분청산(+${(move * 100).toFixed(0)}%) — ${market} ` +
-        `50% 매도, 스탑→브레이크이븐, 트레일링 ${TRAIL_PCT * 100}% 시작`
+        `50% 매도, 스탑→브레이크이븐, 트레일링 ${(trailPct * 100).toFixed(0)}% 시작`
       );
       this._logger?.logSell({
         strategy: "B", market, price: cur, quantity: pos.quantity, budget: pos.budget * 0.5,
-        reason: "부분청산(+15%)", pnlRate: move, pnlKrw: halfPnl,
+        reason: `부분청산(+${(partialAt * 100).toFixed(0)}%)`, pnlRate: move, pnlKrw: halfPnl,
         partial: true, trail: false, dryRun: this.dryRun,
       });
       this._updateDetection(market, `+${(move * 100).toFixed(0)}% 부분청산`);
     }
 
-    // 트레일링 스탑 갱신
+    // 트레일링 스탑 갱신 (적응형 trailPct)
     if (pos.trailActive) {
-      const newStop = pos.peakPrice * (1 - TRAIL_PCT);
+      const newStop = pos.peakPrice * (1 - trailPct);
       if (newStop > pos.stopPrice) pos.stopPrice = newStop;
     }
 
@@ -484,6 +625,11 @@ class StrategyB {
 
       const det = this.detections.find(d => d.market === market);
       if (det) { det.status = `청산(${reason})`; det.finalPnl = +(pnlRate * 100).toFixed(1); }
+
+      // AlphaEngine 청산 기록
+      if (this._alpha) {
+        this._alpha.recordExit({ market, exitPrice: cur, pnlRate, reason });
+      }
 
       this._logger?.logSell({
         strategy: "B", market, price: cur, quantity: pos.quantity, budget: pos.budget,
@@ -808,6 +954,7 @@ class StrategyB {
       tradeReturns:    this.sim.tradeReturns,
       dataEngineMode:  !!this.dataEngine,
       wsActive:        this._wsActive,
+      alpha:           this._alpha?.getSummary() || null,
     };
   }
 }
