@@ -321,43 +321,69 @@ class DashboardServer {
 <style>
 :root{
   --bg:#060b14;--s1:#0d1421;--s2:#111c2d;--border:#1a2744;
-  --text:#e2e8f0;--muted:#4a5568;--dim:#2d3748;
+  --text:#e2e8f0;--muted:#64748b;--dim:#2d3748;
   --blue:#3b82f6;--cyan:#06b6d4;--green:#10b981;--red:#ef4444;
   --yellow:#f59e0b;--purple:#8b5cf6;--orange:#f97316;
 }
 *{box-sizing:border-box;margin:0;padding:0}
-body{font-family:-apple-system,'SF Pro Display',sans-serif;background:var(--bg);color:var(--text);height:100vh;overflow:hidden;display:flex;flex-direction:column}
-::-webkit-scrollbar{width:4px}
-::-webkit-scrollbar-track{background:transparent}
-::-webkit-scrollbar-thumb{background:var(--dim);border-radius:2px}
+body{font-family:-apple-system,'SF Pro Display','Pretendard',sans-serif;background:var(--bg);color:var(--text);height:100vh;overflow:hidden;display:flex;flex-direction:column}
+::-webkit-scrollbar{width:6px}
+::-webkit-scrollbar-track{background:var(--bg)}
+::-webkit-scrollbar-thumb{background:var(--dim);border-radius:3px}
+::-webkit-scrollbar-thumb:hover{background:#4a5568}
 
 /* ─── 탑바 ─── */
 .topbar{
-  display:flex;align-items:center;gap:0;
-  height:50px;border-bottom:1px solid var(--border);
+  display:flex;align-items:center;
+  height:48px;border-bottom:1px solid var(--border);
   background:linear-gradient(90deg,#060b14,#0a1020);
-  flex-shrink:0;padding:0 16px;gap:12px;
+  flex-shrink:0;padding:0 16px;gap:6px;
+  overflow-x:auto;overflow-y:hidden;
+  scrollbar-width:none;
 }
-.logo{font-size:1rem;font-weight:800;color:var(--cyan);letter-spacing:1px;white-space:nowrap}
-.tb-sep{width:1px;height:24px;background:var(--border)}
-.tb-stat{display:flex;flex-direction:column;align-items:center;padding:0 12px;cursor:default}
-.tb-stat .lbl{font-size:.6rem;color:var(--muted);text-transform:uppercase;letter-spacing:.6px}
-.tb-stat .val{font-size:.95rem;font-weight:700;line-height:1.2}
-.tb-right{margin-left:auto;display:flex;align-items:center;gap:8px;font-size:.72rem;color:var(--muted)}
+.topbar::-webkit-scrollbar{display:none}
+.logo{font-size:1.05rem;font-weight:800;color:var(--cyan);letter-spacing:1px;white-space:nowrap;margin-right:4px}
+.tb-sep{width:1px;height:22px;background:var(--border);flex-shrink:0}
+.tb-stat{display:flex;flex-direction:column;align-items:center;padding:0 8px;cursor:default;flex-shrink:0;white-space:nowrap}
+.tb-stat .lbl{font-size:.62rem;color:var(--muted);text-transform:uppercase;letter-spacing:.5px;line-height:1.3}
+.tb-stat .val{font-size:.9rem;font-weight:700;line-height:1.3}
+.tb-right{margin-left:auto;display:flex;align-items:center;gap:8px;font-size:.72rem;color:var(--muted);flex-shrink:0}
 .live-ring{width:8px;height:8px;border-radius:50%;background:var(--green);box-shadow:0 0 6px var(--green);animation:blink 2s infinite}
 @keyframes blink{0%,100%{opacity:1}50%{opacity:.3}}
-.mode-pill{padding:2px 9px;border-radius:99px;font-size:.68rem;font-weight:700;border:1px solid}
+.mode-pill{padding:2px 10px;border-radius:99px;font-size:.7rem;font-weight:700;border:1px solid;white-space:nowrap}
 .pill-sim{color:var(--yellow);border-color:var(--yellow);background:rgba(245,158,11,.08)}
 .pill-live{color:var(--green);border-color:var(--green);background:rgba(16,185,129,.08)}
 
+/* ─── 인포 바 (레짐/펀딩/전략) ─── */
+.info-bar{
+  display:grid;grid-template-columns:repeat(4,1fr);
+  border-bottom:1px solid var(--border);flex-shrink:0;background:var(--s2);
+}
+.info-cell{padding:8px 14px;border-right:1px solid var(--border);min-width:0}
+.info-cell:last-child{border-right:none}
+.info-label{font-size:.62rem;font-weight:700;color:var(--muted);text-transform:uppercase;letter-spacing:.7px;margin-bottom:4px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+
+/* ─── 전략 바 ─── */
+.strat-bar{display:grid;grid-template-columns:1fr 1fr;border-bottom:1px solid var(--border);flex-shrink:0}
+.strat-cell{padding:10px 14px;background:var(--s1);min-width:0;overflow:hidden}
+.strat-cell:first-child{border-right:1px solid var(--border)}
+.strat-header{display:flex;align-items:center;justify-content:space-between;margin-bottom:6px;gap:8px}
+.strat-name{font-size:.7rem;font-weight:700;text-transform:uppercase;letter-spacing:.7px;white-space:nowrap}
+.strat-body{display:flex;gap:12px;align-items:center}
+.strat-pnl{font-size:1.25rem;font-weight:800;white-space:nowrap}
+.strat-sub{font-size:.7rem;color:var(--muted);white-space:nowrap}
+.strat-info{flex:1;min-width:0;font-size:.72rem;color:var(--muted);padding:6px 10px;background:var(--bg);border-radius:6px;border:1px solid var(--border);overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.strat-tags{display:flex;gap:4px;margin-top:6px;flex-wrap:wrap}
+.strat-tag{font-size:.64rem;padding:2px 6px;border-radius:4px;background:rgba(0,0,0,.3);border:1px solid;white-space:nowrap}
+
 /* ─── 메인 그리드 ─── */
-.main{display:grid;grid-template-columns:260px 1fr 300px;flex:1;overflow:hidden;gap:0}
+.main{display:grid;grid-template-columns:280px 1fr 300px;flex:1;overflow:hidden;gap:0}
 
 /* ─── 패널 공통 ─── */
 .panel{border-right:1px solid var(--border);overflow-y:auto;display:flex;flex-direction:column;gap:0}
 .panel:last-child{border-right:none}
 .sec{padding:12px 14px;border-bottom:1px solid var(--border)}
-.sec-title{font-size:.6rem;font-weight:700;color:var(--muted);text-transform:uppercase;letter-spacing:.8px;margin-bottom:8px;display:flex;align-items:center;justify-content:space-between}
+.sec-title{font-size:.64rem;font-weight:700;color:var(--muted);text-transform:uppercase;letter-spacing:.7px;margin-bottom:8px;display:flex;align-items:center;justify-content:space-between}
 
 /* ─── 스캐너 ─── */
 .scan-row{
@@ -365,23 +391,23 @@ body{font-family:-apple-system,'SF Pro Display',sans-serif;background:var(--bg);
   padding:6px 8px;border-radius:6px;cursor:pointer;
   transition:background .12s;border:1px solid transparent;margin-bottom:2px;
 }
-.scan-row:hover{background:rgba(255,255,255,.03)}
+.scan-row:hover{background:rgba(255,255,255,.04)}
 .scan-row.active{background:rgba(59,130,246,.08);border-color:rgba(59,130,246,.25)}
 .scan-dot{width:6px;height:6px;border-radius:50%;flex-shrink:0}
-.scan-name{font-size:.82rem;font-weight:600;flex:1;min-width:0;overflow:hidden;text-overflow:ellipsis}
-.scan-score{font-size:.7rem;color:var(--muted);width:32px;text-align:right}
-.scan-ev{font-size:.7rem;font-weight:600;width:50px;text-align:right}
-.scan-badge{font-size:.6rem;padding:1px 5px;border-radius:4px;white-space:nowrap}
+.scan-name{font-size:.8rem;font-weight:600;flex:1;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.scan-score{font-size:.72rem;color:var(--muted);width:32px;text-align:right;flex-shrink:0}
+.scan-ev{font-size:.72rem;font-weight:600;width:52px;text-align:right;flex-shrink:0}
+.scan-badge{font-size:.62rem;padding:2px 6px;border-radius:4px;white-space:nowrap;flex-shrink:0}
 .go{background:rgba(16,185,129,.15);color:var(--green)}
 .wait{background:rgba(74,85,104,.15);color:var(--muted)}
 .block{background:rgba(239,68,68,.1);color:var(--red)}
 
 /* ─── 히스토리 ─── */
-.hist-row{display:flex;align-items:center;justify-content:space-between;padding:4px 0;border-bottom:1px solid rgba(26,39,68,.5);font-size:.75rem}
+.hist-row{display:flex;align-items:center;justify-content:space-between;padding:5px 0;border-bottom:1px solid rgba(26,39,68,.5);font-size:.76rem;gap:6px}
 .hist-row:last-child{border-bottom:none}
 
 /* ─── 리스크 바 ─── */
-.risk-bar{height:5px;background:var(--dim);border-radius:3px;overflow:hidden;margin-top:5px}
+.risk-bar{height:6px;background:var(--dim);border-radius:3px;overflow:hidden;margin-top:5px}
 .risk-fill{height:100%;border-radius:3px;transition:width .5s}
 
 /* ─── 차트 영역 ─── */
@@ -391,14 +417,14 @@ body{font-family:-apple-system,'SF Pro Display',sans-serif;background:var(--bg);
   padding:8px 14px;border-bottom:1px solid var(--border);flex-shrink:0;
 }
 .chart-info{display:flex;flex-direction:column}
-.chart-mkt{font-size:.95rem;font-weight:700}
-.chart-px{font-size:.72rem;color:var(--muted);margin-top:1px}
+.chart-mkt{font-size:1rem;font-weight:700}
+.chart-px{font-size:.74rem;color:var(--muted);margin-top:1px}
 .tf-group{display:flex;gap:3px}
-.tf-btn{padding:3px 9px;border-radius:5px;font-size:.7rem;cursor:pointer;border:1px solid var(--border);color:var(--muted);background:transparent;transition:all .12s}
+.tf-btn{padding:4px 10px;border-radius:5px;font-size:.72rem;cursor:pointer;border:1px solid var(--border);color:var(--muted);background:transparent;transition:all .12s}
 .tf-btn.on{background:var(--blue);border-color:var(--blue);color:#fff}
 #tv-chart{flex:1;min-height:0}
 .equity-strip{height:90px;border-top:1px solid var(--border);flex-shrink:0;padding:8px 14px 6px}
-.eq-lbl{font-size:.58rem;color:var(--muted);margin-bottom:3px}
+.eq-lbl{font-size:.62rem;color:var(--muted);margin-bottom:3px}
 #eq-svg{width:100%;height:62px}
 
 /* ─── 예측 패널 ─── */
@@ -406,44 +432,44 @@ body{font-family:-apple-system,'SF Pro Display',sans-serif;background:var(--bg);
 
 /* 포지션 / 대기 */
 .pos-block{padding:12px 14px;border-bottom:1px solid var(--border)}
-.pos-mkt{font-size:1rem;font-weight:800;color:var(--cyan)}
-.pos-sub{font-size:.7rem;color:var(--muted);margin-top:2px}
+.pos-mkt{font-size:1.05rem;font-weight:800;color:var(--cyan)}
+.pos-sub{font-size:.72rem;color:var(--muted);margin-top:2px}
 .unreal{font-size:1.6rem;font-weight:800;margin:6px 0 4px}
-.pos-prog{height:4px;background:var(--dim);border-radius:2px;overflow:hidden}
-.pos-fill{height:100%;border-radius:2px;transition:width .4s}
-.wait-block{padding:14px;border-bottom:1px solid var(--border);text-align:center;color:var(--muted);font-size:.82rem}
+.pos-prog{height:5px;background:var(--dim);border-radius:3px;overflow:hidden}
+.pos-fill{height:100%;border-radius:3px;transition:width .4s}
+.wait-block{padding:16px;border-bottom:1px solid var(--border);text-align:center;color:var(--muted);font-size:.84rem}
 
 /* 신호 점수 게이지 */
 .gauge-wrap{padding:14px;border-bottom:1px solid var(--border);display:flex;align-items:center;gap:14px}
 .gauge-svg-wrap{flex-shrink:0}
-.gauge-info{flex:1}
-.gauge-title{font-size:.6rem;color:var(--muted);text-transform:uppercase;letter-spacing:.7px}
-.gauge-mkt{font-size:.9rem;font-weight:700;margin-top:2px}
-.gauge-sub{font-size:.72rem;color:var(--muted);margin-top:2px}
-.gauge-ev{font-size:.82rem;font-weight:700;margin-top:4px}
+.gauge-info{flex:1;min-width:0}
+.gauge-title{font-size:.64rem;color:var(--muted);text-transform:uppercase;letter-spacing:.7px}
+.gauge-mkt{font-size:.92rem;font-weight:700;margin-top:2px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.gauge-sub{font-size:.74rem;color:var(--muted);margin-top:2px}
+.gauge-ev{font-size:.84rem;font-weight:700;margin-top:4px}
 
 /* 팩터 바 */
-.factor-row{display:flex;align-items:center;gap:8px;margin-bottom:5px}
-.factor-lbl{font-size:.68rem;color:var(--muted);width:60px;flex-shrink:0;text-align:right}
-.factor-bar{flex:1;height:5px;background:var(--dim);border-radius:3px;overflow:hidden}
+.factor-row{display:flex;align-items:center;gap:8px;margin-bottom:6px}
+.factor-lbl{font-size:.7rem;color:var(--muted);width:64px;flex-shrink:0;text-align:right;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.factor-bar{flex:1;height:6px;background:var(--dim);border-radius:3px;overflow:hidden}
 .factor-fill{height:100%;border-radius:3px;transition:width .5s}
-.factor-val{font-size:.65rem;width:28px;text-align:right;color:var(--muted)}
+.factor-val{font-size:.68rem;width:30px;text-align:right;color:var(--muted);flex-shrink:0}
 
 /* 필터 체크리스트 */
 .checklist{padding:10px 14px;border-bottom:1px solid var(--border)}
 .check-group{margin-bottom:6px}
-.check-glbl{font-size:.58rem;color:var(--muted);text-transform:uppercase;letter-spacing:.6px;margin-bottom:4px}
+.check-glbl{font-size:.62rem;color:var(--muted);text-transform:uppercase;letter-spacing:.6px;margin-bottom:4px}
 .checks{display:flex;flex-wrap:wrap;gap:4px}
-.ck{display:flex;align-items:center;gap:3px;font-size:.65rem;padding:2px 6px;border-radius:4px;border:1px solid}
+.ck{display:flex;align-items:center;gap:3px;font-size:.68rem;padding:2px 7px;border-radius:4px;border:1px solid;white-space:nowrap}
 .ck.ok{color:var(--green);border-color:rgba(16,185,129,.25);background:rgba(16,185,129,.06)}
 .ck.fail{color:var(--red);border-color:rgba(239,68,68,.25);background:rgba(239,68,68,.06)}
 .ck.warn{color:var(--yellow);border-color:rgba(245,158,11,.25);background:rgba(245,158,11,.06)}
-.ck-dot{font-size:.6rem}
+.ck-dot{font-size:.62rem}
 
 /* 공포탐욕 */
 .fg-section{padding:10px 14px;border-bottom:1px solid var(--border)}
 .fg-top{display:flex;justify-content:space-between;align-items:baseline;margin-bottom:6px}
-.fg-lbl{font-size:.85rem;font-weight:700}
+.fg-lbl{font-size:.88rem;font-weight:700}
 .fg-num{font-size:1.4rem;font-weight:800}
 .fg-bar{height:8px;border-radius:4px;background:linear-gradient(90deg,#ef4444 0%,#f97316 20%,#eab308 40%,#10b981 60%,#3b82f6 80%,#8b5cf6 100%);position:relative}
 .fg-needle{position:absolute;top:-4px;width:3px;height:16px;background:#fff;border-radius:1px;transform:translateX(-50%);transition:left .6s ease;box-shadow:0 0 4px rgba(0,0,0,.5)}
@@ -452,31 +478,47 @@ body{font-family:-apple-system,'SF Pro Display',sans-serif;background:var(--bg);
 .cal-section{padding:10px 14px;border-bottom:1px solid var(--border)}
 .cal-row{display:flex;align-items:center;gap:10px}
 .cal-stats{flex:1}
-.stat-line{display:flex;justify-content:space-between;font-size:.72rem;padding:2px 0}
+.stat-line{display:flex;justify-content:space-between;font-size:.74rem;padding:2px 0}
 .sl-lbl{color:var(--muted)}
 .sl-val{font-weight:600}
 
 /* 거래 로그 */
-.trade-row{display:flex;align-items:center;gap:6px;padding:5px 6px;border-bottom:1px solid rgba(26,39,68,.4);font-size:.7rem;transition:background .1s}
-.trade-row:hover{background:rgba(255,255,255,.02)}
+.trade-row{display:grid;grid-template-columns:32px 48px 1fr auto auto;align-items:center;gap:6px;padding:6px 8px;border-bottom:1px solid rgba(26,39,68,.4);font-size:.72rem;transition:background .1s}
+.trade-row:hover{background:rgba(255,255,255,.03)}
 .trade-row:last-child{border-bottom:none}
-.trade-side{font-size:.6rem;font-weight:800;padding:1px 5px;border-radius:3px;min-width:28px;text-align:center}
+.trade-side{font-size:.62rem;font-weight:800;padding:2px 0;border-radius:3px;text-align:center}
 .side-buy{color:#3b82f6;background:rgba(59,130,246,.1);border:1px solid rgba(59,130,246,.3)}
 .side-sell{color:#ef4444;background:rgba(239,68,68,.1);border:1px solid rgba(239,68,68,.3)}
-.trade-mkt{font-weight:700;color:var(--text);min-width:44px}
-.trade-price{color:var(--muted);min-width:60px;text-align:right}
-.trade-pnl{font-weight:700;min-width:48px;text-align:right}
-.trade-reason{font-size:.6rem;color:var(--muted);padding:1px 4px;border-radius:3px;background:var(--dim)}
-.trade-time{color:var(--muted);font-size:.62rem;margin-left:auto;white-space:nowrap}
-.trade-badge{font-size:.55rem;padding:0 4px;border-radius:2px;font-weight:700}
-.badge-partial{color:var(--yellow);border:1px solid rgba(245,158,11,.3)}
-.badge-trail{color:var(--cyan);border:1px solid rgba(6,182,212,.3)}
-.badge-dry{color:var(--muted);border:1px solid var(--dim)}
+.trade-mkt{font-weight:700;color:var(--text);overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.trade-detail{display:flex;align-items:center;gap:5px;overflow:hidden;min-width:0}
+.trade-price{color:var(--muted);white-space:nowrap}
+.trade-pnl{font-weight:700;white-space:nowrap}
+.trade-reason{font-size:.62rem;color:var(--muted);padding:1px 5px;border-radius:3px;background:var(--dim);white-space:nowrap}
+.trade-meta{display:flex;align-items:center;gap:4px;flex-shrink:0}
+.trade-time{color:var(--muted);font-size:.64rem;white-space:nowrap;flex-shrink:0}
+.trade-badge{font-size:.58rem;padding:1px 5px;border-radius:3px;font-weight:700;white-space:nowrap}
+.badge-partial{color:var(--yellow);border:1px solid rgba(245,158,11,.3);background:rgba(245,158,11,.05)}
+.badge-trail{color:var(--cyan);border:1px solid rgba(6,182,212,.3);background:rgba(6,182,212,.05)}
+.badge-dry{color:var(--muted);border:1px solid var(--dim);background:rgba(45,55,72,.3)}
 
-/* 반응형 */
-@media(max-width:900px){
+/* ─── 반응형 ─── */
+@media(max-width:1400px){
+  .main{grid-template-columns:260px 1fr 280px}
+}
+@media(max-width:1100px){
+  .main{grid-template-columns:240px 1fr}
+  .pred-panel{display:none}
+  .info-bar{grid-template-columns:repeat(2,1fr)}
+}
+@media(max-width:768px){
   .main{grid-template-columns:1fr}
-  .chart-panel,.pred-panel{display:none}
+  .chart-panel{display:none}
+  .strat-bar{grid-template-columns:1fr}
+  .strat-cell:first-child{border-right:none;border-bottom:1px solid var(--border)}
+  .info-bar{grid-template-columns:1fr 1fr}
+  .topbar{gap:4px;padding:0 10px}
+  .tb-stat{padding:0 6px}
+  .tb-stat .val{font-size:.82rem}
 }
 </style>
 </head>
@@ -533,93 +575,80 @@ body{font-family:-apple-system,'SF Pro Display',sans-serif;background:var(--bg);
 </div>
 
 <!-- ─── 레짐 + 펀딩비 파밍 바 ─── -->
-<div style="display:grid;grid-template-columns:1fr 1fr 1fr 1fr;border-bottom:1px solid var(--border);flex-shrink:0;background:var(--s2)">
-
-  <!-- BTC 레짐 -->
-  <div style="padding:8px 16px;border-right:1px solid var(--border)">
-    <div style="font-size:.58rem;font-weight:700;color:var(--muted);text-transform:uppercase;letter-spacing:.8px;margin-bottom:4px">BTC 마켓 레짐</div>
-    <div style="display:flex;align-items:center;gap:8px">
-      <div id="regime-pill" style="padding:3px 10px;border-radius:99px;font-size:.78rem;font-weight:800;border:1px solid var(--muted);color:var(--muted)">—</div>
-      <div id="regime-conf" style="font-size:.7rem;color:var(--muted)">—</div>
+<div class="info-bar">
+  <div class="info-cell">
+    <div class="info-label">BTC 마켓 레짐</div>
+    <div style="display:flex;align-items:center;gap:8px;flex-wrap:wrap">
+      <div id="regime-pill" style="padding:3px 10px;border-radius:99px;font-size:.78rem;font-weight:800;border:1px solid var(--muted);color:var(--muted);white-space:nowrap">—</div>
+      <div id="regime-conf" style="font-size:.72rem;color:var(--muted);white-space:nowrap">—</div>
     </div>
-    <div id="regime-detail" style="font-size:.65rem;color:var(--muted);margin-top:3px">SMA200 대비 —</div>
+    <div id="regime-detail" style="font-size:.68rem;color:var(--muted);margin-top:3px">SMA200 대비 —</div>
   </div>
 
-  <!-- 펀딩비 -->
-  <div style="padding:8px 16px;border-right:1px solid var(--border)">
-    <div style="font-size:.58rem;font-weight:700;color:var(--muted);text-transform:uppercase;letter-spacing:.8px;margin-bottom:4px">Bybit 펀딩비 (BTC)</div>
-    <div style="display:flex;align-items:baseline;gap:6px">
+  <div class="info-cell">
+    <div class="info-label">Bybit 펀딩비 (BTC)</div>
+    <div style="display:flex;align-items:baseline;gap:6px;flex-wrap:wrap">
       <span id="funding-rate" style="font-size:1.1rem;font-weight:800;color:var(--text)">—</span>
-      <span style="font-size:.65rem;color:var(--muted)">/8h</span>
-      <span id="funding-apr" style="font-size:.72rem;font-weight:700;color:var(--muted)">APR —</span>
+      <span style="font-size:.68rem;color:var(--muted)">/8h</span>
+      <span id="funding-apr" style="font-size:.74rem;font-weight:700;color:var(--muted)">APR —</span>
     </div>
-    <div id="funding-next" style="font-size:.65rem;color:var(--muted);margin-top:2px">다음 정산 —</div>
+    <div id="funding-next" style="font-size:.68rem;color:var(--muted);margin-top:2px">다음 정산 —</div>
   </div>
 
-  <!-- 파밍 신호 -->
-  <div style="padding:8px 16px;border-right:1px solid var(--border)">
-    <div style="font-size:.58rem;font-weight:700;color:var(--muted);text-transform:uppercase;letter-spacing:.8px;margin-bottom:4px">펀딩비 파밍 신호</div>
-    <div id="farming-signal" style="padding:3px 10px;border-radius:99px;font-size:.75rem;font-weight:800;border:1px solid var(--muted);color:var(--muted);display:inline-block">대기 중</div>
-    <div id="farming-desc" style="font-size:.63rem;color:var(--muted);margin-top:3px">|rate| ≥ 0.03% 시 활성</div>
+  <div class="info-cell">
+    <div class="info-label">펀딩비 파밍 신호</div>
+    <div id="farming-signal" style="padding:3px 10px;border-radius:99px;font-size:.76rem;font-weight:800;border:1px solid var(--muted);color:var(--muted);display:inline-block;white-space:nowrap">대기 중</div>
+    <div id="farming-desc" style="font-size:.66rem;color:var(--muted);margin-top:3px">|rate| >= 0.03% 시 활성</div>
   </div>
 
-  <!-- 전략 상태 -->
-  <div style="padding:8px 16px">
-    <div style="font-size:.58rem;font-weight:700;color:var(--muted);text-transform:uppercase;letter-spacing:.8px;margin-bottom:4px">전략 가동 상태</div>
-    <div style="display:flex;flex-direction:column;gap:3px">
+  <div class="info-cell">
+    <div class="info-label">전략 가동 상태</div>
+    <div style="display:flex;flex-direction:column;gap:4px">
       <div style="display:flex;align-items:center;gap:6px">
         <div id="strat-a-dot" style="width:7px;height:7px;border-radius:50%;background:var(--muted);flex-shrink:0"></div>
-        <span style="font-size:.68rem;color:var(--muted)">Strategy A:</span>
-        <span id="strat-a-status" style="font-size:.68rem;font-weight:700;color:var(--muted)">—</span>
+        <span style="font-size:.72rem;color:var(--muted)">A:</span>
+        <span id="strat-a-status" style="font-size:.72rem;font-weight:700;color:var(--muted)">—</span>
       </div>
       <div style="display:flex;align-items:center;gap:6px">
         <div id="strat-b-dot" style="width:7px;height:7px;border-radius:50%;background:var(--green);flex-shrink:0;box-shadow:0 0 5px var(--green)"></div>
-        <span style="font-size:.68rem;color:var(--muted)">Strategy B:</span>
-        <span id="strat-b-status" style="font-size:.68rem;font-weight:700;color:var(--green)">모니터링</span>
+        <span style="font-size:.72rem;color:var(--muted)">B:</span>
+        <span id="strat-b-status" style="font-size:.72rem;font-weight:700;color:var(--green)">모니터링</span>
       </div>
     </div>
   </div>
 </div>
 
 <!-- ─── 전략 패널 ─── -->
-<div id="strategy-bar" style="display:grid;grid-template-columns:1fr 1fr;gap:0;border-bottom:1px solid var(--border);flex-shrink:0">
-
-  <!-- Strategy A -->
-  <div style="padding:10px 16px;border-right:1px solid var(--border);background:var(--s1)">
-    <div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:6px">
-      <span style="font-size:.68rem;font-weight:700;color:var(--cyan);text-transform:uppercase;letter-spacing:.8px">Strategy A — 1h 스윙</span>
-      <span id="sa-wr" style="font-size:.68rem;color:var(--muted)">승률 —</span>
+<div id="strategy-bar" class="strat-bar">
+  <div class="strat-cell">
+    <div class="strat-header">
+      <span class="strat-name" style="color:var(--cyan)">Strategy A — 1h 스윙</span>
+      <span id="sa-wr" style="font-size:.7rem;color:var(--muted)">승률 —</span>
     </div>
-    <div style="display:flex;gap:16px;align-items:center">
+    <div class="strat-body">
       <div>
-        <div id="sa-pnl" style="font-size:1.3rem;font-weight:800;color:var(--green)">—</div>
-        <div id="sa-asset" style="font-size:.68rem;color:var(--muted)">—</div>
+        <div id="sa-pnl" class="strat-pnl" style="color:var(--green)">—</div>
+        <div id="sa-asset" class="strat-sub">—</div>
       </div>
-      <div id="sa-pos" style="flex:1;font-size:.72rem;color:var(--muted);padding:6px 10px;background:var(--bg);border-radius:6px;border:1px solid var(--border)">
-        포지션 없음 — 신호 대기
-      </div>
+      <div id="sa-pos" class="strat-info">포지션 없음 — 신호 대기</div>
     </div>
-    <div id="sa-hist" style="display:flex;gap:4px;margin-top:6px;flex-wrap:wrap"></div>
+    <div id="sa-hist" class="strat-tags"></div>
   </div>
 
-  <!-- Strategy B -->
-  <div style="padding:10px 16px;background:var(--s1)">
-    <div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:6px">
-      <span style="font-size:.68rem;font-weight:700;color:var(--purple);text-transform:uppercase;letter-spacing:.8px">Strategy B — 신규상장</span>
-      <span id="sb-monitor" style="font-size:.68rem;color:var(--muted)">—개 감시</span>
+  <div class="strat-cell">
+    <div class="strat-header">
+      <span class="strat-name" style="color:var(--purple)">Strategy B — 신규상장</span>
+      <span id="sb-monitor" style="font-size:.7rem;color:var(--muted)">—개 감시</span>
     </div>
-    <div style="display:flex;gap:16px;align-items:center">
+    <div class="strat-body">
       <div>
-        <div id="sb-pnl" style="font-size:1.3rem;font-weight:800;color:var(--green)">—</div>
-        <div id="sb-asset" style="font-size:.68rem;color:var(--muted)">—</div>
+        <div id="sb-pnl" class="strat-pnl" style="color:var(--green)">—</div>
+        <div id="sb-asset" class="strat-sub">—</div>
       </div>
-      <div id="sb-detect" style="flex:1;font-size:.72rem;color:var(--muted);padding:6px 10px;background:var(--bg);border-radius:6px;border:1px solid var(--border)">
-        🔍 신규상장 감시 중...
-      </div>
+      <div id="sb-detect" class="strat-info">신규상장 감시 중...</div>
     </div>
-    <!-- 오픈 포지션 (실시간 손익) -->
     <div id="sb-positions" style="margin-top:6px"></div>
-    <div id="sb-hist" style="display:flex;gap:4px;margin-top:4px;flex-wrap:wrap"></div>
+    <div id="sb-hist" class="strat-tags" style="margin-top:4px"></div>
   </div>
 </div>
 
@@ -1117,7 +1146,7 @@ function update(d){
     }
     c("sa-hist").innerHTML = (sA.history||[]).slice(0,6).map(h=>{
       const col=h.pnlRate>=0?"var(--green)":"var(--red)";
-      return \`<span style="font-size:.62rem;padding:1px 5px;border-radius:4px;background:rgba(0,0,0,.3);border:1px solid \${col};color:\${col}">\${h.market.replace("KRW-","")}&nbsp;\${h.pnlRate>=0?"+":""}\${(h.pnlRate*100).toFixed(1)}%</span>\`;
+      return \`<span class="strat-tag" style="border-color:\${col};color:\${col}">\${h.market.replace("KRW-","")}&nbsp;\${h.pnlRate>=0?"+":""}\${(h.pnlRate*100).toFixed(1)}%</span>\`;
     }).join("");
   }
 
@@ -1160,9 +1189,9 @@ function update(d){
     } else {
       c("sb-positions").innerHTML = "";
     }
-    c("sb-hist").innerHTML = (sB.history||[]).slice(0,6).map(h=>{
+    c("sb-hist").innerHTML = (sB.history||[]).slice(0,8).map(h=>{
       const col=h.pnlRate>=0?"var(--green)":"var(--red)";
-      return \`<span style="font-size:.62rem;padding:1px 5px;border-radius:4px;background:rgba(0,0,0,.3);border:1px solid \${col};color:\${col}">\${h.market.replace("KRW-","")}&nbsp;\${h.pnlRate>=0?"+":""}\${(h.pnlRate*100).toFixed(1)}%</span>\`;
+      return \`<span class="strat-tag" style="border-color:\${col};color:\${col}">\${h.market.replace("KRW-","")}&nbsp;\${h.pnlRate>=0?"+":""}\${(h.pnlRate*100).toFixed(1)}%</span>\`;
     }).join("");
   }
 
@@ -1175,7 +1204,7 @@ function update(d){
       const sideLabel = isBuy?"매수":"매도";
       const pnlHtml = !isBuy && t.pnlRate!=null
         ? \`<span class="trade-pnl" style="color:\${t.pnlRate>=0?"var(--green)":"var(--red)"}">\${t.pnlRate>=0?"+":""}\${(t.pnlRate*100).toFixed(1)}%</span>\`
-        : (isBuy && t.qualityScore!=null ? \`<span class="trade-pnl" style="color:var(--purple)">Q:\${t.qualityScore}</span>\` : "");
+        : (isBuy && t.qualityScore!=null ? \`<span class="trade-pnl" style="color:var(--purple)">Q:\${t.qualityScore}</span>\` : '<span></span>');
       const badges = [];
       if(t.partial) badges.push('<span class="trade-badge badge-partial">부분</span>');
       if(t.trail)   badges.push('<span class="trade-badge badge-trail">트레일</span>');
@@ -1185,15 +1214,17 @@ function update(d){
       return \`<div class="trade-row">
         <span class="trade-side \${sideClass}">\${sideLabel}</span>
         <span class="trade-mkt">\${t.market.replace("KRW-","")}</span>
-        <span class="trade-price">\${Math.round(t.price).toLocaleString()}</span>
-        \${pnlHtml}
-        \${reasonHtml}
-        \${badges.join("")}
+        <span class="trade-detail">
+          <span class="trade-price">\${Math.round(t.price).toLocaleString()}원</span>
+          \${pnlHtml}
+          \${reasonHtml}
+        </span>
+        <span class="trade-meta">\${badges.join("")}</span>
         <span class="trade-time">\${timeStr}</span>
       </div>\`;
     }).join("");
   } else {
-    c("trade-log").innerHTML = '<div style="color:var(--muted);font-size:.72rem;text-align:center;padding:12px">아직 거래 기록이 없습니다</div>';
+    c("trade-log").innerHTML = '<div style="color:var(--muted);font-size:.74rem;text-align:center;padding:16px">아직 거래 기록이 없습니다</div>';
   }
 
   // ─ 자본곡선
