@@ -28,6 +28,9 @@ const { createExchange }       = require("./exchange-adapter");
 const { GlobalListingScanner } = require("./global-listing-scanner");
 const { CrossExchangeArb }     = require("./cross-exchange-arb");
 const { ArbExecutor }          = require("./arb-executor");
+const { RebalanceManager }     = require("./rebalance-manager");
+const { MultiExchangeWebSocket } = require("./exchange-websocket");
+const { ArbDataLogger }        = require("./arb-data-logger");
 
 try { require("dotenv").config(); } catch {}
 
@@ -64,12 +67,34 @@ class TradingBot {
     this.tradeLogger   = new TradeLogger("./trades.db");
     this._wsBtcPrice  = null;   // WS 실시간 BTC 가격
 
-    // ── 글로벌 거래소 어댑터 ─────────────────────────────────
+    // ── 글로벌 거래소 어댑터 (6개 거래소) ─────────────────────
     this.exchanges = {
-      upbit:   createExchange("upbit",   { apiKey: process.env.UPBIT_ACCESS_KEY,  secretKey: process.env.UPBIT_SECRET_KEY }),
-      binance: createExchange("binance", { apiKey: process.env.BINANCE_API_KEY,   secretKey: process.env.BINANCE_SECRET_KEY }),
-      bybit:   createExchange("bybit",   { apiKey: process.env.BYBIT_API_KEY,     secretKey: process.env.BYBIT_SECRET_KEY }),
+      upbit:   createExchange("upbit",   { apiKey: process.env.UPBIT_ACCESS_KEY,   secretKey: process.env.UPBIT_SECRET_KEY }),
+      bithumb: createExchange("bithumb", { apiKey: process.env.BITHUMB_API_KEY,    secretKey: process.env.BITHUMB_SECRET_KEY }),
+      binance: createExchange("binance", { apiKey: process.env.BINANCE_API_KEY,    secretKey: process.env.BINANCE_SECRET_KEY }),
+      bybit:   createExchange("bybit",   { apiKey: process.env.BYBIT_API_KEY,      secretKey: process.env.BYBIT_SECRET_KEY }),
+      okx:     createExchange("okx",     { apiKey: process.env.OKX_API_KEY,        secretKey: process.env.OKX_SECRET_KEY, passphrase: process.env.OKX_PASSPHRASE }),
+      gate:    createExchange("gate",    { apiKey: process.env.GATE_API_KEY,       secretKey: process.env.GATE_SECRET_KEY }),
     };
+
+    // ── 멀티거래소 WebSocket (Binance + Bybit 실시간 가격) ────
+    this.multiExWs = new MultiExchangeWebSocket();
+
+    // ── 아비트라지 데이터 로거 (24일까지 축적) ─────────────
+    this.arbDataLogger = new ArbDataLogger({
+      dbPath:     "./arb-data.db",
+      backupDir:  "./arb-backups",
+      exchanges:  this.exchanges,
+      usdKrw:     1350,
+    });
+
+    // ── 리밸런싱 매니저 ──────────────────────────────────────
+    this.rebalancer = new RebalanceManager({
+      exchanges: this.exchanges,
+      usdKrw:    1350,
+      targetRatio: 0.5,
+      autoExecute: false,  // 수동 승인 모드
+    });
 
     // ── 글로벌 신규 상장 스캐너 ──────────────────────────────
     this.listingScanner = new GlobalListingScanner({
@@ -92,13 +117,43 @@ class TradingBot {
       exchanges:    Object.values(this.exchanges),
       usdKrw:       1350,
       minSpreadPct: 1.5,
+      multiExWs:    this.multiExWs,   // Binance/Bybit WS 실시간 피드
+      upbitWs:      this.upbitWs,     // Upbit WS 실시간 피드
       onOpportunity: (opp) => {
         console.log(
           `[Bot] 차익 기회 알림 — ${opp.coin}: ` +
           `${opp.buyExchange} → ${opp.sellExchange} | 스프레드 ${opp.spreadPct}%`
         );
+
+        // 스프레드 이벤트 로깅
+        this.arbDataLogger.logSpreadEvent({
+          coin: opp.coin,
+          buyExchange:  opp.buyExchange,
+          sellExchange: opp.sellExchange,
+          buyPrice:     opp.buyPrice,
+          sellPrice:    opp.sellPrice,
+          spreadPct:    opp.spreadPct,
+          netProfitPct: opp.netProfitPct,
+          source:       opp.source || "rest",
+          action:       "detected",
+          ts:           opp.detectedAt || Date.now(),
+        });
+
         // ArbExecutor로 동시 실행 전달
-        this.arbExecutor.execute(opp).catch(e =>
+        this.arbExecutor.execute(opp).then(result => {
+          // 실행 결과 로깅
+          if (result.executed) {
+            this.arbDataLogger.logExecution(result);
+          } else {
+            this.arbDataLogger.logSpreadEvent({
+              ...opp,
+              buyPrice: opp.buyPrice, sellPrice: opp.sellPrice,
+              action: "skipped",
+              skipReason: result.reason,
+              ts: Date.now(),
+            });
+          }
+        }).catch(e =>
           console.error("[Bot] ArbExecutor 실행 오류:", e.message)
         );
       },
@@ -152,10 +207,18 @@ class TradingBot {
     console.log(`  자본:     ${INITIAL_KRW.toLocaleString()}원`);
     console.log(`  실거래:   ${DRY_RUN ? "OFF (시뮬레이션만)" : "ON ⚡"}`);
     console.log(`  API 키:   ${this.orderService.getSummary().hasApiKeys ? "연결됨" : "없음 ⚠"}`);
-    console.log("  ── 거래소 연결 상태 ──");
-    console.log(`  Upbit:    ${process.env.UPBIT_ACCESS_KEY ? "API 키 있음" : "공개 API만"}`);
-    console.log(`  Binance:  ${process.env.BINANCE_API_KEY ? "API 키 있음" : "공개 API만"}`);
-    console.log(`  Bybit:    ${process.env.BYBIT_API_KEY ? "API 키 있음" : "공개 API만"}`);
+    console.log("  ── 거래소 연결 상태 (6개) ──");
+    const exStatus = [
+      ["Upbit",   process.env.UPBIT_ACCESS_KEY],
+      ["Bithumb", process.env.BITHUMB_API_KEY],
+      ["Binance", process.env.BINANCE_API_KEY],
+      ["Bybit",   process.env.BYBIT_API_KEY],
+      ["OKX",     process.env.OKX_API_KEY],
+      ["Gate.io", process.env.GATE_API_KEY],
+    ];
+    for (const [name, key] of exStatus) {
+      console.log(`  ${name.padEnd(9)} ${key ? "API 키 있음" : "공개 API만"}`);
+    }
     console.log("══════════════════════════════════════════");
 
     // ── 실거래 모드 프리플라이트 체크 ──────────────────
@@ -211,6 +274,10 @@ class TradingBot {
     this.strategyB.setWebSocket(this.upbitWs);   // 신규상장 포지션 실시간 감시
     console.log(`[Bot] Strategy B 시작 (신규상장) — 자본 ${CAPITAL_B.toLocaleString()}원`);
 
+    // ── 멀티거래소 WebSocket 연결 ───────────────────────────
+    this.multiExWs.connect();
+    console.log("[Bot] Binance/Bybit WebSocket 실시간 가격 스트림 연결");
+
     // ── 글로벌 스캐너 + 차익 감지 시작 ──────────────────────
     await this.listingScanner.start().catch(e => {
       console.error("[Bot] GlobalListingScanner 시작 실패:", e.message);
@@ -224,6 +291,8 @@ class TradingBot {
       if (rate) {
         this.crossArb.setUsdKrw(rate);
         this.arbExecutor.setUsdKrw(rate);
+        this.rebalancer.setUsdKrw(rate);
+        this.arbDataLogger.setUsdKrw(rate);
       }
     };
     _syncArbRate();
@@ -234,6 +303,18 @@ class TradingBot {
     });
     console.log("[Bot] 교차 거래소 차익 감지 시작 (15초 주기)");
     console.log(`[Bot] ArbExecutor 시작 — ${DRY_RUN ? "시뮬레이션" : "실거래⚡"} | 최대 $${this.arbExecutor._maxPosUsd}/건`);
+
+    // ── 리밸런싱 매니저 시작 ──────────────────────────────────
+    await this.rebalancer.start().catch(e => {
+      console.error("[Bot] RebalanceManager 시작 실패:", e.message);
+    });
+    console.log("[Bot] 리밸런싱 매니저 시작 (5분 주기 잔고 체크)");
+
+    // ── 데이터 축적 시작 (4/24까지 시뮬레이션) ───────────────
+    await this.arbDataLogger.start().catch(e => {
+      console.error("[Bot] ArbDataLogger 시작 실패:", e.message);
+    });
+    console.log("[Bot] 아비트라지 데이터 축적 시작 (30초 스냅샷 + 5분 호가 + 1시간 백업)");
 
     // ── 시작 시 포지션 복구 ──────────────────────────
     if (!DRY_RUN && this.orderService.getSummary().hasApiKeys) {
@@ -294,8 +375,9 @@ class TradingBot {
       }
     }
 
-    // 차익 거래 모니터링에 코인 추가
+    // 차익 거래 모니터링에 코인 추가 + WS 구독
     this.crossArb.addCoin(listing.base);
+    this.multiExWs.addCoin(listing.base);
   }
 
   // ─── 5초 메인 틱 ────────────────────────────────────
@@ -582,6 +664,9 @@ class TradingBot {
     this.strategyB.stop();
     this.listingScanner.stop();
     this.crossArb.stop();
+    this.multiExWs.stop();
+    this.rebalancer.stop();
+    this.arbDataLogger.stop();
     this.tradeLogger.close();
 
     if (this.livePosition && !DRY_RUN && this.orderService.getSummary().hasApiKeys) {

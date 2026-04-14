@@ -40,6 +40,9 @@ class DashboardServer {
       if (req.url === "/api/stream")  return this._sse(req, res);
       if (req.url === "/api/trades")  return this._trades(res);
       if (req.url === "/api/trade-stats") return this._tradeStats(res);
+      if (req.url === "/api/arb-spreads") return this._arbSpreads(res);
+      if (req.url === "/api/arb-kimchi")  return this._arbKimchi(res);
+      if (req.url === "/api/arb-profit")  return this._arbProfit(res);
       return this._page(res);
     });
 
@@ -108,6 +111,26 @@ class DashboardServer {
     };
     res.writeHead(200, { "Content-Type": "application/json", "Access-Control-Allow-Origin": "*" });
     res.end(JSON.stringify(stats));
+  }
+
+  // ── 아비트라지 데이터 API ─────────────────────────────────
+
+  _arbSpreads(res) {
+    const data = this.bot.arbDataLogger?.getSpreadDistribution(24) || [];
+    res.writeHead(200, { "Content-Type": "application/json", "Access-Control-Allow-Origin": "*" });
+    res.end(JSON.stringify(data));
+  }
+
+  _arbKimchi(res) {
+    const data = this.bot.arbDataLogger?.getKimchiPremiumHistory(24) || [];
+    res.writeHead(200, { "Content-Type": "application/json", "Access-Control-Allow-Origin": "*" });
+    res.end(JSON.stringify(data));
+  }
+
+  _arbProfit(res) {
+    const data = this.bot.arbDataLogger?.getProfitAnalysis(7) || [];
+    res.writeHead(200, { "Content-Type": "application/json", "Access-Control-Allow-Origin": "*" });
+    res.end(JSON.stringify(data));
   }
 
   // ── 데이터 수집 ─────────────────────────────────────────
@@ -289,6 +312,9 @@ class DashboardServer {
       globalListings: bot.listingScanner?.getSummary() || null,
       crossArb:       bot.crossArb?.getSummary() || null,
       arbExecutor:    bot.arbExecutor?.getSummary() || null,
+      arbData:        bot.arbDataLogger?.getSummary() || null,
+      rebalancer:     bot.rebalancer?.getSummary() || null,
+      multiExWs:      bot.multiExWs?.getSummary() || null,
     };
   }
 

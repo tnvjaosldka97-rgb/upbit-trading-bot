@@ -118,6 +118,19 @@ class ArbExecutor {
       return { executed: false, reason: "스프레드 소멸" };
     }
 
+    // ── 호가창 깊이 슬리피지 가드 ──────────────────────────
+    const depthCheck = await this._checkOrderbookDepth(opp, verified);
+    if (!depthCheck.ok) {
+      this._daily.skipped++;
+      console.log(
+        `[ArbExec] 호가 깊이 부족 — ${opp.coin} | ` +
+        `필요: $${depthCheck.requiredUsd?.toFixed(0)} | ` +
+        `가용: $${depthCheck.availableUsd?.toFixed(0)} | ` +
+        `예상슬리피지: ${depthCheck.estSlippage?.toFixed(2)}%`
+      );
+      return { executed: false, reason: `호가깊이부족(${depthCheck.estSlippage?.toFixed(1)}%)` };
+    }
+
     // ── 포지션 사이즈 계산 ────────────────────────────────
     const positionUsd = Math.min(
       this._maxPosUsd,
@@ -330,6 +343,60 @@ class ArbExecutor {
     } catch (e) {
       console.error(`[ArbExec] ⚠️ 비상 청산 실패! 수동 확인 필요: ${e.message}`);
     }
+  }
+
+  // ── 호가창 깊이 검증 (슬리피지 가드) ──────────────────────
+  async _checkOrderbookDepth(opp, verified) {
+    try {
+      const buyEx  = this._getExchange(opp.buyExchange);
+      const sellEx = this._getExchange(opp.sellExchange);
+
+      const [buyOB, sellOB] = await Promise.all([
+        buyEx.getOrderbook(opp.coin, 10),
+        sellEx.getOrderbook(opp.coin, 10),
+      ]);
+
+      // 매수 거래소: asks (매도 호가) 깊이 확인 — 우리가 매수하려면 asks에 물량 필요
+      // 매도 거래소: bids (매수 호가) 깊이 확인 — 우리가 매도하려면 bids에 물량 필요
+      const positionUsd = Math.min(this._maxPosUsd, MAX_POSITION_USD);
+
+      const buyDepthUsd  = this._calcDepthUsd(buyOB.asks,  buyEx.quoteCurrency, "ask");
+      const sellDepthUsd = this._calcDepthUsd(sellOB.bids, sellEx.quoteCurrency, "bid");
+
+      const availableUsd = Math.min(buyDepthUsd, sellDepthUsd);
+
+      // 슬리피지 추정: 포지션/가용깊이 비율로 선형 근사
+      const depthRatio = positionUsd / Math.max(availableUsd, 1);
+      const estSlippage = depthRatio * 0.5; // 깊이의 50% 사용 시 ~0.5% 슬리피지
+
+      // 가드: 슬리피지가 MAX_SLIPPAGE_PCT 초과 또는 포지션 > 가용깊이의 30%
+      const ok = estSlippage <= MAX_SLIPPAGE_PCT && positionUsd <= availableUsd * 0.3;
+
+      return {
+        ok,
+        buyDepthUsd:  +buyDepthUsd.toFixed(2),
+        sellDepthUsd: +sellDepthUsd.toFixed(2),
+        availableUsd: +availableUsd.toFixed(2),
+        requiredUsd:  positionUsd,
+        estSlippage:  +estSlippage.toFixed(3),
+        depthRatio:   +depthRatio.toFixed(3),
+      };
+    } catch (e) {
+      // 호가 조회 실패 시 보수적으로 통과 (REST 스프레드 검증은 이미 통과)
+      console.warn(`[ArbExec] 호가 깊이 조회 실패 (통과): ${e.message}`);
+      return { ok: true, estSlippage: 0 };
+    }
+  }
+
+  _calcDepthUsd(levels, quoteCurrency, _type) {
+    let totalUsd = 0;
+    for (const level of levels) {
+      const priceUsd = quoteCurrency === "KRW"
+        ? level.price / this._usdKrw
+        : level.price;
+      totalUsd += priceUsd * level.qty;
+    }
+    return totalUsd;
   }
 
   // ── 사용 가능한 예산 계산 ─────────────────────────────────

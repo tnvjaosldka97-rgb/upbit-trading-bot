@@ -28,6 +28,8 @@ class CrossExchangeArb {
    * @param {number} opts.minSpreadPct - 최소 스프레드 % (기본 1.5)
    * @param {Function} opts.onOpportunity - 기회 발견 시 콜백
    * @param {number} opts.scanInterval - 스캔 주기 ms (기본 15000)
+   * @param {Object} opts.multiExWs    - MultiExchangeWebSocket 인스턴스 (옵션)
+   * @param {Object} opts.upbitWs      - UpbitWebSocket 인스턴스 (옵션)
    */
   constructor({
     exchanges = [],
@@ -35,6 +37,8 @@ class CrossExchangeArb {
     minSpreadPct = 1.5,
     onOpportunity,
     scanInterval = 15_000,
+    multiExWs = null,
+    upbitWs = null,
   } = {}) {
     this._exchanges    = exchanges;
     this._usdKrw       = usdKrw;
@@ -43,6 +47,8 @@ class CrossExchangeArb {
     this._scanInterval = scanInterval;
     this._intervalId   = null;
     this._running      = false;
+    this._multiExWs    = multiExWs;  // Binance/Bybit WS
+    this._upbitWs      = upbitWs;    // Upbit WS
 
     // 모니터링 코인 목록 (동적으로 추가 가능)
     this._coins = new Set(DEFAULT_COINS);
@@ -53,6 +59,9 @@ class CrossExchangeArb {
     // 기회 이력 (최근 100개)
     this._history = [];
 
+    // WS 실시간 감지 통계
+    this._wsDetections = 0;
+
     // 통계
     this._stats = {
       totalScans:    0,
@@ -60,6 +69,7 @@ class CrossExchangeArb {
       maxSpread:     0,
       lastScanAt:    null,
       errors:        0,
+      wsOpps:        0,  // WS 실시간 감지 기회 수
     };
   }
 
@@ -75,9 +85,18 @@ class CrossExchangeArb {
       `최소 스프레드: ${this._minSpreadPct}%, USD/KRW: ${this._usdKrw}`
     );
 
+    // ── WebSocket 실시간 감지 (있으면 활성화) ──────────────
+    if (this._multiExWs) {
+      this._multiExWs.onPrice((exchange, coin, price) => {
+        this._onWsPrice(exchange, coin, price);
+      });
+      console.log("[CrossArb] WebSocket 실시간 감지 활성화 (Binance/Bybit)");
+    }
+
     // 즉시 1회 스캔
     await this._scan().catch(e => console.error("[CrossArb] 초기 스캔 오류:", e.message));
 
+    // REST 폴링은 WS 백업으로 유지 (WS 장애 대비)
     this._intervalId = setInterval(
       () => this._scan().catch(e => {
         console.error("[CrossArb] 스캔 오류:", e.message);
@@ -85,6 +104,87 @@ class CrossExchangeArb {
       }),
       this._scanInterval
     );
+  }
+
+  // ── WebSocket 실시간 가격 수신 → 즉시 스프레드 체크 ────────
+
+  _onWsPrice(wsExchange, coin, wsPriceUsdt) {
+    if (!this._running || !this._coins.has(coin)) return;
+
+    // Upbit WS 가격 가져오기 (KRW → USD 환산)
+    let upbitPriceUsd = null;
+    if (this._upbitWs) {
+      const krwPrice = this._upbitWs.getPrice?.(`KRW-${coin}`);
+      if (krwPrice && this._usdKrw > 0) {
+        upbitPriceUsd = krwPrice / this._usdKrw;
+      }
+    }
+
+    // Binance/Bybit 다른 쪽 가격 가져오기
+    let otherExchange = null;
+    let otherPrice = null;
+    if (this._multiExWs) {
+      if (wsExchange === "Binance") {
+        otherPrice = this._multiExWs.getPrice("Bybit", coin);
+        otherExchange = "Bybit";
+      } else {
+        otherPrice = this._multiExWs.getPrice("Binance", coin);
+        otherExchange = "Binance";
+      }
+    }
+
+    // 가격 쌍 비교 (Upbit vs WS거래소, WS거래소 간)
+    const pairs = [];
+    if (upbitPriceUsd && wsPriceUsdt) {
+      pairs.push(
+        { ex1: "Upbit", p1: upbitPriceUsd, ex2: wsExchange, p2: wsPriceUsdt },
+      );
+    }
+    if (otherPrice && wsPriceUsdt) {
+      pairs.push(
+        { ex1: wsExchange, p1: wsPriceUsdt, ex2: otherExchange, p2: otherPrice },
+      );
+    }
+
+    for (const { ex1, p1, ex2, p2 } of pairs) {
+      const low  = p1 < p2 ? { exchange: ex1, price: p1 } : { exchange: ex2, price: p2 };
+      const high = p1 < p2 ? { exchange: ex2, price: p2 } : { exchange: ex1, price: p1 };
+
+      const spreadPct = (high.price - low.price) / low.price * 100;
+      if (spreadPct >= this._minSpreadPct) {
+        const netProfitPct = spreadPct - (TOTAL_FEE * 100);
+        const opp = {
+          coin,
+          buyExchange:  low.exchange,
+          sellExchange: high.exchange,
+          buyPrice:     low.price,
+          sellPrice:    high.price,
+          spreadPct:    +spreadPct.toFixed(3),
+          netProfitPct: +netProfitPct.toFixed(3),
+          detectedAt:   Date.now(),
+          source:       "websocket",
+        };
+
+        this._stats.wsOpps++;
+        this._stats.totalOpps++;
+        if (spreadPct > this._stats.maxSpread) {
+          this._stats.maxSpread = +spreadPct.toFixed(3);
+        }
+
+        this._history.unshift(opp);
+        if (this._history.length > 100) this._history = this._history.slice(0, 100);
+
+        console.log(
+          `[CrossArb] ⚡ WS 실시간 차익! ${coin} — ` +
+          `${low.exchange}($${low.price.toFixed(2)}) → ${high.exchange}($${high.price.toFixed(2)}) | ` +
+          `스프레드: ${spreadPct.toFixed(2)}%`
+        );
+
+        try { this._onOpportunity(opp); } catch (e) {
+          console.error("[CrossArb] WS onOpportunity 오류:", e.message);
+        }
+      }
+    }
   }
 
   stop() {
@@ -117,23 +217,22 @@ class CrossExchangeArb {
     this._stats.totalScans++;
     this._stats.lastScanAt = Date.now();
 
-    // 모든 거래소의 모든 코인 가격을 병렬 조회
+    // 거래소별 순차 → 코인 병렬 (메모리 안전)
     const priceMap = new Map(); // coin → [{exchange, price (USD 환산)}]
 
-    const tasks = [];
     for (const ex of this._exchanges) {
-      for (const coin of this._coins) {
-        tasks.push(this._fetchPrice(ex, coin));
+      const results = await Promise.allSettled(
+        Array.from(this._coins).map(coin => this._fetchPrice(ex, coin))
+      );
+      for (const r of results) {
+        if (r.status === "fulfilled" && r.value) {
+          const { coin, exchange, priceUsd } = r.value;
+          if (!priceMap.has(coin)) priceMap.set(coin, []);
+          priceMap.get(coin).push({ exchange, priceUsd });
+        }
       }
-    }
-
-    const results = await Promise.allSettled(tasks);
-    for (const r of results) {
-      if (r.status === "fulfilled" && r.value) {
-        const { coin, exchange, priceUsd } = r.value;
-        if (!priceMap.has(coin)) priceMap.set(coin, []);
-        priceMap.get(coin).push({ exchange, priceUsd });
-      }
+      // 거래소 간 간격 (rate limit)
+      await new Promise(r => setTimeout(r, 50));
     }
 
     // 스프레드 계산 및 기회 감지
@@ -239,6 +338,8 @@ class CrossExchangeArb {
       maxSpread:      this._stats.maxSpread,
       lastScanAt:     this._stats.lastScanAt,
       errors:         this._stats.errors,
+      wsOpps:         this._stats.wsOpps,
+      wsEnabled:      !!this._multiExWs,
       currentOpps:    this._opportunities.length,
       topOpportunity: topOpp ? {
         coin:        topOpp.coin,

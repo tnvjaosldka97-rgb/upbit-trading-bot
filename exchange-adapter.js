@@ -819,6 +819,13 @@ class BybitAdapter {
 
 
 // ═══════════════════════════════════════════════════════════════
+//  외부 어댑터 임포트
+// ═══════════════════════════════════════════════════════════════
+const { OKXAdapter }     = require("./exchange-okx");
+const { BithumbAdapter } = require("./exchange-bithumb");
+const { GateAdapter }    = require("./exchange-gate");
+
+// ═══════════════════════════════════════════════════════════════
 //  팩토리 함수
 // ═══════════════════════════════════════════════════════════════
 function createExchange(name, config = {}) {
@@ -826,13 +833,30 @@ function createExchange(name, config = {}) {
     case "upbit":   return new UpbitAdapter(config);
     case "binance": return new BinanceAdapter(config);
     case "bybit":   return new BybitAdapter(config);
+    case "okx":     return new OKXAdapter(config);
+    case "bithumb": return new BithumbAdapter(config);
+    case "gate":    return new GateAdapter(config);
     default: throw new Error(`[ExchangeAdapter] 알 수 없는 거래소: ${name}`);
   }
 }
 
+/** 지원 거래소 목록 */
+const SUPPORTED_EXCHANGES = [
+  { id: "upbit",   name: "Upbit",   quote: "KRW",  region: "KR",     fee: 0.0005 },
+  { id: "bithumb", name: "Bithumb", quote: "KRW",  region: "KR",     fee: 0.0004 },
+  { id: "binance", name: "Binance", quote: "USDT", region: "GLOBAL", fee: 0.0010 },
+  { id: "bybit",   name: "Bybit",   quote: "USDT", region: "GLOBAL", fee: 0.0010 },
+  { id: "okx",     name: "OKX",     quote: "USDT", region: "GLOBAL", fee: 0.0008 },
+  { id: "gate",    name: "Gate.io", quote: "USDT", region: "GLOBAL", fee: 0.0010 },
+];
+
 module.exports = {
   createExchange,
+  SUPPORTED_EXCHANGES,
   UpbitAdapter,
   BinanceAdapter,
   BybitAdapter,
+  OKXAdapter,
+  BithumbAdapter,
+  GateAdapter,
 };
