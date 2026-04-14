@@ -30,6 +30,13 @@ const BUDGET_PCT          = 0.40;         // 보유 현금의 40%
 const MAX_LISTING_AGE_MS  = 2 * 60 * 60_000; // 상장 후 2시간 이내만 진입
 const QUALITY_THRESHOLD   = 35;           // CoinGecko 품질 점수 미만 → 진입 스킵
 
+// ── 작전 방어 상수 ──────────────────────────────────────
+const SPREAD_MAX_PCT      = 3.0;         // 스프레드 3% 이상 → 유동성 부족, 조작 의심
+const MIN_ORDERBOOK_DEPTH = 3_000_000;   // 호가창 양쪽 합계 최소 300만원
+const PRICE_SPIKE_MAX     = 0.50;        // 시초가 대비 +50% 이상 급등 시 진입 금지 (이미 펌핑됨)
+const WHALE_RATIO_MAX     = 0.40;        // 상위 1개 호가가 전체 40% 이상 → 고래/벽 의심
+const MIN_TRADE_COUNT     = 20;          // 최소 체결 건수 (워시트레이딩 필터)
+
 // 스테이블코인 블랙리스트
 const STABLECOINS = new Set(["USDT","USDC","DAI","BUSD","TUSD","FDUSD","PYUSD","USDD","FRAX"]);
 
@@ -309,7 +316,26 @@ class StrategyB {
     }
     console.log(`[B] 품질 통과 — ${market} 점수:${quality.score} [${quality.flags.join(",")}]`);
 
-    const price = await this._ticker(market);
+    // ── 작전 방어: 호가창 + 체결 데이터 검증 ──────────────
+    const manipulation = await this._detectManipulation(market);
+    if (manipulation.blocked) {
+      console.warn(
+        `[B] 진입 차단(작전방어) — ${market} ` +
+        `사유: ${manipulation.reasons.join(", ")}`
+      );
+      this._updateDetection(market, `차단(${manipulation.reasons[0]})`);
+      this._logger?.logBuy({
+        strategy: "B", market, price: 0, quantity: 0, budget: 0,
+        qualityScore: quality.score, qualityFlags: [...quality.flags, ...manipulation.reasons],
+        dryRun: this.dryRun,
+      });
+      return;
+    }
+    if (manipulation.warnings.length > 0) {
+      console.log(`[B] 작전 경고(진입 허용) — ${market}: ${manipulation.warnings.join(", ")}`);
+    }
+
+    const price = manipulation.currentPrice || await this._ticker(market);
     if (!price) {
       console.warn(`[B] ${market} 가격 조회 실패`);
       return;
@@ -604,6 +630,118 @@ class StrategyB {
     } catch {
       return { score: 60, flags: ["품질체크_실패"] };
     }
+  }
+
+  /**
+   * 작전세력/조작 탐지 — 진입 직전 호가창 + 체결 분석
+   *
+   * 탐지 항목:
+   *   1) 스프레드 과대 → 유동성 없는 코인, 미끄러짐 위험
+   *   2) 호가창 깊이 부족 → 소량으로 가격 조작 가능
+   *   3) 고래 벽 → 상위 호가 1개가 전체의 40%+ 차지
+   *   4) 이미 펌핑 → 시초가 대비 +50% 이상 급등 후 진입은 꼭대기
+   *   5) 체결 건수 부족 → 워시트레이딩 의심
+   */
+  async _detectManipulation(market) {
+    const result = { blocked: false, reasons: [], warnings: [], currentPrice: null };
+
+    try {
+      // 호가창 + 최근 체결 + 시세 병렬 조회
+      const [obRes, tradesRes, tickerRes] = await Promise.allSettled([
+        fetch(`https://api.upbit.com/v1/orderbook?markets=${market}`, { signal: AbortSignal.timeout(3000) })
+          .then(r => r.ok ? r.json() : null),
+        fetch(`https://api.upbit.com/v1/trades/ticks?market=${market}&count=50`, { signal: AbortSignal.timeout(3000) })
+          .then(r => r.ok ? r.json() : null),
+        fetch(`https://api.upbit.com/v1/ticker?markets=${market}`, { signal: AbortSignal.timeout(3000) })
+          .then(r => r.ok ? r.json() : null),
+      ]);
+
+      const ob     = obRes.status === "fulfilled" ? obRes.value?.[0] : null;
+      const trades = tradesRes.status === "fulfilled" ? tradesRes.value : null;
+      const ticker = tickerRes.status === "fulfilled" ? tickerRes.value?.[0] : null;
+
+      if (ticker) result.currentPrice = ticker.trade_price;
+
+      // ── 1) 스프레드 체크 ────────────────────────────────
+      if (ob?.orderbook_units?.length > 0) {
+        const bestAsk = ob.orderbook_units[0].ask_price;
+        const bestBid = ob.orderbook_units[0].bid_price;
+        const spread  = (bestAsk - bestBid) / bestBid * 100;
+
+        if (spread > SPREAD_MAX_PCT) {
+          result.blocked = true;
+          result.reasons.push(`스프레드${spread.toFixed(1)}%(>${SPREAD_MAX_PCT}%)`);
+        } else if (spread > SPREAD_MAX_PCT * 0.6) {
+          result.warnings.push(`스프레드${spread.toFixed(1)}%`);
+        }
+
+        // ── 2) 호가창 깊이 ──────────────────────────────────
+        let totalBid = 0, totalAsk = 0;
+        let maxBid = 0, maxAsk = 0;
+        for (const u of ob.orderbook_units) {
+          const bidKrw = u.bid_price * u.bid_size;
+          const askKrw = u.ask_price * u.ask_size;
+          totalBid += bidKrw;
+          totalAsk += askKrw;
+          if (bidKrw > maxBid) maxBid = bidKrw;
+          if (askKrw > maxAsk) maxAsk = askKrw;
+        }
+        const totalDepth = totalBid + totalAsk;
+
+        if (totalDepth < MIN_ORDERBOOK_DEPTH) {
+          result.blocked = true;
+          result.reasons.push(`호가깊이${Math.round(totalDepth/10000)}만(<${MIN_ORDERBOOK_DEPTH/10000}만)`);
+        }
+
+        // ── 3) 고래 벽 탐지 ─────────────────────────────────
+        const whaleRatioBid = totalBid > 0 ? maxBid / totalBid : 0;
+        const whaleRatioAsk = totalAsk > 0 ? maxAsk / totalAsk : 0;
+        const whaleRatio    = Math.max(whaleRatioBid, whaleRatioAsk);
+
+        if (whaleRatio > WHALE_RATIO_MAX) {
+          result.warnings.push(`고래벽${(whaleRatio * 100).toFixed(0)}%`);
+          // 고래벽만으로는 차단하지 않음 (경고만)
+        }
+      }
+
+      // ── 4) 이미 펌핑 체크 ──────────────────────────────────
+      if (ticker) {
+        const openPrice   = ticker.opening_price;
+        const curPrice    = ticker.trade_price;
+        const pumpFromOpen = (curPrice - openPrice) / openPrice;
+
+        if (pumpFromOpen > PRICE_SPIKE_MAX) {
+          result.blocked = true;
+          result.reasons.push(`이미펌핑+${(pumpFromOpen * 100).toFixed(0)}%(>${PRICE_SPIKE_MAX * 100}%)`);
+        } else if (pumpFromOpen > PRICE_SPIKE_MAX * 0.6) {
+          result.warnings.push(`급등+${(pumpFromOpen * 100).toFixed(0)}%`);
+        }
+      }
+
+      // ── 5) 체결 건수 (워시트레이딩) ───────────────────────
+      if (trades && Array.isArray(trades)) {
+        if (trades.length < MIN_TRADE_COUNT) {
+          result.warnings.push(`체결${trades.length}건(<${MIN_TRADE_COUNT})`);
+        }
+
+        // 같은 수량 반복 체결 = 워시트레이딩 패턴
+        if (trades.length >= 10) {
+          const volumes = trades.map(t => +t.trade_volume.toFixed(8));
+          const uniqueVols = new Set(volumes).size;
+          const repeatRatio = 1 - uniqueVols / volumes.length;
+          if (repeatRatio > 0.5) {
+            result.warnings.push(`반복체결${(repeatRatio * 100).toFixed(0)}%(워시의심)`);
+          }
+        }
+      }
+
+    } catch (e) {
+      // 조작 탐지 실패 시 진입 허용 (보수적 대응보다 기회 우선)
+      result.warnings.push("조작탐지실패");
+    }
+
+    if (result.reasons.length > 0) result.blocked = true;
+    return result;
   }
 
   async _fetchMarkets() {
