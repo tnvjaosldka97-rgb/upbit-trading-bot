@@ -1,26 +1,25 @@
 .env
 node_modules/
 data/
-trades.db
-trades.db-wal
-trades.db-shm
+
+# SQLite
+*.db
+*.db-shm
+*.db-wal
 
 # Logs
 *.log
 
-# SQLite runtime data
-arb-data.db
-arb-data.db-shm
-arb-data.db-wal
-prediction_edge/prediction_edge.db-shm
-prediction_edge/prediction_edge.db-wal
-
 # Output files
 backtest-result.txt
 multimarket-result.txt
+sweep*.txt
 
 # Claude memory
 .claude/
 
-# Calibration results
-prediction_edge/backtest/oracle_calibration_result.json
+# Separate project
+prediction_edge/
+
+# Backups
+arb-backups/
