@@ -27,11 +27,24 @@ const ATR_TRAIL_MULT = CFG.A_ATR_TRAIL_MULT;
 const MAX_HOLD_MS    = CFG.A_MAX_HOLD_MS;
 const COOLDOWN_MS    = CFG.A_COOLDOWN_MS;
 
+// Multi-factor scoring config
+const MACRO_WEIGHT       = CFG.A_MACRO_WEIGHT;
+const DATA_WEIGHT        = CFG.A_DATA_WEIGHT;
+const TAPE_WEIGHT        = CFG.A_TAPE_WEIGHT;
+const HARD_BLOCK_KIMCHI  = CFG.A_HARD_BLOCK_KIMCHI;
+const HARD_BLOCK_FUNDING = CFG.A_HARD_BLOCK_FUNDING;
+const HARD_BLOCK_GREED   = CFG.A_HARD_BLOCK_GREED;
+const MIN_CONFLUENCE     = CFG.A_MIN_CONFLUENCE;
+const EV_GATE            = CFG.A_EV_GATE;
+
 class StrategyA {
   constructor(options = {}) {
     this.orderService  = options.orderService  || null;
     this.regimeEngine  = options.regimeEngine  || null;
     this.calibEngine   = options.calibEngine   || null;
+    this.macroEngine   = options.macroEngine   || null;
+    this.dataAggEngine = options.dataAggEngine || null;
+    this.alphaEngine   = options.alphaEngine   || null;
     this.dryRun        = options.dryRun ?? true;
     this.initialCapital = options.initialCapital || 100_000;
 
@@ -94,7 +107,7 @@ class StrategyA {
    * @param {{ suggestedPositionPct: number, expectedValue: number }} calibration - from CalibrationEngine
    * @returns {{ action: string, reason: string, confidence: number, stopLoss: number, takeProfit: number } | null}
    */
-  evaluate(candles, regime, calibration) {
+  evaluate(candles, regime, calibration, externalSignals = {}) {
     if (!candles || candles.length < 50) {
       return { action: "HOLD", reason: "insufficient data", confidence: 0 };
     }
@@ -121,20 +134,46 @@ class StrategyA {
       return { action: "HOLD", reason: "BEAR_STRONG regime block", confidence: 0 };
     }
 
-    // ── Signal Fusion Scoring ─────────────────────────
-    let score = 0;
+    // ═══════════════════════════════════════════════════
+    //  HARD FILTERS — 구조적 위험 시 무조건 차단
+    // ═══════════════════════════════════════════════════
+    const macro = externalSignals.macro || null;
+    const data  = externalSignals.data  || null;
+    const tape  = externalSignals.tape  || null;
+
+    if (macro) {
+      if (macro.kimchiPremium !== null && macro.kimchiPremium > HARD_BLOCK_KIMCHI) {
+        return { action: "HOLD", reason: `BLOCKED: kimchi ${(macro.kimchiPremium * 100).toFixed(1)}% > ${HARD_BLOCK_KIMCHI * 100}%`, confidence: 0 };
+      }
+      if (macro.fundingRate !== null && macro.fundingRate > HARD_BLOCK_FUNDING) {
+        return { action: "HOLD", reason: `BLOCKED: funding ${(macro.fundingRate * 10000).toFixed(1)}bps crowded long`, confidence: 0 };
+      }
+      if (macro.fearGreedValue !== null && macro.fearGreedValue > HARD_BLOCK_GREED) {
+        return { action: "HOLD", reason: `BLOCKED: extreme greed ${macro.fearGreedValue}`, confidence: 0 };
+      }
+    }
+
+    // EV Gate — 캘리브레이션 EV가 마이너스면 거래 안 함
+    if (calibration?.sufficient && calibration.expectedValue <= EV_GATE) {
+      return { action: "HOLD", reason: `BLOCKED: EV ${(calibration.expectedValue * 100).toFixed(3)}% too low`, confidence: 0 };
+    }
+
+    // ═══════════════════════════════════════════════════
+    //  CATEGORY 1: TA (기술지표) — max ~88 points
+    // ═══════════════════════════════════════════════════
+    let taScore = 0;
     const reasons = [];
 
     // 1) RSI14
     const rsi = this._rsi(closes, 14);
     if (rsi < RSI_OVERSOLD) {
-      score += 15;
+      taScore += 15;
       reasons.push(`RSI_OVERSOLD(${rsi.toFixed(0)})`);
     } else if (rsi > RSI_OVERBOUGHT) {
-      score -= 10;
+      taScore -= 10;
       reasons.push(`RSI_OVERBOUGHT(${rsi.toFixed(0)})`);
     } else if (rsi >= 42 && rsi <= 58) {
-      score += 5;
+      taScore += 5;
       reasons.push(`RSI_NEUTRAL(${rsi.toFixed(0)})`);
     }
 
@@ -142,36 +181,36 @@ class StrategyA {
     const macd = this._macd(closes);
     if (macd) {
       if (macd.histogram > 0 && macd.histogram > macd.prevHistogram) {
-        score += 12;
+        taScore += 12;
         reasons.push("MACD_BULLISH_MOMENTUM");
       } else if (macd.histogram <= 0) {
-        score -= 5;
+        taScore -= 5;
         reasons.push("MACD_NEGATIVE");
       }
     }
 
-    // 3) Bollinger Band squeeze (BB width < 2% = squeeze)
+    // 3) Bollinger Band squeeze
     const bb = this._bollingerBands(closes, 20, 2);
     if (bb) {
       const bbWidth = (bb.upper - bb.lower) / bb.middle;
       if (bbWidth < 0.02 && price > bb.middle) {
-        score += 10;
+        taScore += 10;
         reasons.push("BB_SQUEEZE_BREAKOUT");
       } else if (bbWidth < 0.02) {
-        score += 5;
+        taScore += 5;
         reasons.push("BB_SQUEEZE");
       }
       if (price < bb.lower) {
-        score += 8;
+        taScore += 8;
         reasons.push("BB_OVERSOLD");
       }
     }
 
-    // 4) Volume spike (recent 3 vs prior 20)
+    // 4) Volume spike
     const recentVol = this._mean(volumes.slice(-3));
     const baseVol   = this._mean(volumes.slice(-23, -3));
     if (baseVol > 0 && recentVol > baseVol * 1.5) {
-      score += 8;
+      taScore += 8;
       reasons.push("VOLUME_SPIKE");
     }
 
@@ -179,29 +218,76 @@ class StrategyA {
     const ma8  = this._sma(closes, 8);
     const ma21 = this._sma(closes, 21);
     if (ma8 && ma21 && ma8 > ma21) {
-      score += 10;
+      taScore += 10;
       reasons.push("GOLDEN_CROSS");
     }
 
     // 6) EMA200 position
     const ema200 = this._ema(closes, 200);
     if (ema200 && price > ema200) {
-      score += 8;
+      taScore += 8;
       reasons.push("ABOVE_EMA200");
     } else if (ema200) {
-      score -= 15;
+      taScore -= 15;
       reasons.push("BELOW_EMA200");
     }
 
     // 7) Regime contribution
     const regimeScore = this._regimeScore(regimeStr);
-    score += regimeScore;
+    taScore += regimeScore;
     if (regimeScore > 0) reasons.push(`REGIME_${regimeStr}`);
 
-    // ── Confidence ────────────────────────────────────
-    const confidence = Math.min(Math.max(score / 80, 0), 1);
+    // ═══════════════════════════════════════════════════
+    //  CATEGORY 2: MACRO (구조적 알파) — max ~30 points
+    // ═══════════════════════════════════════════════════
+    let macroScore = 0;
+    if (macro) {
+      macroScore = Math.round(macro.macroScore * MACRO_WEIGHT * 10) / 10;
+      if (macroScore > 0) reasons.push(`MACRO_BULLISH(${macroScore.toFixed(0)})`);
+      else if (macroScore < -3) reasons.push(`MACRO_BEARISH(${macroScore.toFixed(0)})`);
+    }
 
-    // ── Kelly-calibrated targets ──────────────────────
+    // ═══════════════════════════════════════════════════
+    //  CATEGORY 3: DATA (파생상품/온체인) — max ~25 points
+    // ═══════════════════════════════════════════════════
+    let dataScore = 0;
+    if (data) {
+      dataScore = Math.round(data.dataScore * DATA_WEIGHT * 10) / 10;
+      if (dataScore > 0) reasons.push(`DATA_BULLISH(${dataScore.toFixed(0)})`);
+      else if (dataScore < -3) reasons.push(`DATA_BEARISH(${dataScore.toFixed(0)})`);
+    }
+
+    // ═══════════════════════════════════════════════════
+    //  CATEGORY 4: TAPE (체결 미시구조) — max ~16 points
+    // ═══════════════════════════════════════════════════
+    let tapeScore = 0;
+    if (tape) {
+      switch (tape.signal) {
+        case "STRONG_BUY": tapeScore = 12; break;
+        case "BUY":        tapeScore = 8;  break;
+        case "NEUTRAL":    tapeScore = 0;  break;
+        case "AVOID":      tapeScore = -10; break;
+      }
+      if (tape.largeTradeRatio > 0.3) tapeScore += 4;
+      tapeScore = Math.round(tapeScore * TAPE_WEIGHT * 10) / 10;
+      if (tapeScore > 0) reasons.push(`TAPE_${tape.signal}(${tapeScore.toFixed(0)})`);
+      else if (tapeScore < 0) reasons.push(`TAPE_AVOID(${tapeScore.toFixed(0)})`);
+    }
+
+    // ═══════════════════════════════════════════════════
+    //  CONFLUENCE GATE + FINAL DECISION
+    // ═══════════════════════════════════════════════════
+    const score = taScore + macroScore + dataScore + tapeScore;
+
+    let confluence = 0;
+    if (taScore > 0) confluence++;
+    if (macroScore > 0) confluence++;
+    if (dataScore > 0) confluence++;
+    if (tapeScore > 0) confluence++;
+
+    const confidence = Math.min(Math.max(score / 120, 0), 1);
+
+    // Kelly-calibrated targets
     const atr = this._atr(highs, lows, closes, 14);
     const atrPct = price > 0 ? atr / price : 0;
     const calPct = calibration?.suggestedPositionPct || 0.05;
@@ -216,10 +302,12 @@ class StrategyA {
     const takeProfit = Math.round(price * (1 + targetRate));
     const stopLoss   = Math.round(price * (1 + stopRate));
 
-    if (score >= ENTRY_THRESHOLD) {
+    if (score >= ENTRY_THRESHOLD && confluence >= MIN_CONFLUENCE) {
       console.log(
         `[StrategyA] BUY signal -- ${MARKET} score:${score} ` +
-        `confidence:${confidence.toFixed(2)} [${reasons.join(",")}]`
+        `confluence:${confluence}/4 ` +
+        `[TA:${taScore} MACRO:${macroScore} DATA:${dataScore} TAPE:${tapeScore}] ` +
+        `[${reasons.join(",")}]`
       );
       return {
         action: "BUY",
@@ -228,13 +316,17 @@ class StrategyA {
         stopLoss,
         takeProfit,
         score,
-        _meta: { rsi, atr, atrPct, targetRate, stopRate, calPct },
+        _meta: { rsi, atr, atrPct, targetRate, stopRate, calPct, taScore, macroScore, dataScore, tapeScore, confluence },
       };
     }
 
+    const holdReason = score < ENTRY_THRESHOLD
+      ? `score ${score} < threshold ${ENTRY_THRESHOLD}`
+      : `confluence ${confluence}/${MIN_CONFLUENCE} insufficient`;
+
     return {
       action: "HOLD",
-      reason: `score ${score} < threshold ${ENTRY_THRESHOLD}`,
+      reason: holdReason,
       confidence,
       stopLoss,
       takeProfit,
@@ -374,7 +466,23 @@ class StrategyA {
           ? this.calibEngine.getResult()
           : null;
 
-        const signal = this.evaluate(candles, regime, calibration);
+        // Multi-factor signal gathering
+        const macroSignals = this.macroEngine
+          ? this.macroEngine.getSignals(MARKET)
+          : null;
+        const dataSignals = this.dataAggEngine
+          ? this.dataAggEngine.getSignals(MARKET)
+          : null;
+        let tapeSignals = null;
+        try {
+          if (this.alphaEngine) tapeSignals = await this.alphaEngine.analyzeTape(MARKET);
+        } catch {}
+
+        const signal = this.evaluate(candles, regime, calibration, {
+          macro: macroSignals,
+          data:  dataSignals,
+          tape:  tapeSignals,
+        });
         if (signal && signal.action === "BUY") {
           await this._enter(MARKET, signal, regime, calibration);
         }

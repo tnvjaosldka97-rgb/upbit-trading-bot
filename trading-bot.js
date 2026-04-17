@@ -24,6 +24,12 @@ const { CalibrationEngine } = require("./calibration-engine");
 const { StrategyA }         = require("./strategy-a");
 const { StrategyB }         = require("./strategy-b");
 
+// Multi-factor signal engines
+const { MacroSignalEngine }         = require("./macro-signal-engine");
+const { DataAggregationEngine }     = require("./data-aggregation-engine");
+const { AlphaEngine }               = require("./alpha-engine");
+const { MarketDataService }         = require("./market-data-service");
+
 // Arbitrage subsystem (public data only — no API keys required)
 const { createExchange, safeFetch }  = require("./exchange-adapter");
 const { ExchangeWebSocketManager }  = require("./exchange-websocket");
@@ -70,11 +76,20 @@ class TradingBot {
       minTrades:     20,
     });
 
+    // ── Multi-factor signal engines ───────────────
+    this.mds           = new MarketDataService();
+    this.macroEngine   = new MacroSignalEngine(this.mds);
+    this.dataAggEngine = new DataAggregationEngine();
+    this.alphaEngine   = new AlphaEngine();
+
     // ── Strategy A: 1h Swing (BTC) ─────────────────
     this.strategyA = new StrategyA({
       orderService:   this.orderService,
       regimeEngine:   this.regimeEngine,
       calibEngine:    this.calibEngine,
+      macroEngine:    this.macroEngine,
+      dataAggEngine:  this.dataAggEngine,
+      alphaEngine:    this.alphaEngine,
       initialCapital: CAPITAL_A,
       dryRun:         DRY_RUN,
     });
@@ -165,6 +180,12 @@ class TradingBot {
     // ── Start calibration engine ───────────────────
     this.calibEngine.start(60_000);
     console.log("[TradingBot] calibration engine started (1min interval)");
+
+    // ── Start multi-factor signal engines ──────────
+    this.macroEngine.start();
+    console.log("[TradingBot] MacroSignalEngine started (kimchi/funding/feargreed)");
+    this.dataAggEngine.start();
+    console.log("[TradingBot] DataAggregationEngine started (OI/LS/taker/listings/news)");
 
     // ── Start Strategy A (1h interval) ─────────────
     this.strategyA.start(STRATEGY_A_INTERVAL);
@@ -744,6 +765,8 @@ ${(stratB.detections || []).slice(0, 10).map(d =>
 
     // Stop engines
     this.calibEngine.stop();
+    try { this.macroEngine.stop(); } catch {}
+    try { this.dataAggEngine.stop(); } catch {}
     this.strategyA.stop();
     this.strategyB.stop();
 

@@ -18,13 +18,23 @@ module.exports = Object.freeze({
   A_MARKET:          env("A_MARKET", "KRW-BTC"),
   A_RSI_OVERSOLD:    num("A_RSI_OVERSOLD", 35),
   A_RSI_OVERBOUGHT:  num("A_RSI_OVERBOUGHT", 70),
-  A_ENTRY_THRESHOLD: num("A_ENTRY_THRESHOLD", 40),
+  A_ENTRY_THRESHOLD: num("A_ENTRY_THRESHOLD", 55),
   A_DEFAULT_TARGET:  num("A_DEFAULT_TARGET", 0.035),
   A_DEFAULT_STOP:    num("A_DEFAULT_STOP", -0.015),
   A_PARTIAL_RATE:    num("A_PARTIAL_RATE", 0.020),
   A_ATR_TRAIL_MULT:  num("A_ATR_TRAIL_MULT", 2.0),
   A_MAX_HOLD_MS:     num("A_MAX_HOLD_MS", 12 * 60 * 60_000),
   A_COOLDOWN_MS:     num("A_COOLDOWN_MS", 2 * 60 * 60_000),
+
+  // ─── Strategy A Multi-Factor Scoring ───────────────
+  A_MACRO_WEIGHT:       num("A_MACRO_WEIGHT", 1.0),
+  A_DATA_WEIGHT:        num("A_DATA_WEIGHT", 1.0),
+  A_TAPE_WEIGHT:        num("A_TAPE_WEIGHT", 0.7),
+  A_HARD_BLOCK_KIMCHI:  num("A_HARD_BLOCK_KIMCHI", 0.03),
+  A_HARD_BLOCK_FUNDING: num("A_HARD_BLOCK_FUNDING", 0.001),
+  A_HARD_BLOCK_GREED:   num("A_HARD_BLOCK_GREED", 85),
+  A_MIN_CONFLUENCE:     num("A_MIN_CONFLUENCE", 3),
+  A_EV_GATE:            num("A_EV_GATE", 0.0001),
 
   // ─── Strategy B (New Listing) ──────────────────────
   B_SCAN_INTERVAL_MS:   num("B_SCAN_INTERVAL_MS", 30_000),
