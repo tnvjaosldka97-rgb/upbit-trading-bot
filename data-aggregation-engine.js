@@ -1,5 +1,7 @@
 "use strict";
 
+const { safeFetch } = require("./exchange-adapter");
+
 /**
  * DataAggregationEngine — 빅데이터 신호 집합체
  *
@@ -112,7 +114,7 @@ class DataAggregationEngine {
     try {
       const results = await Promise.allSettled(
         symbols.map((sym) =>
-          fetch(`https://fapi.binance.com/fapi/v1/openInterest?symbol=${sym}`)
+          safeFetch(`https://fapi.binance.com/fapi/v1/openInterest?symbol=${sym}`)
             .then((r) => r.ok ? r.json() : null),
         ),
       );
@@ -130,7 +132,7 @@ class DataAggregationEngine {
         this.state.binanceOI.set(sym, { oi, timestamp: Date.now() });
       }
       this.state.lastUpdated.oi = Date.now();
-    } catch {}
+    } catch (e) { console.warn("[DataAggr] refreshOI:", e.message); }
   }
 
   // ─── 2. Long/Short 비율 (군중 쏠림) ──────────────────
@@ -144,7 +146,7 @@ class DataAggregationEngine {
     try {
       const results = await Promise.allSettled(
         symbols.map((sym) =>
-          fetch(`https://fapi.binance.com/futures/data/globalLongShortAccountRatio?symbol=${sym}&period=5m&limit=1`)
+          safeFetch(`https://fapi.binance.com/futures/data/globalLongShortAccountRatio?symbol=${sym}&period=5m&limit=1`)
             .then((r) => r.ok ? r.json() : null),
         ),
       );
@@ -163,7 +165,7 @@ class DataAggregationEngine {
         });
       }
       this.state.lastUpdated.lsRatio = Date.now();
-    } catch {}
+    } catch (e) { console.warn("[DataAggr] refreshLsRatios:", e.message); }
   }
 
   // ─── 3. Taker 매수/매도 비율 ─────────────────────────
@@ -178,7 +180,7 @@ class DataAggregationEngine {
     try {
       const results = await Promise.allSettled(
         symbols.map((sym) =>
-          fetch(`https://fapi.binance.com/futures/data/takerlongshortRatio?symbol=${sym}&period=5m&limit=3`)
+          safeFetch(`https://fapi.binance.com/futures/data/takerlongshortRatio?symbol=${sym}&period=5m&limit=3`)
             .then((r) => r.ok ? r.json() : null),
         ),
       );
@@ -193,7 +195,7 @@ class DataAggregationEngine {
         this.state.takerRatios.set(sym, avgRatio);
       }
       this.state.lastUpdated.taker = Date.now();
-    } catch {}
+    } catch (e) { console.warn("[DataAggr] refreshTakerFlow:", e.message); }
   }
 
   // ─── 4. Bybit OI (크로스 거래소 확인) ────────────────
@@ -207,7 +209,7 @@ class DataAggregationEngine {
     try {
       const results = await Promise.allSettled(
         symbols.map((sym) =>
-          fetch(`https://api.bybit.com/v5/market/open-interest?category=linear&symbol=${sym}&intervalTime=5min&limit=2`)
+          safeFetch(`https://api.bybit.com/v5/market/open-interest?category=linear&symbol=${sym}&intervalTime=5min&limit=2`)
             .then((r) => r.ok ? r.json() : null),
         ),
       );
@@ -224,7 +226,7 @@ class DataAggregationEngine {
         });
       }
       this.state.lastUpdated.bybitOI = Date.now();
-    } catch {}
+    } catch (e) { console.warn("[DataAggr] refreshBybitOI:", e.message); }
   }
 
   // ─── 5. 업비트 신규 상장 감지 ────────────────────────
@@ -241,7 +243,7 @@ class DataAggregationEngine {
    */
   async checkNewListings() {
     try {
-      const res = await fetch("https://api.upbit.com/v1/market/all?isDetails=false");
+      const res = await safeFetch("https://api.upbit.com/v1/market/all?isDetails=false");
       if (!res.ok) return;
       const markets = await res.json();
 
@@ -282,7 +284,7 @@ class DataAggregationEngine {
           this.state.newListings.delete(market);
         }
       }
-    } catch {}
+    } catch (e) { console.warn("[DataAggr] checkNewListings:", e.message); }
   }
 
   // ─── 6. 뉴스 감성 분석 ───────────────────────────────
@@ -296,7 +298,7 @@ class DataAggregationEngine {
     try {
       const results = await Promise.allSettled(
         currencies.map((cur) =>
-          fetch(`https://cryptopanic.com/api/v1/posts/?public=true&currencies=${cur}&filter=hot&limit=10`)
+          safeFetch(`https://cryptopanic.com/api/v1/posts/?public=true&currencies=${cur}&filter=hot&limit=10`, { timeout: 8000 })
             .then((r) => r.ok ? r.json() : null),
         ),
       );
@@ -328,7 +330,7 @@ class DataAggregationEngine {
         }
       }
       this.state.lastUpdated.news = Date.now();
-    } catch {}
+    } catch (e) { console.warn("[DataAggr] refreshNewsScores:", e.message); }
   }
 
   // ─── 신호 종합 ───────────────────────────────────────

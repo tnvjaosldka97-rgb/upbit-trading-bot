@@ -1,5 +1,7 @@
 "use strict";
 
+const { safeFetch } = require("./exchange-adapter");
+
 /**
  * MacroSignalEngine — 구조적 알파 (Structural Alpha)
  *
@@ -67,23 +69,23 @@ class MacroSignalEngine {
       "DOGEUSDT","AVAXUSDT","DOTUSDT","LINKUSDT","MATICUSDT",
     ];
     try {
-      const res = await fetch(
+      const res = await safeFetch(
         `https://api.binance.com/api/v3/ticker/price?symbols=${JSON.stringify(symbols)}`,
       );
       if (!res.ok) return;
       for (const item of await res.json()) {
         this.state.binancePrices.set(item.symbol.replace("USDT", ""), Number(item.price));
       }
-    } catch {}
+    } catch (e) { console.warn("[MacroSignal] refreshBinancePrices:", e.message); }
 
     // 환율도 함께 갱신 (FX 데이터 없을 때 폴백용)
     try {
-      const res = await fetch("https://open.er-api.com/v6/latest/USD");
+      const res = await safeFetch("https://open.er-api.com/v6/latest/USD", { timeout: 8000 });
       if (res.ok) {
         const data = await res.json();
         if (data?.rates?.KRW) this._cachedUsdKrw = data.rates.KRW;
       }
-    } catch {}
+    } catch (e) { console.warn("[MacroSignal] refreshFxRate:", e.message); }
   }
 
   computeKimchiPremiums() {
@@ -91,7 +93,7 @@ class MacroSignalEngine {
     // FX 데이터 없으면 환율 API로 직접 폴백 (캐시된 값 사용)
     const usdKrw = fxUsd?.basePrice
       ? Number(fxUsd.basePrice)
-      : (this._cachedUsdKrw || 1370);  // 없으면 근사치 사용
+      : (this._cachedUsdKrw || require("./config").DEFAULT_USD_KRW);
     if (!usdKrw) return;
 
     for (const [symbol, binanceUsd] of this.state.binancePrices.entries()) {
@@ -109,7 +111,7 @@ class MacroSignalEngine {
   async refreshFundingRates() {
     try {
       // Binance 무기한 선물 펀딩비 — 공개 API, 인증 불필요
-      const res = await fetch("https://fapi.binance.com/fapi/v1/premiumIndex");
+      const res = await safeFetch("https://fapi.binance.com/fapi/v1/premiumIndex");
       if (!res.ok) return;
       for (const item of await res.json()) {
         if (!item.symbol?.endsWith("USDT")) continue;
@@ -119,12 +121,12 @@ class MacroSignalEngine {
         );
       }
       this.state.lastUpdated.funding = Date.now();
-    } catch {}
+    } catch (e) { console.warn("[MacroSignal] refreshFundingRates:", e.message); }
   }
 
   async refreshFearGreed() {
     try {
-      const res  = await fetch("https://api.alternative.me/fng/?limit=1");
+      const res  = await safeFetch("https://api.alternative.me/fng/?limit=1", { timeout: 8000 });
       if (!res.ok) return;
       const data = await res.json();
       const item = data?.data?.[0];
@@ -136,7 +138,7 @@ class MacroSignalEngine {
         };
       }
       this.state.lastUpdated.fearGreed = Date.now();
-    } catch {}
+    } catch (e) { console.warn("[MacroSignal] refreshFearGreed:", e.message); }
   }
 
   /**

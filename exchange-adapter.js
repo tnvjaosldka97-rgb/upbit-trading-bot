@@ -851,6 +851,8 @@ const SUPPORTED_EXCHANGES = [
 ];
 
 module.exports = {
+  safeFetch,
+  fetchJSON,
   createExchange,
   SUPPORTED_EXCHANGES,
   UpbitAdapter,

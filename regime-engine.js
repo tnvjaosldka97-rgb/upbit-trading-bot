@@ -1,269 +1,365 @@
 "use strict";
 
 /**
- * RegimeEngine v2 — 멀티타임프레임 시장 국면 감지
+ * RegimeEngine v2 — Multi-timeframe regime detection
  *
- * v1 (단일 일봉 SMA200) → v2 (일봉 + 4h 이중 확인)
+ * Upbit REST API candle data (1h, 4h, daily) 기반
+ * 5-국면 분류: BULL_STRONG, BULL_WEAK, RANGE, BEAR_WEAK, BEAR_STRONG
  *
- * 3-국면 분류:
- *   BULL   : 일봉 SMA200 +2% 이상 + 주간 양수 + 4h 추세 상승
- *   NEUTRAL: 중간 구간
- *   BEAR   : 일봉 SMA200 -2% 이하 + 주간 음수 + 4h 추세 하락
- *
- * 개선점 (v2):
- *   1) 4h 캔들 SMA50으로 단기 추세 확인
- *   2) 일봉 RSI14로 과열/침체 보정
- *   3) 복합 신뢰도 계산 (단순 30% 고착 제거)
- *   4) 국면 전환 히스테리시스 (잦은 전환 방지)
+ * 사용 지표: SMA20/50/200, RSI14, ATR14, Volume Ratio, ADX
  */
+
+const { safeFetch } = require("./exchange-adapter");
+const UPBIT_API = "https://api.upbit.com";
+
 class RegimeEngine {
-  constructor() {
-    this.REFRESH_MS   = 15 * 60_000;  // 15분마다 갱신 (v1: 30분)
-    this._intervalId  = null;
+  constructor(options = {}) {
+    this.cacheTTL = options.cacheTTL || 60_000; // 1분 캐시
+    this._cache = new Map();
 
-    this.state = {
-      regime:           "NEUTRAL",
-      confidence:       0,
-      btcVsSma200:      0,
-      btcVsSma50_4h:    0,    // 4h SMA50 대비
-      weeklyReturn:     0,
-      monthlyReturn:    0,
-      dailyRsi:         50,
-      volatilityRegime: "NORMAL",
-      lastUpdated:      0,
-    };
+    // 히스테리시스: 잦은 전환 방지
+    this._pendingRegime = null;
+    this._pendingCount  = 0;
+    this.HYSTERESIS_COUNT = 2;
 
-    // 히스테리시스: 같은 신호 2회 연속일 때만 전환
-    this._pendingRegime   = null;
-    this._pendingCount    = 0;
-    this.HYSTERESIS_COUNT = 2;   // 2회 연속 확인 후 전환
+    // 마지막 확정 국면
+    this._lastRegime = "RANGE";
+    this._lastConfidence = 0;
   }
 
-  async start() {
-    await this.refresh();
-    this._intervalId = setInterval(() => this.refresh(), this.REFRESH_MS);
-    console.log(
-      `[RegimeEngine v2] 시작 — 국면: ${this.state.regime} ` +
-      `(신뢰도 ${Math.round(this.state.confidence)}%) ` +
-      `BTC vs SMA200: ${(this.state.btcVsSma200 * 100).toFixed(1)}%`
-    );
+  // ─── Public API ─────────────────────────────────────
+
+  /**
+   * detect(market) -> { regime, confidence, details }
+   *
+   * @param {string} market - e.g. "KRW-BTC"
+   * @returns {Promise<{regime: string, confidence: number, details: object}>}
+   */
+  async detect(market) {
+    const cacheKey = `${market}_regime`;
+    const cached = this._cache.get(cacheKey);
+    if (cached && Date.now() - cached.ts < this.cacheTTL) {
+      return cached.value;
+    }
+
+    try {
+      const [candles1h, candles4h, candlesDaily] = await Promise.all([
+        this._fetchCandles(market, 60, 200),
+        this._fetchCandles(market, 240, 200),
+        this._fetchCandlesDay(market, 200),
+      ]);
+
+      const tf1h    = this._analyzeTimeframe(candles1h, "1h");
+      const tf4h    = this._analyzeTimeframe(candles4h, "4h");
+      const tfDaily = this._analyzeTimeframe(candlesDaily, "daily");
+
+      const compositeScore = this._fuseScores(tf1h, tf4h, tfDaily);
+      const rawRegime = this._classifyRegime(compositeScore);
+
+      // 히스테리시스 적용
+      const regime = this._applyHysteresis(rawRegime);
+      const confidence = Math.min(Math.abs(compositeScore) / 100, 1.0);
+
+      const result = {
+        regime,
+        confidence: Math.round(confidence * 100) / 100,
+        details: {
+          compositeScore: Math.round(compositeScore * 100) / 100,
+          rawRegime,
+          timeframes: {
+            "1h":    { score: tf1h.score, trend: tf1h.trend, rsi: tf1h.rsi, adx: tf1h.adx, volRatio: tf1h.volRatio },
+            "4h":    { score: tf4h.score, trend: tf4h.trend, rsi: tf4h.rsi, adx: tf4h.adx, volRatio: tf4h.volRatio },
+            daily:   { score: tfDaily.score, trend: tfDaily.trend, rsi: tfDaily.rsi, adx: tfDaily.adx, volRatio: tfDaily.volRatio },
+          },
+          timestamp: new Date().toISOString(),
+        },
+      };
+
+      this._lastRegime = regime;
+      this._lastConfidence = result.confidence;
+      this._cache.set(cacheKey, { ts: Date.now(), value: result });
+
+      console.log(
+        `[RegimeEngine] ${market} -> ${regime} (confidence: ${result.confidence}, ` +
+        `score: ${result.details.compositeScore})`
+      );
+      return result;
+
+    } catch (err) {
+      console.error(`[RegimeEngine] detect error (${market}):`, err.message);
+      return {
+        regime: this._lastRegime || "RANGE",
+        confidence: 0,
+        details: { error: err.message, timestamp: new Date().toISOString() },
+      };
+    }
   }
 
-  stop() { if (this._intervalId) clearInterval(this._intervalId); }
+  /**
+   * Convenience getters matching v1 interface
+   */
+  getRegime()    { return this._lastRegime; }
+  getConfidence(){ return this._lastConfidence; }
 
-  getRegime()   { return this.state.regime; }
-  isBull()      { return this.state.regime === "BULL"; }
-  isNeutral()   { return this.state.regime === "NEUTRAL"; }
-  isBear()      { return this.state.regime === "BEAR"; }
+  isBullish() {
+    return this._lastRegime === "BULL_STRONG" || this._lastRegime === "BULL_WEAK";
+  }
+  isBearish() {
+    return this._lastRegime === "BEAR_STRONG" || this._lastRegime === "BEAR_WEAK";
+  }
 
   getKellyMultiplier() {
-    if (this.state.regime === "BULL")    return 1.5;
-    if (this.state.regime === "NEUTRAL") return 1.0;
-    return 0.0;
+    switch (this._lastRegime) {
+      case "BULL_STRONG": return 1.5;
+      case "BULL_WEAK":   return 1.2;
+      case "RANGE":       return 1.0;
+      case "BEAR_WEAK":   return 0.5;
+      case "BEAR_STRONG": return 0.0;
+      default:            return 1.0;
+    }
   }
 
   getScoreContribution() {
-    if (this.state.regime === "BULL")    return 25;
-    if (this.state.regime === "NEUTRAL") return 0;
-    return -999;
-  }
-
-  async refresh() {
-    try {
-      // ── 일봉 데이터 (200개) ─────────────────────────
-      const [dailyRes, h4Res] = await Promise.allSettled([
-        fetch("https://api.upbit.com/v1/candles/days?market=KRW-BTC&count=200"),
-        fetch("https://api.upbit.com/v1/candles/minutes/240?market=KRW-BTC&count=100"),
-      ]);
-
-      if (dailyRes.status !== "fulfilled" || !dailyRes.value.ok) return;
-      const rawDaily = await dailyRes.value.json();
-      if (!Array.isArray(rawDaily) || rawDaily.length < 50) return;
-
-      const daily   = rawDaily.reverse();
-      const closes  = daily.map(c => Number(c.trade_price));
-      const price   = closes[closes.length - 1];
-      const n       = closes.length;
-
-      // ── 일봉 지표 ──────────────────────────────────
-      const smaLen  = Math.min(200, n);
-      const sma200  = closes.slice(-smaLen).reduce((s, v) => s + v, 0) / smaLen;
-      const btcVsSma200 = (price - sma200) / sma200;
-
-      const weeklyReturn  = n >= 8  ? (price - closes[n - 8])  / closes[n - 8]  : 0;
-      const monthlyReturn = n >= 31 ? (price - closes[n - 31]) / closes[n - 31] : 0;
-
-      // 일봉 RSI14
-      const dailyRsi = this._rsi(closes, 14);
-
-      // 일봉 ATR20
-      const atr20      = this._atr(daily.slice(-21));
-      const volRatio   = atr20 / price;
-      const volatilityRegime = volRatio > 0.045 ? "HIGH"
-        : volRatio < 0.018 ? "LOW"
-        : "NORMAL";
-
-      // ── 4h 지표 ────────────────────────────────────
-      let btcVsSma50_4h = 0;
-      let h4TrendUp = null;
-
-      if (h4Res.status === "fulfilled" && h4Res.value.ok) {
-        const raw4h = await h4Res.value.json();
-        if (Array.isArray(raw4h) && raw4h.length >= 50) {
-          const h4 = raw4h.reverse();
-          const h4closes = h4.map(c => Number(c.trade_price));
-          const h4price  = h4closes[h4closes.length - 1];
-          const h4sma50  = h4closes.slice(-50).reduce((s, v) => s + v, 0) / 50;
-          btcVsSma50_4h  = (h4price - h4sma50) / h4sma50;
-
-          // 4h SMA50 기울기: 최근 10개 vs 이전 10개
-          const smaRecent = h4closes.slice(-10).reduce((s, v) => s + v, 0) / 10;
-          const smaPrev   = h4closes.slice(-20, -10).reduce((s, v) => s + v, 0) / 10;
-          h4TrendUp       = smaRecent > smaPrev;
-        }
-      }
-
-      // ── 국면 결정 (멀티타임프레임) ─────────────────
-      const aboveSma200 = btcVsSma200 > 0.02;
-      const belowSma200 = btcVsSma200 < -0.02;
-      const weekUp      = weeklyReturn > 0.01;
-      const weekDown    = weeklyReturn < -0.01;
-      const monthUp     = monthlyReturn > 0.03;
-      const monthDown   = monthlyReturn < -0.03;
-      const above4hSma  = btcVsSma50_4h > 0;
-      const below4hSma  = btcVsSma50_4h < 0;
-
-      // RSI 보정: 극단 RSI → 신뢰도 조정
-      const rsiOverbought  = dailyRsi > 75;  // 과열 → BULL 신뢰도 감소
-      const rsiOversold    = dailyRsi < 30;  // 침체 → BEAR 완화, 반등 가능
-
-      let rawRegime;
-      let confidence = 0;
-
-      if (aboveSma200 && weekUp) {
-        rawRegime  = "BULL";
-        confidence = 50 + Math.min(30, btcVsSma200 * 800 + weeklyReturn * 300);
-        if (monthUp)              confidence = Math.min(90, confidence + 10);
-        if (above4hSma && h4TrendUp) confidence = Math.min(95, confidence + 10); // 4h 확인
-        if (rsiOverbought)        confidence -= 10;  // 과열 보정
-      } else if (belowSma200 && weekDown) {
-        rawRegime  = "BEAR";
-        confidence = 50 + Math.min(30, Math.abs(btcVsSma200) * 800);
-        if (monthDown)            confidence = Math.min(90, confidence + 10);
-        if (below4hSma && !h4TrendUp) confidence = Math.min(95, confidence + 10); // 4h 확인
-        if (rsiOversold)          confidence -= 10;  // 과매도 반등 가능
-      } else if (btcVsSma200 > 0.01 && above4hSma) {
-        rawRegime  = "BULL";
-        confidence = 42;
-        if (weekUp) confidence += 8;
-      } else if (btcVsSma200 < -0.01 && weekDown && below4hSma) {
-        rawRegime  = "BEAR";
-        confidence = 40;
-      } else {
-        rawRegime  = "NEUTRAL";
-        // NEUTRAL 신뢰도도 시장 상태 반영
-        confidence = 35 + Math.min(20, Math.abs(btcVsSma200) * 300);
-      }
-
-      if (volatilityRegime === "HIGH") confidence = Math.max(20, confidence - 15);
-      confidence = Math.round(Math.max(0, Math.min(95, confidence)));
-
-      // ── 히스테리시스: 잦은 전환 방지 ──────────────
-      const prev = this.state.regime;
-      let finalRegime = prev;
-
-      if (rawRegime !== prev) {
-        if (rawRegime === this._pendingRegime) {
-          this._pendingCount++;
-          if (this._pendingCount >= this.HYSTERESIS_COUNT) {
-            finalRegime         = rawRegime;
-            this._pendingRegime = null;
-            this._pendingCount  = 0;
-          }
-        } else {
-          this._pendingRegime = rawRegime;
-          this._pendingCount  = 1;
-        }
-      } else {
-        this._pendingRegime = null;
-        this._pendingCount  = 0;
-      }
-
-      this.state = {
-        regime:           finalRegime,
-        confidence,
-        btcVsSma200,
-        btcVsSma50_4h,
-        weeklyReturn,
-        monthlyReturn,
-        dailyRsi:         Math.round(dailyRsi),
-        volatilityRegime,
-        lastUpdated:      Date.now(),
-      };
-
-      if (prev !== finalRegime) {
-        console.log(
-          `[RegimeEngine v2] 국면 전환: ${prev} → ${finalRegime} ` +
-          `(신뢰도 ${confidence}%)\n` +
-          `  SMA200: ${(btcVsSma200 * 100).toFixed(2)}% | ` +
-          `SMA50(4h): ${(btcVsSma50_4h * 100).toFixed(2)}% | ` +
-          `RSI: ${Math.round(dailyRsi)} | ` +
-          `주간: ${(weeklyReturn * 100).toFixed(2)}%`
-        );
-      } else if (rawRegime !== this._pendingRegime || prev === finalRegime) {
-        // 주기적 상태 로그 (30분마다)
-        if (!this._lastStateLog || Date.now() - this._lastStateLog > 30 * 60_000) {
-          console.log(
-            `[RegimeEngine v2] ${finalRegime} (신뢰도 ${confidence}%) | ` +
-            `SMA200: ${(btcVsSma200 * 100).toFixed(1)}% | ` +
-            `SMA50(4h): ${(btcVsSma50_4h * 100).toFixed(1)}% | ` +
-            `RSI: ${Math.round(dailyRsi)} | 변동성: ${volatilityRegime}`
-          );
-          this._lastStateLog = Date.now();
-        }
-      }
-    } catch (e) {
-      console.error("[RegimeEngine v2] refresh 오류:", e.message);
+    switch (this._lastRegime) {
+      case "BULL_STRONG": return 30;
+      case "BULL_WEAK":   return 15;
+      case "RANGE":       return 0;
+      case "BEAR_WEAK":   return -15;
+      case "BEAR_STRONG": return -999;
+      default:            return 0;
     }
-  }
-
-  _rsi(closes, p = 14) {
-    if (closes.length < p + 1) return 50;
-    let g = 0, l = 0;
-    for (let i = closes.length - p; i < closes.length; i++) {
-      const d = closes[i] - closes[i - 1];
-      if (d > 0) g += d; else l -= d;
-    }
-    const al = l / p;
-    return al === 0 ? 99 : 100 - 100 / (1 + (g / p) / al);
-  }
-
-  _atr(candles) {
-    if (candles.length < 2) return 0;
-    const trs = candles.slice(1).map((c, i) =>
-      Math.max(
-        Number(c.high_price) - Number(c.low_price),
-        Math.abs(Number(c.high_price) - Number(candles[i].trade_price)),
-        Math.abs(Number(c.low_price)  - Number(candles[i].trade_price))
-      )
-    );
-    return trs.reduce((s, v) => s + v, 0) / trs.length;
   }
 
   getSummary() {
     return {
-      regime:           this.state.regime,
-      confidence:       this.state.confidence,
-      btcVsSma200Pct:   +(this.state.btcVsSma200 * 100).toFixed(2),
-      btcVsSma50_4hPct: +(this.state.btcVsSma50_4h * 100).toFixed(2),
-      weeklyReturnPct:  +(this.state.weeklyReturn * 100).toFixed(2),
-      monthlyReturnPct: +(this.state.monthlyReturn * 100).toFixed(2),
-      dailyRsi:         this.state.dailyRsi,
-      volatilityRegime: this.state.volatilityRegime,
-      kellyMultiplier:  this.getKellyMultiplier(),
-      pendingRegime:    this._pendingRegime,
-      lastUpdated:      this.state.lastUpdated,
+      regime:          this._lastRegime,
+      confidence:      this._lastConfidence,
+      kellyMultiplier: this.getKellyMultiplier(),
+      scoreContrib:    this.getScoreContribution(),
+      pendingRegime:   this._pendingRegime,
     };
+  }
+
+  // ─── Candle Fetching ────────────────────────────────
+
+  async _fetchCandles(market, minutes, count) {
+    const url = `${UPBIT_API}/v1/candles/minutes/${minutes}?market=${market}&count=${count}`;
+    const res = await safeFetch(url, { headers: { accept: "application/json" } });
+    if (!res.ok) throw new Error(`candle fetch ${minutes}m failed: ${res.status}`);
+    const data = await res.json();
+    return data.reverse(); // chronological
+  }
+
+  async _fetchCandlesDay(market, count) {
+    const url = `${UPBIT_API}/v1/candles/days?market=${market}&count=${count}`;
+    const res = await safeFetch(url, { headers: { accept: "application/json" } });
+    if (!res.ok) throw new Error(`candle fetch daily failed: ${res.status}`);
+    const data = await res.json();
+    return data.reverse();
+  }
+
+  // ─── Timeframe Analysis ─────────────────────────────
+
+  _analyzeTimeframe(candles, label) {
+    if (!candles || candles.length < 50) {
+      return { score: 0, trend: "UNKNOWN", rsi: 50, adx: 0, volRatio: 1, label };
+    }
+
+    const closes  = candles.map(c => c.trade_price);
+    const highs   = candles.map(c => c.high_price);
+    const lows    = candles.map(c => c.low_price);
+    const volumes = candles.map(c => c.candle_acc_trade_volume);
+
+    const sma20  = this._sma(closes, 20);
+    const sma50  = this._sma(closes, 50);
+    const sma200 = candles.length >= 200 ? this._sma(closes, 200) : sma50;
+    const lastClose = closes[closes.length - 1];
+
+    const rsi = this._rsi(closes, 14);
+    const atr = this._atr(highs, lows, closes, 14);
+    const atrPct = lastClose > 0 ? (atr / lastClose) * 100 : 0;
+
+    const volRecent = this._mean(volumes.slice(-5));
+    const volPrior  = this._mean(volumes.slice(-25, -5));
+    const volRatio  = volPrior > 0 ? volRecent / volPrior : 1;
+
+    const adx = this._adx(highs, lows, closes, 14);
+
+    // ─── Score Calculation ────────────────────────────
+    let score = 0;
+
+    // SMA alignment
+    if (lastClose > sma20) score += 10; else score -= 10;
+    if (sma20 > sma50) score += 15; else score -= 15;
+    if (sma50 > sma200) score += 20; else score -= 20;
+
+    // Price vs SMA200 distance
+    if (sma200 > 0) {
+      const distPct = ((lastClose - sma200) / sma200) * 100;
+      score += Math.max(-25, Math.min(25, distPct * 2));
+    }
+
+    // RSI
+    if (rsi > 70) score += 10;
+    else if (rsi > 55) score += 5;
+    else if (rsi < 30) score -= 10;
+    else if (rsi < 45) score -= 5;
+
+    // ADX trend strength amplifier
+    if (adx > 25) {
+      score = score * 1.3;
+    } else if (adx < 15) {
+      score = score * 0.5;
+    }
+
+    // Volume ratio amplifier
+    if (volRatio > 1.5) {
+      score = score * 1.2;
+    }
+
+    let trend;
+    if (sma20 > sma50 && sma50 > sma200) trend = "UP";
+    else if (sma20 < sma50 && sma50 < sma200) trend = "DOWN";
+    else trend = "MIXED";
+
+    return {
+      score: Math.round(score * 100) / 100,
+      trend,
+      rsi: Math.round(rsi * 100) / 100,
+      adx: Math.round(adx * 100) / 100,
+      atrPct: Math.round(atrPct * 100) / 100,
+      volRatio: Math.round(volRatio * 100) / 100,
+      label,
+    };
+  }
+
+  // ─── Score Fusion ───────────────────────────────────
+
+  _fuseScores(tf1h, tf4h, tfDaily) {
+    return tfDaily.score * 0.5 + tf4h.score * 0.3 + tf1h.score * 0.2;
+  }
+
+  _classifyRegime(score) {
+    if (score >= 50)  return "BULL_STRONG";
+    if (score >= 15)  return "BULL_WEAK";
+    if (score > -15)  return "RANGE";
+    if (score > -50)  return "BEAR_WEAK";
+    return "BEAR_STRONG";
+  }
+
+  _applyHysteresis(rawRegime) {
+    const prev = this._lastRegime;
+    if (rawRegime === prev) {
+      this._pendingRegime = null;
+      this._pendingCount  = 0;
+      return prev;
+    }
+
+    if (rawRegime === this._pendingRegime) {
+      this._pendingCount++;
+      if (this._pendingCount >= this.HYSTERESIS_COUNT) {
+        this._pendingRegime = null;
+        this._pendingCount  = 0;
+        console.log(`[RegimeEngine] regime transition: ${prev} -> ${rawRegime}`);
+        return rawRegime;
+      }
+    } else {
+      this._pendingRegime = rawRegime;
+      this._pendingCount  = 1;
+    }
+
+    return prev;
+  }
+
+  // ─── Technical Indicators ──────────────────────────
+
+  _sma(values, period) {
+    if (values.length < period) return values[values.length - 1] || 0;
+    const slice = values.slice(-period);
+    return slice.reduce((s, v) => s + v, 0) / period;
+  }
+
+  _mean(arr) {
+    if (!arr.length) return 0;
+    return arr.reduce((s, v) => s + v, 0) / arr.length;
+  }
+
+  _rsi(closes, period) {
+    if (closes.length < period + 1) return 50;
+    let gains = 0, losses = 0;
+    for (let i = closes.length - period; i < closes.length; i++) {
+      const diff = closes[i] - closes[i - 1];
+      if (diff > 0) gains += diff;
+      else losses += Math.abs(diff);
+    }
+    const avgGain = gains / period;
+    const avgLoss = losses / period;
+    if (avgLoss === 0) return 100;
+    const rs = avgGain / avgLoss;
+    return 100 - (100 / (1 + rs));
+  }
+
+  _atr(highs, lows, closes, period) {
+    if (highs.length < period + 1) return 0;
+    const trs = [];
+    for (let i = 1; i < highs.length; i++) {
+      const tr = Math.max(
+        highs[i] - lows[i],
+        Math.abs(highs[i] - closes[i - 1]),
+        Math.abs(lows[i] - closes[i - 1])
+      );
+      trs.push(tr);
+    }
+    const slice = trs.slice(-period);
+    return slice.reduce((s, v) => s + v, 0) / slice.length;
+  }
+
+  _adx(highs, lows, closes, period) {
+    if (highs.length < period * 2) return 0;
+
+    const plusDMs = [];
+    const minusDMs = [];
+    const trs = [];
+
+    for (let i = 1; i < highs.length; i++) {
+      const upMove   = highs[i] - highs[i - 1];
+      const downMove = lows[i - 1] - lows[i];
+      plusDMs.push(upMove > downMove && upMove > 0 ? upMove : 0);
+      minusDMs.push(downMove > upMove && downMove > 0 ? downMove : 0);
+      const tr = Math.max(
+        highs[i] - lows[i],
+        Math.abs(highs[i] - closes[i - 1]),
+        Math.abs(lows[i] - closes[i - 1])
+      );
+      trs.push(tr);
+    }
+
+    if (trs.length < period) return 0;
+
+    let atr     = this._mean(trs.slice(0, period));
+    let plusDM   = this._mean(plusDMs.slice(0, period));
+    let minusDM  = this._mean(minusDMs.slice(0, period));
+    const dxValues = [];
+
+    for (let i = period; i < trs.length; i++) {
+      atr     = atr - (atr / period) + trs[i];
+      plusDM  = plusDM - (plusDM / period) + plusDMs[i];
+      minusDM = minusDM - (minusDM / period) + minusDMs[i];
+
+      const plusDI  = atr > 0 ? (plusDM / atr) * 100 : 0;
+      const minusDI = atr > 0 ? (minusDM / atr) * 100 : 0;
+      const diSum   = plusDI + minusDI;
+      const dx      = diSum > 0 ? (Math.abs(plusDI - minusDI) / diSum) * 100 : 0;
+      dxValues.push(dx);
+    }
+
+    if (dxValues.length < period) return this._mean(dxValues) || 0;
+
+    let adx = this._mean(dxValues.slice(0, period));
+    for (let i = period; i < dxValues.length; i++) {
+      adx = (adx * (period - 1) + dxValues[i]) / period;
+    }
+    return adx;
   }
 }
 

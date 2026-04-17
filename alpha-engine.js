@@ -1,5 +1,7 @@
 "use strict";
 
+const CFG = require("./config");
+
 /**
  * AlphaEngine — 체결강도 + 김치프리미엄 + 변동성 적응 + 분할진입 + 성과 추적
  *
@@ -73,7 +75,7 @@ class AlphaEngine {
     this._cacheTTL    = 10_000;     // 10초 캐시
 
     // USD/KRW 환율 (외부 주입 또는 폴백)
-    this._usdKrw = 1370;
+    this._usdKrw = CFG.DEFAULT_USD_KRW;
   }
 
   /**

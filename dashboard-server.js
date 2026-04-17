@@ -923,7 +923,7 @@ async function loadChart(market, tf){
   try{
     const tf2 = tf < 60 ? \`minutes/\${tf}\` : \`hours/1\`;
     const url = \`https://api.upbit.com/v1/candles/\${tf2}?market=\${market}&count=200\`;
-    const data = await fetch(url).then(r=>r.json());
+    const data = await fetch(url, { signal: AbortSignal.timeout(10000) }).then(r=>r.json());
     if(!Array.isArray(data)) return;
     const candles = data.reverse().map(c=>({
       time: Math.floor(new Date(c.candle_date_time_utc).getTime()/1000),

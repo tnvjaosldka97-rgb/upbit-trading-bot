@@ -1,701 +1,804 @@
 "use strict";
 
 /**
- * TradingBot v2 — 10점짜리 통합 엔진
+ * TradingBot v9 — Main Orchestrator
  *
- * v1 대비 핵심 변경:
- *   1) 켈리 공식 기반 포지션 사이징 (캘리브레이션 결과 자동 반영)
- *   2) 시작 시 포지션 복구 (크래시 생존)
- *   3) 시장가 → 스마트 지정가 진입 (슬리피지 제거)
- *   4) 진입 중 잠금 (race condition 방지)
- *   5) 일일 통계 리셋 자정 자동 처리
+ * Core infrastructure for Upbit automated trading system.
+ * - Loads dotenv config
+ * - Initializes UpbitOrderService, strategies, regime engine, calibration engine
+ * - Main loop: 1h interval for Strategy A, 5min for Strategy B
+ * - Express dashboard on port 4020 (with fallback to 4021+)
+ * - Health check endpoint, status API
+ * - Graceful shutdown
+ * - BOT_MODE: LIVE or CALIBRATION
+ * - DRY_RUN support
+ * - Railway deployment support (process.env.PORT)
  */
-
-const { MarketDataService }    = require("./market-data-service");
-const { CalibrationEngine }    = require("./calibration-engine");
-const { UpbitOrderService }    = require("./upbit-order-service");
-const { MacroSignalEngine }    = require("./macro-signal-engine");
-const { DataAggregationEngine }= require("./data-aggregation-engine");
-const { RegimeEngine }         = require("./regime-engine");
-const { UpbitWebSocket }       = require("./upbit-websocket");
-const { DashboardServer }      = require("./dashboard-server");
-const { StrategyA }            = require("./strategy-a");
-const { StrategyB }            = require("./strategy-b");
-const { AlphaEngine }          = require("./alpha-engine");
-const { BybitFundingEngine }   = require("./bybit-funding-engine");
-const { TradeLogger }          = require("./trade-logger");
-const { createExchange }       = require("./exchange-adapter");
-const { GlobalListingScanner } = require("./global-listing-scanner");
-const { CrossExchangeArb }     = require("./cross-exchange-arb");
-const { ArbExecutor }          = require("./arb-executor");
-const { RebalanceManager }     = require("./rebalance-manager");
-const { MultiExchangeWebSocket } = require("./exchange-websocket");
-const { ArbDataLogger }        = require("./arb-data-logger");
 
 try { require("dotenv").config(); } catch {}
 
+const http = require("http");
+const { UpbitOrderService } = require("./upbit-order-service");
+const { RegimeEngine }      = require("./regime-engine");
+const { CalibrationEngine } = require("./calibration-engine");
+const { StrategyA }         = require("./strategy-a");
+const { StrategyB }         = require("./strategy-b");
+
+// Arbitrage subsystem (public data only — no API keys required)
+const { createExchange, safeFetch }  = require("./exchange-adapter");
+const { ExchangeWebSocketManager }  = require("./exchange-websocket");
+const { UpbitWebSocket }            = require("./upbit-websocket");
+const { CrossExchangeArb }          = require("./cross-exchange-arb");
+const { ArbDataLogger }             = require("./arb-data-logger");
+const { ArbExecutor }               = require("./arb-executor");
+
+// ─── Config ───────────────────────────────────────────
+
 const INITIAL_KRW = Number(process.env.INITIAL_CAPITAL || 100_000);
 const BOT_MODE    = process.env.BOT_MODE || "CALIBRATION";
-const DRY_RUN     = process.env.DRY_RUN  !== "false";
+const DRY_RUN     = process.env.DRY_RUN !== "false";
+const BASE_PORT   = Number(process.env.PORT || 4020);
+const ARB_ENABLED        = process.env.ARB_ENABLED !== "false";
+const ARB_USD_KRW_FALLBACK = Number(process.env.ARB_USD_KRW || 1480);
+const ARB_DB_PATH        = process.env.ARB_DB_PATH || "./arb-data.db";
+const ARB_FX_REFRESH_MS  = 5 * 60_000;
 
-// 자본 배분: A 60% / B 40%
+// Capital allocation: A 60% / B 40%
 const CAPITAL_A = Math.floor(INITIAL_KRW * 0.60);
 const CAPITAL_B = Math.floor(INITIAL_KRW * 0.40);
 
+// Loop intervals
+const STRATEGY_A_INTERVAL = 60 * 60_000;  // 1h
+const STRATEGY_B_INTERVAL = 5 * 60_000;   // 5min (scan)
+const REGIME_INTERVAL     = 15 * 60_000;  // 15min regime refresh
+const HEALTH_LOG_INTERVAL = 10 * 60_000;  // 10min health log
+
 class TradingBot {
   constructor() {
-    this.mds = new MarketDataService({
-      solutionName:       "ATS-v9",
-      defaultMarketCode:  "KRW-BTC",
-    });
-    // simulationConfig AND simulation state 모두 갱신 (createSimulationState가 생성자에서 호출되므로)
-    this.mds.simulationConfig.initialCapital  = INITIAL_KRW;
-    this.mds.state.simulation.initialCapital  = INITIAL_KRW;
-    this.mds.state.simulation.cash            = INITIAL_KRW;
-
-    this.calibration  = new CalibrationEngine(this.mds);
+    // ── Order execution engine ──────────────────────
     this.orderService = new UpbitOrderService({
       accessKey: process.env.UPBIT_ACCESS_KEY,
       secretKey: process.env.UPBIT_SECRET_KEY,
     });
-    this.macroEngine  = new MacroSignalEngine(this.mds);
-    this.dataEngine   = new DataAggregationEngine(this.mds);
-    this.regimeEngine  = new RegimeEngine();
-    this.fundingEngine = new BybitFundingEngine();
-    this.alphaEngine   = new AlphaEngine();
-    this.upbitWs       = new UpbitWebSocket();
-    this.tradeLogger   = new TradeLogger("./trades.db");
-    this._wsBtcPrice  = null;   // WS 실시간 BTC 가격
 
-    // ── 글로벌 거래소 어댑터 (6개 거래소) ─────────────────────
-    this.exchanges = {
-      upbit:   createExchange("upbit",   { apiKey: process.env.UPBIT_ACCESS_KEY,   secretKey: process.env.UPBIT_SECRET_KEY }),
-      bithumb: createExchange("bithumb", { apiKey: process.env.BITHUMB_API_KEY,    secretKey: process.env.BITHUMB_SECRET_KEY }),
-      binance: createExchange("binance", { apiKey: process.env.BINANCE_API_KEY,    secretKey: process.env.BINANCE_SECRET_KEY }),
-      bybit:   createExchange("bybit",   { apiKey: process.env.BYBIT_API_KEY,      secretKey: process.env.BYBIT_SECRET_KEY }),
-      okx:     createExchange("okx",     { apiKey: process.env.OKX_API_KEY,        secretKey: process.env.OKX_SECRET_KEY, passphrase: process.env.OKX_PASSPHRASE }),
-      gate:    createExchange("gate",    { apiKey: process.env.GATE_API_KEY,       secretKey: process.env.GATE_SECRET_KEY }),
-    };
+    // ── Regime detection ────────────────────────────
+    this.regimeEngine = new RegimeEngine();
 
-    // ── 멀티거래소 WebSocket (Binance + Bybit 실시간 가격) ────
-    this.multiExWs = new MultiExchangeWebSocket();
-
-    // ── 아비트라지 데이터 로거 (24일까지 축적) ─────────────
-    this.arbDataLogger = new ArbDataLogger({
-      dbPath:     "./arb-data.db",
-      backupDir:  "./arb-backups",
-      exchanges:  this.exchanges,
-      usdKrw:     1350,
+    // ── Kelly calibration ───────────────────────────
+    this.calibEngine = new CalibrationEngine({
+      rollingWindow: 200,
+      minTrades:     20,
     });
 
-    // ── 리밸런싱 매니저 ──────────────────────────────────────
-    this.rebalancer = new RebalanceManager({
-      exchanges: this.exchanges,
-      usdKrw:    1350,
-      targetRatio: 0.5,
-      autoExecute: false,  // 수동 승인 모드
-    });
-
-    // ── 글로벌 신규 상장 스캐너 ──────────────────────────────
-    this.listingScanner = new GlobalListingScanner({
-      exchanges: Object.values(this.exchanges),
-      onNewListing: (listing) => this._onGlobalListing(listing),
-      scanInterval: 30_000,
-    });
-
-    // ── 아비트라지 동시 실행 엔진 ──────────────────────────────
-    this.arbExecutor = new ArbExecutor({
-      exchanges:      this.exchanges,
-      tradeLogger:    this.tradeLogger,
-      usdKrw:         1350,
-      dryRun:         DRY_RUN,
-      maxPositionUsd: Number(process.env.ARB_MAX_POSITION_USD || 500),
-    });
-
-    // ── 교차 거래소 차익 거래 감지 ────────────────────────────
-    this.crossArb = new CrossExchangeArb({
-      exchanges:    Object.values(this.exchanges),
-      usdKrw:       1350,
-      minSpreadPct: 1.5,
-      multiExWs:    this.multiExWs,   // Binance/Bybit WS 실시간 피드
-      upbitWs:      this.upbitWs,     // Upbit WS 실시간 피드
-      onOpportunity: (opp) => {
-        console.log(
-          `[Bot] 차익 기회 알림 — ${opp.coin}: ` +
-          `${opp.buyExchange} → ${opp.sellExchange} | 스프레드 ${opp.spreadPct}%`
-        );
-
-        // 스프레드 이벤트 로깅
-        this.arbDataLogger.logSpreadEvent({
-          coin: opp.coin,
-          buyExchange:  opp.buyExchange,
-          sellExchange: opp.sellExchange,
-          buyPrice:     opp.buyPrice,
-          sellPrice:    opp.sellPrice,
-          spreadPct:    opp.spreadPct,
-          netProfitPct: opp.netProfitPct,
-          source:       opp.source || "rest",
-          action:       "detected",
-          ts:           opp.detectedAt || Date.now(),
-        });
-
-        // ArbExecutor로 동시 실행 전달
-        this.arbExecutor.execute(opp).then(result => {
-          // 실행 결과 로깅
-          if (result.executed) {
-            this.arbDataLogger.logExecution(result);
-          } else {
-            this.arbDataLogger.logSpreadEvent({
-              ...opp,
-              buyPrice: opp.buyPrice, sellPrice: opp.sellPrice,
-              action: "skipped",
-              skipReason: result.reason,
-              ts: Date.now(),
-            });
-          }
-        }).catch(e =>
-          console.error("[Bot] ArbExecutor 실행 오류:", e.message)
-        );
-      },
-    });
-
-    // ── Strategy A/B ─────────────────────────────────
-    // 모든 엔진을 각 전략에 주입 → 신호 퓨전 가능
-    const opts = { orderService: this.orderService, dryRun: DRY_RUN };
+    // ── Strategy A: 1h Swing (BTC) ─────────────────
     this.strategyA = new StrategyA({
-      ...opts,
-      macroEngine:   this.macroEngine,
-      dataEngine:    this.dataEngine,
-      regimeEngine:  this.regimeEngine,
-      fundingEngine: this.fundingEngine,   // 펀딩비 신호 연동
+      orderService:   this.orderService,
+      regimeEngine:   this.regimeEngine,
+      calibEngine:    this.calibEngine,
       initialCapital: CAPITAL_A,
+      dryRun:         DRY_RUN,
     });
+
+    // ── Strategy B: New Listing Pattern ─────────────
     this.strategyB = new StrategyB({
-      ...opts,
-      dataEngine:    this.dataEngine,   // DataEngine 연동 → 중복 폴링 제거
+      orderService:   this.orderService,
       initialCapital: CAPITAL_B,
-      tradeLogger:   this.tradeLogger,
-      alphaEngine:   this.alphaEngine,  // AlphaEngine 연동 → 체결강도+김프+변동성 적응
+      dryRun:         DRY_RUN,
     });
 
-    // 실거래 포지션 (구 MDS 기반, 참조용 유지)
-    this.livePosition = null;
+    // ── WebSocket for real-time price (optional) ────
+    this._ws = null;
+    this._initWebSocket();
 
-    // 진입 중 잠금 (race condition 방지)
-    this.enteringPosition = false;
+    // ── Arbitrage subsystem (public data — no keys) ─
+    this.arb         = null;
+    this.arbLogger   = null;
+    this.arbMultiWs  = null;
+    this.arbUpbitWs  = null;
+    this.arbUsdKrw   = ARB_USD_KRW_FALLBACK;
+    this._fxIntervalId = null;
+    if (ARB_ENABLED) this._initArbSubsystem();
 
-    // 일일 손실 추적
-    this.dailyStats = {
-      date:         "",
-      realizedPnl:  0,
-      tradeCount:   0,
-      consLosses:   0,
+    // ── State tracking ──────────────────────────────
+    this._startedAt       = null;
+    this._regimeIntervalId = null;
+    this._healthIntervalId = null;
+    this._server           = null;
+    this._shutdownCalled   = false;
+
+    // Daily circuit breaker
+    this._dailyStats = {
+      date:        "",
+      realizedPnl: 0,
+      tradeCount:  0,
+      consLosses:  0,
     };
-
-    this.MAX_DAILY_LOSS      = INITIAL_KRW * 0.006; // -0.6%
-    this.MAX_DAILY_TRADES    = 8;
-    this.MAX_CONS_LOSSES     = 2;
-
-    this.mainLoopId = null;
-    this.dashboard  = new DashboardServer(this);
+    this.MAX_DAILY_LOSS   = INITIAL_KRW * 0.006;
+    this.MAX_DAILY_TRADES = 8;
+    this.MAX_CONS_LOSSES  = 3;
   }
 
-  async start() {
-    console.log("══════════════════════════════════════════");
-    console.log("  ATS v9 — Global Multi-Exchange Trading Bot");
-    console.log(`  모드:     ${BOT_MODE}`);
-    console.log(`  자본:     ${INITIAL_KRW.toLocaleString()}원`);
-    console.log(`  실거래:   ${DRY_RUN ? "OFF (시뮬레이션만)" : "ON ⚡"}`);
-    console.log(`  API 키:   ${this.orderService.getSummary().hasApiKeys ? "연결됨" : "없음 ⚠"}`);
-    console.log("  ── 거래소 연결 상태 (6개) ──");
-    const exStatus = [
-      ["Upbit",   process.env.UPBIT_ACCESS_KEY],
-      ["Bithumb", process.env.BITHUMB_API_KEY],
-      ["Binance", process.env.BINANCE_API_KEY],
-      ["Bybit",   process.env.BYBIT_API_KEY],
-      ["OKX",     process.env.OKX_API_KEY],
-      ["Gate.io", process.env.GATE_API_KEY],
-    ];
-    for (const [name, key] of exStatus) {
-      console.log(`  ${name.padEnd(9)} ${key ? "API 키 있음" : "공개 API만"}`);
-    }
-    console.log("══════════════════════════════════════════");
+  // ─── Startup ────────────────────────────────────────
 
-    // ── 실거래 모드 프리플라이트 체크 ──────────────────
-    if (!DRY_RUN) {
+  async start() {
+    this._startedAt = Date.now();
+
+    console.log("==================================================");
+    console.log("  ATS v9 — Upbit Automated Trading System");
+    console.log(`  Mode:       ${BOT_MODE}`);
+    console.log(`  Capital:    ${INITIAL_KRW.toLocaleString()} KRW`);
+    console.log(`  DRY_RUN:    ${DRY_RUN ? "ON (simulation)" : "OFF (LIVE!)"}`);
+    console.log(`  API Keys:   ${this.orderService.getSummary().hasApiKeys ? "connected" : "missing"}`);
+    console.log(`  Strategy A: ${CAPITAL_A.toLocaleString()} KRW (1h swing BTC)`);
+    console.log(`  Strategy B: ${CAPITAL_B.toLocaleString()} KRW (new listings)`);
+    console.log("==================================================");
+
+    // ── Preflight check (live mode) ────────────────
+    if (!DRY_RUN && BOT_MODE === "LIVE") {
       const ok = await this._preflight();
       if (!ok) {
-        console.error("[Bot] 프리플라이트 실패 — 안전을 위해 중단. DRY_RUN=true로 재시작하세요.");
+        console.error("[TradingBot] preflight failed -- aborting. Set DRY_RUN=true to run in simulation.");
         process.exit(1);
       }
     }
 
-    this.dashboard.start();
+    // ── Start dashboard ────────────────────────────
+    await this._startDashboard();
 
-    await this.mds.start();
-    console.log("[Bot] 시세 엔진 준비 완료");
+    // ── Start regime engine (initial detect) ───────
+    try {
+      const regime = await this.regimeEngine.detect("KRW-BTC");
+      console.log(`[TradingBot] initial regime: ${regime.regime} (confidence: ${regime.confidence})`);
+    } catch (e) {
+      console.error("[TradingBot] initial regime detect failed:", e.message);
+    }
 
-    this.calibration.start();
-    console.log("[Bot] 캘리브레이션 엔진 시작");
-
-    this.macroEngine.start();
-    this.mds.setMacroEngine(this.macroEngine);
-    console.log("[Bot] 매크로 시그널 엔진 시작 (김치 프리미엄 / 펀딩비 / 공포탐욕)");
-
-    // AlphaEngine에 USD/KRW 환율 주입 (매크로엔진 환율 연동)
-    const _syncUsdKrw = () => {
-      const rate = this.macroEngine._cachedUsdKrw
-        || (this.mds.state.fxUsd?.basePrice ? Number(this.mds.state.fxUsd.basePrice) : null);
-      if (rate) this.alphaEngine.setUsdKrw(rate);
-    };
-    _syncUsdKrw();
-    setInterval(_syncUsdKrw, 60_000);  // 1분마다 환율 동기화
-
-    this.dataEngine.start();
-    this.mds.setDataEngine(this.dataEngine);
-    console.log("[Bot] 데이터 집합 엔진 시작 (OI / L/S비율 / 테이커 / 신규상장 / 뉴스)");
-
-    await this.regimeEngine.start();
-    console.log(`[Bot] 레짐 엔진 시작 — 현재 국면: ${this.regimeEngine.getRegime()}`);
-
-    // ── WebSocket 실시간 시세 ─────────────────────────
-    this.upbitWs.subscribe("KRW-BTC");
-    this.upbitWs.onPrice((market, price) => {
-      if (market === "KRW-BTC") this._wsBtcPrice = price;
-    });
-    this.upbitWs.connect();
-    console.log("[Bot] WebSocket 시세 스트림 연결 시작 (KRW-BTC 실시간)");
-
-    // ── Strategy A/B 시작 ─────────────────────────────
-    this.strategyA.start();
-    this.strategyA.setWebSocket(this.upbitWs);   // 실시간 손절 활성화
-    console.log(`[Bot] Strategy A 시작 (1h 스윙) — 자본 ${CAPITAL_A.toLocaleString()}원`);
-    await this.strategyB.start();
-    this.strategyB.setWebSocket(this.upbitWs);   // 신규상장 포지션 실시간 감시
-    console.log(`[Bot] Strategy B 시작 (신규상장) — 자본 ${CAPITAL_B.toLocaleString()}원`);
-
-    // ── 멀티거래소 WebSocket 연결 ───────────────────────────
-    this.multiExWs.connect();
-    console.log("[Bot] Binance/Bybit WebSocket 실시간 가격 스트림 연결");
-
-    // ── 글로벌 스캐너 + 차익 감지 시작 ──────────────────────
-    await this.listingScanner.start().catch(e => {
-      console.error("[Bot] GlobalListingScanner 시작 실패:", e.message);
-    });
-    console.log("[Bot] 글로벌 신규 상장 스캐너 시작 (Binance/Bybit/Upbit 병렬 스캔)");
-
-    // CrossArb + ArbExecutor에 환율 주입 (매크로엔진 연동)
-    const _syncArbRate = () => {
-      const rate = this.macroEngine._cachedUsdKrw
-        || (this.mds.state.fxUsd?.basePrice ? Number(this.mds.state.fxUsd.basePrice) : null);
-      if (rate) {
-        this.crossArb.setUsdKrw(rate);
-        this.arbExecutor.setUsdKrw(rate);
-        this.rebalancer.setUsdKrw(rate);
-        this.arbDataLogger.setUsdKrw(rate);
+    // Periodic regime refresh
+    this._regimeIntervalId = setInterval(async () => {
+      try {
+        await this.regimeEngine.detect("KRW-BTC");
+      } catch (e) {
+        console.error("[TradingBot] regime refresh error:", e.message);
       }
-    };
-    _syncArbRate();
-    setInterval(_syncArbRate, 60_000);
+    }, REGIME_INTERVAL);
 
-    await this.crossArb.start().catch(e => {
-      console.error("[Bot] CrossExchangeArb 시작 실패:", e.message);
-    });
-    console.log("[Bot] 교차 거래소 차익 감지 시작 (15초 주기)");
-    console.log(`[Bot] ArbExecutor 시작 — ${DRY_RUN ? "시뮬레이션" : "실거래⚡"} | 최대 $${this.arbExecutor._maxPosUsd}/건`);
+    // ── Start calibration engine ───────────────────
+    this.calibEngine.start(60_000);
+    console.log("[TradingBot] calibration engine started (1min interval)");
 
-    // ── 리밸런싱 매니저 시작 ──────────────────────────────────
-    await this.rebalancer.start().catch(e => {
-      console.error("[Bot] RebalanceManager 시작 실패:", e.message);
-    });
-    console.log("[Bot] 리밸런싱 매니저 시작 (5분 주기 잔고 체크)");
+    // ── Start Strategy A (1h interval) ─────────────
+    this.strategyA.start(STRATEGY_A_INTERVAL);
+    console.log(`[TradingBot] Strategy A started (${STRATEGY_A_INTERVAL / 60_000}min interval)`);
 
-    // ── 데이터 축적 시작 (4/24까지 시뮬레이션) ───────────────
-    await this.arbDataLogger.start().catch(e => {
-      console.error("[Bot] ArbDataLogger 시작 실패:", e.message);
-    });
-    console.log("[Bot] 아비트라지 데이터 축적 시작 (30초 스냅샷 + 5분 호가 + 1시간 백업)");
+    // ── Start Strategy B (5min scan) ───────────────
+    await this.strategyB.start();
+    console.log(`[TradingBot] Strategy B started (${STRATEGY_B_INTERVAL / 1000}s scan interval)`);
 
-    // ── 시작 시 포지션 복구 ──────────────────────────
+    // ── Position recovery (live mode) ──────────────
     if (!DRY_RUN && this.orderService.getSummary().hasApiKeys) {
       const recovered = await this.orderService
-        .reconcilePosition(this.mds.state.analysisMarketCodes)
-        .catch((e) => { console.error("[Bot] 복구 실패:", e.message); return null; });
-
+        .reconcilePosition(["KRW-BTC"])
+        .catch(e => { console.error("[TradingBot] recovery failed:", e.message); return null; });
       if (recovered) {
-        this.livePosition = {
-          ...recovered,
-          entryPrice:  recovered.avgBuyPrice,
-          budget:      recovered.quantity * recovered.avgBuyPrice,
-          stopPrice:   recovered.avgBuyPrice * (1 + this.mds.simulationConfig.stopLossRate),
-          targetPrice: recovered.avgBuyPrice * (1 + this.mds.simulationConfig.targetGrossRate),
-        };
-        console.log(`[Bot] 포지션 복구 완료 — ${recovered.market}`);
+        console.log(`[TradingBot] recovered position: ${recovered.market} qty:${recovered.quantity}`);
       }
     }
 
-    // 캘리브레이션은 백그라운드 병렬 실행 — 게이트 제거
-    // 실거래 루프는 즉시 시작, 캘리브레이션 데이터가 쌓이면 자동으로 파라미터 갱신
-    console.log("[Bot] 실거래 루프 즉시 시작 (캘리브레이션 백그라운드 병렬 실행)");
-    this.startMainLoop();
+    // ── Start Arbitrage Subsystem ──────────────────
+    if (ARB_ENABLED) await this._startArbSubsystem();
 
+    // ── Health logging ─────────────────────────────
+    this._healthIntervalId = setInterval(() => this._logHealth(), HEALTH_LOG_INTERVAL);
+
+    // ── Graceful shutdown ──────────────────────────
     process.on("SIGINT",  () => this.shutdown("SIGINT"));
     process.on("SIGTERM", () => this.shutdown("SIGTERM"));
+
+    console.log("[TradingBot] all systems running");
   }
 
-  startMainLoop() {
-    this.mainLoopId = setInterval(async () => {
-      try { await this.tick(); }
-      catch (e) { console.error("[Bot] tick 오류:", e.message); }
-    }, 5_000);
-  }
+  // ─── Arbitrage Subsystem Init (public data only) ────
 
-  // ─── 글로벌 신규 상장 콜백 ──────────────────────────────
-  // GlobalListingScanner에서 호출 — Binance/Bybit/Upbit 신규 상장 시
-  _onGlobalListing(listing) {
-    console.log(
-      `[Bot] 글로벌 신규 상장: ${listing.base} @ ${listing.exchangeName} ` +
-      `(우선순위: ${listing.priority}) ` +
-      (listing.alreadyOnOther ? `[이미: ${listing.alreadyOn.join(",")}]` : "[최초!]")
-    );
-
-    // Upbit 상장인 경우 Strategy B에 연동 (기존 로직 활용)
-    if (listing.exchange === "upbit") {
-      const market = `KRW-${listing.base}`;
-      if (!this.strategyB.actedListings.has(market)) {
-        this.strategyB.actedListings.add(market);
-        this.strategyB.detections.unshift({
-          market,
-          detectedAt: listing.detectedAt,
-          status: "글로벌감지",
-        });
-        this.strategyB._enter(market).catch(e =>
-          console.error("[Bot] 글로벌→StrategyB 진입 오류:", e.message)
-        );
-      }
-    }
-
-    // 차익 거래 모니터링에 코인 추가 + WS 구독
-    this.crossArb.addCoin(listing.base);
-    this.multiExWs.addCoin(listing.base);
-  }
-
-  // ─── 5초 메인 틱 ────────────────────────────────────
-  // Strategy A/B가 독립적으로 주문을 처리함.
-  // 메인 틱은 공통 서킷브레이커 + MDS 구시스템 포지션 복구 관리만 담당.
-
-  async tick() {
-    const now = Date.now();
-    this.resetDailyStatsIfNeeded(now);
-
-    if (this.isHalted()) return;
-    this.applyCalibratedConfig();
-
-    // 복구된 구시스템 포지션(재시작 시)만 손절 감시
-    // Strategy A/B 포지션은 각 전략이 직접 관리
-    if (this.livePosition) {
-      await this.managePosition();
-    }
-  }
-
-  // ─── 진입 ───────────────────────────────────────────
-
-  async enterPosition(simPosition) {
-    if (DRY_RUN || !this.orderService.getSummary().hasApiKeys) return;
-    if (this.enteringPosition) return;
-    this.enteringPosition = true;
-
+  async _fetchUsdKrw() {
+    // Upbit KRW-USDT = actual KRW per USD (USDT ≈ 1 USD)
     try {
-      const krwBalance = await this.orderService.getBalance("KRW");
-
-      // ── 켈리 기반 포지션 사이징 ──────────────────────
-      const budget = this.computeBudget(krwBalance);
-      if (budget < 5_000) {
-        console.warn("[Bot] 예산 부족 또는 켈리 0 — 진입 건너뜀");
-        return;
-      }
-
-      console.log(
-        `[Bot] 진입 시도 → ${simPosition.marketCode} | ` +
-        `예산 ${budget.toLocaleString()}원 (잔고의 ${((budget / krwBalance) * 100).toFixed(1)}%)`,
-      );
-
-      // ── 스마트 지정가 매수 ────────────────────────────
-      const result = await this.orderService.smartLimitBuy(
-        simPosition.marketCode,
-        budget,
-      );
-
-      if (!result.filled) {
-        console.warn(`[Bot] 진입 실패: ${result.reason}`);
-        return;
-      }
-
-      const { avgPrice, executedVolume } = result;
-
-      // ── 지정가 매도 예약 ──────────────────────────────
-      const targetPrice = avgPrice * (1 + simPosition.targetGrossRate);
-      const limitSell   = await this.orderService.limitSell(
-        simPosition.marketCode,
-        executedVolume,
-        targetPrice,
-      );
-
-      this.livePosition = {
-        market:         simPosition.marketCode,
-        quantity:       executedVolume,
-        entryPrice:     avgPrice,
-        budget,
-        targetPrice,
-        stopPrice:      avgPrice * (1 + (simPosition.dynamicStopRate ?? this.mds.simulationConfig.stopLossRate)),
-        limitSellUuid:  limitSell.uuid,
-        openedAt:       Date.now(),
-      };
-
-      console.log(
-        `[Bot] 포지션 오픈 — 매수가 ${avgPrice.toLocaleString()} | ` +
-        `목표 ${targetPrice.toLocaleString()} | 손절 ${this.livePosition.stopPrice.toLocaleString()}`,
-      );
-
-      // 지정가 체결 비동기 감시
-      this.orderService
-        .waitForFillOrMarketSell(limitSell.uuid, simPosition.marketCode, executedVolume)
-        .then((r) => this.onPositionClosed(r))
-        .catch((e) => console.error("[Bot] 매도 감시 오류:", e.message));
-
-      this.dailyStats.tradeCount++;
-
+      const res = await safeFetch("https://api.upbit.com/v1/ticker?markets=KRW-USDT");
+      const data = await res.json();
+      const rate = Number(data?.[0]?.trade_price);
+      if (rate > 800 && rate < 3000) return rate;
     } catch (e) {
-      console.error("[Bot] 진입 오류:", e.message);
-    } finally {
-      this.enteringPosition = false;
+      console.error("[TradingBot] USD/KRW fetch failed:", e.message);
+    }
+    return null;
+  }
+
+  _initArbSubsystem() {
+    try {
+      // 6 REST adapters (no keys — public getTicker only)
+      const restExchanges = {
+        upbit:   createExchange("upbit",   {}),
+        binance: createExchange("binance", {}),
+        bybit:   createExchange("bybit",   {}),
+        okx:     createExchange("okx",     {}),
+        gate:    createExchange("gate",    {}),
+        bithumb: createExchange("bithumb", {}),
+      };
+      this._arbExchanges = restExchanges;
+
+      // WS managers (public streams, no keys)
+      this.arbMultiWs = new ExchangeWebSocketManager();
+      this.arbUpbitWs = new UpbitWebSocket({
+        markets:        ["KRW-BTC","KRW-ETH","KRW-XRP","KRW-SOL","KRW-DOGE","KRW-ADA","KRW-AVAX","KRW-DOT","KRW-LINK"],
+        subscribeTypes: ["ticker"],
+      });
+
+      // Cross-exchange spread detector (WS + REST dual mode)
+      this.arb = new CrossExchangeArb({
+        exchanges: restExchanges,
+        usdKrw:    this.arbUsdKrw,
+        multiExWs: this.arbMultiWs,
+        upbitWs:   this.arbUpbitWs,
+      });
+
+      // Data logger (persistent SQLite)
+      this.arbLogger = new ArbDataLogger({
+        dbPath:    ARB_DB_PATH,
+        exchanges: restExchanges,
+        usdKrw:    this.arbUsdKrw,
+      });
+
+      // Executor (DRY_RUN default; controlled via env)
+      this.arbExecutor = new ArbExecutor({
+        exchanges:  restExchanges,
+        dataLogger: this.arbLogger,
+        usdKrw:     this.arbUsdKrw,
+      });
+
+      // Wire spread events → logger + executor
+      // Logger dedup: max 1 event per coin+pair per 10s (bounded via pruning)
+      const lastLogged = new Map();
+      const LOG_DEDUP_MS = 10_000;
+      this.arb.on("opportunity", (opp) => {
+        const now = Date.now();
+        const key = `${opp.symbol || opp.coin}-${opp.buyExchange}-${opp.sellExchange}`;
+        const prev = lastLogged.get(key) || 0;
+        if (now - prev >= LOG_DEDUP_MS) {
+          lastLogged.set(key, now);
+          try { this.arbLogger.logSpreadEvent(opp); } catch (e) {
+            console.error("[TradingBot] logSpreadEvent error:", e.message);
+          }
+          // Periodic prune: drop entries older than 60s (bounds Map size)
+          if (lastLogged.size > 500) {
+            const cutoff = now - 60_000;
+            for (const [k, t] of lastLogged) if (t < cutoff) lastLogged.delete(k);
+          }
+        }
+
+        // Executor: evaluate every opportunity (has own persistence + cooldown gates)
+        this.arbExecutor.execute(opp).catch(e => {
+          console.error("[TradingBot] arbExecutor.execute error:", e.message);
+        });
+      });
+
+      console.log("[TradingBot] arbitrage subsystem initialized (6 exchanges, public data)");
+    } catch (e) {
+      console.error("[TradingBot] arb init failed:", e.message, e.stack);
+      this.arb = null;
+      this.arbLogger = null;
     }
   }
 
-  // ─── 포지션 관리 (손절 감시) ────────────────────────
-
-  async managePosition() {
-    if (!this.livePosition) return;
-
-    // WS 실시간 가격 우선, 없으면 MDS 폴백
-    const ctx          = this.mds.ensureContext(this.livePosition.market);
-    const currentPrice = (this.livePosition.market === "KRW-BTC" && this._wsBtcPrice)
-      ? this._wsBtcPrice
-      : this.mds.getCurrentPrice(ctx);
-    if (!currentPrice) return;
-
-    if (currentPrice <= this.livePosition.stopPrice) {
-      console.warn(
-        `[Bot] 손절 트리거 → ${this.livePosition.market} | ` +
-        `현재 ${currentPrice.toLocaleString()} ≤ 손절가 ${this.livePosition.stopPrice.toLocaleString()}`,
-      );
-
-      if (!DRY_RUN && this.orderService.getSummary().hasApiKeys) {
-        if (this.livePosition.limitSellUuid) {
-          await this.orderService.cancelOrder(this.livePosition.limitSellUuid).catch(() => {});
-        }
-        const balance = await this.orderService
-          .getBalance(this.livePosition.market.split("-")[1])
-          .catch(() => 0);
-        if (balance > 0.00001) {
-          await this.orderService.marketSell(this.livePosition.market, balance).catch((e) => {
-            console.error("[Bot] 손절 매도 실패:", e.message);
-          });
-        }
+  async _startArbSubsystem() {
+    if (!this.arb) return;
+    try {
+      // 1) Fetch real USD/KRW rate BEFORE starting (critical for spread math)
+      const rate = await this._fetchUsdKrw();
+      if (rate) {
+        this.arbUsdKrw = rate;
+        this.arb.setUsdKrw(rate);
+        this.arbLogger.setUsdKrw(rate);
+        console.log(`[TradingBot] USD/KRW = ${rate} (live from Upbit)`);
+      } else {
+        console.warn(`[TradingBot] USD/KRW fetch failed — using fallback ${this.arbUsdKrw}`);
       }
 
-      const pnl = (currentPrice - this.livePosition.entryPrice) / this.livePosition.entryPrice;
-      this.recordPnl(pnl * this.livePosition.budget);
-      this.livePosition = null;
+      // 2) Start WS streams
+      this.arbMultiWs.start(["BTC","ETH","XRP","SOL","DOGE","ADA","AVAX","DOT","LINK"]);
+      this.arbUpbitWs.connect();
+
+      // 3) Start detectors
+      await this.arb.start();
+      await this.arbLogger.start();
+
+      // 4) Sanity check: logger actually ready?
+      if (this.arbLogger._ready) {
+        console.log("[TradingBot] ArbDataLogger ready — DB persistence active");
+      } else {
+        console.error("[TradingBot] ArbDataLogger NOT ready — DB persistence DISABLED");
+      }
+
+      // 5) Periodic FX refresh
+      this._fxIntervalId = setInterval(async () => {
+        const r = await this._fetchUsdKrw();
+        if (r && Math.abs(r - this.arbUsdKrw) / this.arbUsdKrw > 0.001) {
+          console.log(`[TradingBot] USD/KRW updated: ${this.arbUsdKrw} → ${r}`);
+          this.arbUsdKrw = r;
+          this.arb.setUsdKrw(r);
+          this.arbLogger.setUsdKrw(r);
+          this.arbExecutor?.setUsdKrw(r);
+        }
+      }, ARB_FX_REFRESH_MS);
+
+      console.log("[TradingBot] arbitrage subsystem running");
+    } catch (e) {
+      console.error("[TradingBot] arb start failed:", e.message, e.stack);
     }
   }
 
-  onPositionClosed(result) {
-    if (!this.livePosition) return;
-    const ctx          = this.mds.ensureContext(this.livePosition.market);
-    const currentPrice = this.mds.getCurrentPrice(ctx) || this.livePosition.targetPrice;
-    const pnl          = (currentPrice - this.livePosition.entryPrice) / this.livePosition.entryPrice;
-    this.recordPnl(pnl * this.livePosition.budget);
-    this.livePosition = null;
+  _stopArbSubsystem() {
+    if (this._fxIntervalId) { clearInterval(this._fxIntervalId); this._fxIntervalId = null; }
+    try { this.arb?.stop(); } catch {}
+    try { this.arbLogger?.stop(); } catch {}
+    try { this.arbMultiWs?.stop(); } catch {}
+    try { this.arbUpbitWs?.disconnect(); } catch {}
   }
 
-  recordPnl(pnlKrw) {
-    this.dailyStats.realizedPnl += pnlKrw;
-    if (pnlKrw < 0) this.dailyStats.consLosses++;
-    else             this.dailyStats.consLosses = 0;
+  // ─── WebSocket Init (optional, ws package) ──────────
 
+  _initWebSocket() {
+    try {
+      const WebSocket = require("ws");
+      const wsUrl = "wss://api.upbit.com/websocket/v1";
+      const ws = new WebSocket(wsUrl);
+
+      ws.on("open", () => {
+        console.log("[TradingBot] WebSocket connected");
+        // Subscribe to BTC ticker
+        ws.send(JSON.stringify([
+          { ticket: "ats-v9-ws" },
+          { type: "ticker", codes: ["KRW-BTC"] },
+        ]));
+      });
+
+      ws.on("message", (raw) => {
+        try {
+          const data = JSON.parse(raw.toString());
+          if (data.type === "ticker" && data.code) {
+            const price = data.trade_price;
+            // Feed to Strategy A
+            if (data.code === "KRW-BTC") {
+              this.strategyA.onPriceUpdate(price);
+            }
+            // Feed to Strategy B (any subscribed market)
+            this.strategyB.onPriceUpdate(data.code, price);
+          }
+        } catch {}
+      });
+
+      ws.on("error", (err) => {
+        console.error("[TradingBot] WebSocket error:", err.message);
+      });
+
+      ws.on("close", () => {
+        console.warn("[TradingBot] WebSocket disconnected -- reconnecting in 5s");
+        setTimeout(() => this._initWebSocket(), 5000);
+      });
+
+      this._ws = ws;
+    } catch {
+      // ws package not available -- polling only
+      console.log("[TradingBot] ws package not available -- using REST polling only");
+    }
+  }
+
+  // ─── Dashboard (Express-like HTTP server) ───────────
+
+  async _startDashboard() {
+    const server = http.createServer((req, res) => {
+      try {
+        // CORS
+        res.setHeader("Access-Control-Allow-Origin", "*");
+        res.setHeader("Access-Control-Allow-Methods", "GET");
+
+        const url = new URL(req.url, `http://${req.headers.host}`);
+
+        if (url.pathname === "/health") {
+          res.writeHead(200, { "Content-Type": "application/json" });
+          res.end(JSON.stringify(this._getHealth()));
+          return;
+        }
+
+        if (url.pathname === "/api/status") {
+          res.writeHead(200, { "Content-Type": "application/json" });
+          res.end(JSON.stringify(this._getFullStatus()));
+          return;
+        }
+
+        if (url.pathname === "/api/regime") {
+          res.writeHead(200, { "Content-Type": "application/json" });
+          res.end(JSON.stringify(this.regimeEngine.getSummary()));
+          return;
+        }
+
+        if (url.pathname === "/api/calibration") {
+          res.writeHead(200, { "Content-Type": "application/json" });
+          res.end(JSON.stringify(this.calibEngine.getSummary()));
+          return;
+        }
+
+        if (url.pathname === "/api/strategy-a") {
+          res.writeHead(200, { "Content-Type": "application/json" });
+          res.end(JSON.stringify(this.strategyA.getSummary()));
+          return;
+        }
+
+        if (url.pathname === "/api/strategy-b") {
+          res.writeHead(200, { "Content-Type": "application/json" });
+          res.end(JSON.stringify(this.strategyB.getSummary()));
+          return;
+        }
+
+        if (url.pathname === "/api/arb") {
+          res.writeHead(200, { "Content-Type": "application/json" });
+          res.end(JSON.stringify({
+            enabled:  ARB_ENABLED,
+            running:  !!this.arb,
+            ws:       this.arbMultiWs?.getSummary?.() || null,
+            arb:      this.arb?._stats || null,
+            logger:   this.arbLogger?._stats || null,
+          }));
+          return;
+        }
+
+        // Default: HTML dashboard
+        res.writeHead(200, { "Content-Type": "text/html; charset=utf-8" });
+        res.end(this._renderDashboard());
+      } catch (e) {
+        res.writeHead(500, { "Content-Type": "application/json" });
+        res.end(JSON.stringify({ error: e.message }));
+      }
+    });
+
+    // Try ports starting from BASE_PORT
+    const port = await this._listen(server, BASE_PORT);
+    this._server = server;
+    console.log(`[TradingBot] dashboard running on http://0.0.0.0:${port}`);
+  }
+
+  _listen(server, port, maxRetries = 5) {
+    return new Promise((resolve, reject) => {
+      let attempts = 0;
+      const tryPort = (p) => {
+        server.once("error", (err) => {
+          if (err.code === "EADDRINUSE" && attempts < maxRetries) {
+            attempts++;
+            console.warn(`[TradingBot] port ${p} in use, trying ${p + 1}`);
+            tryPort(p + 1);
+          } else {
+            reject(err);
+          }
+        });
+        server.listen(p, "0.0.0.0", () => resolve(p));
+      };
+      tryPort(port);
+    });
+  }
+
+  // ─── Dashboard HTML ─────────────────────────────────
+
+  _renderDashboard() {
+    const status   = this._getFullStatus();
+    const regime   = status.regime;
+    const stratA   = status.strategyA;
+    const stratB   = status.strategyB;
+    const calib    = status.calibration;
+    const health   = status.health;
+
+    const positionsHtml = (stratA.position
+      ? `<tr><td>${stratA.position.market}</td><td>${stratA.position.entryPrice?.toLocaleString()}</td>` +
+        `<td>${stratA.position.targetPrice?.toLocaleString()}</td>` +
+        `<td>${stratA.position.stopPrice?.toLocaleString()}</td>` +
+        `<td>${stratA.position.regime}</td></tr>`
+      : ""
+    ) + (stratB.positions || []).map(p =>
+      `<tr><td>${p.market}</td><td>${p.entryPrice?.toLocaleString()}</td>` +
+      `<td>${p.targetPrice?.toLocaleString()}</td>` +
+      `<td>${p.stopPrice?.toLocaleString()}</td><td>listing</td></tr>`
+    ).join("");
+
+    const historyHtml = [...(stratA.history || []), ...(stratB.history || [])]
+      .sort((a, b) => (b.closedAt || 0) - (a.closedAt || 0))
+      .slice(0, 15)
+      .map(h =>
+        `<tr><td>${h.market}</td><td>${h.entryPrice?.toLocaleString()}</td>` +
+        `<td>${h.exitPrice?.toLocaleString()}</td>` +
+        `<td style="color:${h.pnlRate >= 0 ? '#2ecc71' : '#e74c3c'}">${(h.pnlRate * 100).toFixed(2)}%</td>` +
+        `<td>${h.reason}</td></tr>`
+      ).join("");
+
+    return `<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>ATS v9 Dashboard</title>
+<meta http-equiv="refresh" content="30">
+<style>
+  * { margin: 0; padding: 0; box-sizing: border-box; }
+  body { font-family: -apple-system, 'Segoe UI', Roboto, monospace; background: #0d1117; color: #c9d1d9; padding: 16px; }
+  h1 { color: #58a6ff; margin-bottom: 8px; font-size: 1.4em; }
+  h2 { color: #8b949e; margin: 16px 0 8px; font-size: 1.1em; border-bottom: 1px solid #21262d; padding-bottom: 4px; }
+  .grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(280px, 1fr)); gap: 12px; margin-bottom: 16px; }
+  .card { background: #161b22; border: 1px solid #30363d; border-radius: 8px; padding: 12px; }
+  .card .label { color: #8b949e; font-size: 0.8em; text-transform: uppercase; }
+  .card .value { font-size: 1.3em; font-weight: bold; margin-top: 2px; }
+  .green { color: #2ecc71; }
+  .red { color: #e74c3c; }
+  .yellow { color: #f39c12; }
+  .blue { color: #58a6ff; }
+  table { width: 100%; border-collapse: collapse; margin-top: 8px; font-size: 0.85em; }
+  th, td { padding: 6px 8px; text-align: left; border-bottom: 1px solid #21262d; }
+  th { color: #8b949e; font-weight: 600; }
+  .badge { display: inline-block; padding: 2px 8px; border-radius: 4px; font-size: 0.75em; font-weight: 600; }
+  .badge-bull { background: #1a4731; color: #2ecc71; }
+  .badge-bear { background: #4a1a1a; color: #e74c3c; }
+  .badge-range { background: #3a3a1a; color: #f39c12; }
+  .badge-live { background: #1a3a4a; color: #58a6ff; }
+  .badge-dry { background: #2a2a2a; color: #8b949e; }
+  .footer { margin-top: 20px; color: #484f58; font-size: 0.75em; text-align: center; }
+</style>
+</head>
+<body>
+<h1>ATS v9 Dashboard
+  <span class="badge ${DRY_RUN ? 'badge-dry' : 'badge-live'}">${DRY_RUN ? 'DRY RUN' : 'LIVE'}</span>
+  <span class="badge ${BOT_MODE === 'LIVE' ? 'badge-live' : 'badge-range'}">${BOT_MODE}</span>
+</h1>
+
+<div class="grid">
+  <div class="card">
+    <div class="label">Market Regime</div>
+    <div class="value">
+      <span class="badge ${regime.regime?.includes('BULL') ? 'badge-bull' : regime.regime?.includes('BEAR') ? 'badge-bear' : 'badge-range'}">
+        ${regime.regime || 'N/A'}
+      </span>
+      <span style="font-size:0.7em; color:#8b949e"> confidence: ${regime.confidence || 0}</span>
+    </div>
+  </div>
+  <div class="card">
+    <div class="label">Bot Health</div>
+    <div class="value ${health.healthy ? 'green' : 'red'}">${health.healthy ? 'HEALTHY' : 'UNHEALTHY'}</div>
+    <div style="font-size:0.75em; color:#8b949e">uptime: ${health.uptimeHours}h | orders halted: ${health.orderEngineHalted ? 'YES' : 'no'}</div>
+  </div>
+  <div class="card">
+    <div class="label">Strategy A (1h Swing BTC)</div>
+    <div class="value ${stratA.pnlRate >= 0 ? 'green' : 'red'}">${stratA.pnlRate >= 0 ? '+' : ''}${stratA.pnlRate}%</div>
+    <div style="font-size:0.75em; color:#8b949e">W:${stratA.wins} L:${stratA.losses} | WR:${stratA.winRate || 'N/A'}%</div>
+  </div>
+  <div class="card">
+    <div class="label">Strategy B (New Listings)</div>
+    <div class="value ${stratB.pnlRate >= 0 ? 'green' : 'red'}">${stratB.pnlRate >= 0 ? '+' : ''}${stratB.pnlRate}%</div>
+    <div style="font-size:0.75em; color:#8b949e">W:${stratB.wins} L:${stratB.losses} | WR:${stratB.winRate || 'N/A'}% | monitoring: ${stratB.monitoringCount}</div>
+  </div>
+  <div class="card">
+    <div class="label">Total P&L</div>
+    <div class="value ${(stratA.realizedPnl + stratB.realizedPnl) >= 0 ? 'green' : 'red'}">
+      ${((stratA.realizedPnl + stratB.realizedPnl) >= 0 ? '+' : '')}${(stratA.realizedPnl + stratB.realizedPnl).toLocaleString()} KRW
+    </div>
+  </div>
+  <div class="card">
+    <div class="label">Calibration</div>
+    <div class="value blue">${calib.mode}</div>
+    <div style="font-size:0.75em; color:#8b949e">
+      trades: ${calib.totalTrades} | kelly: ${calib.halfKelly ? (calib.halfKelly * 100).toFixed(1) + '%' : 'N/A'} | EV: ${calib.expectedValue ? (calib.expectedValue * 100).toFixed(3) + '%' : 'N/A'}
+    </div>
+  </div>
+</div>
+
+<h2>Active Positions</h2>
+<table>
+<tr><th>Market</th><th>Entry</th><th>Target</th><th>Stop</th><th>Type</th></tr>
+${positionsHtml || '<tr><td colspan="5" style="color:#484f58">No active positions</td></tr>'}
+</table>
+
+<h2>Recent Trades</h2>
+<table>
+<tr><th>Market</th><th>Entry</th><th>Exit</th><th>P&L</th><th>Reason</th></tr>
+${historyHtml || '<tr><td colspan="5" style="color:#484f58">No trades yet</td></tr>'}
+</table>
+
+<h2>New Listing Detections</h2>
+<table>
+<tr><th>Market</th><th>Detected</th><th>Status</th><th>P&L</th></tr>
+${(stratB.detections || []).slice(0, 10).map(d =>
+  `<tr><td>${d.market}</td><td>${d.detectedAt ? new Date(d.detectedAt).toLocaleTimeString() : 'N/A'}</td>` +
+  `<td>${d.status}</td><td>${d.finalPnl != null ? d.finalPnl + '%' : '-'}</td></tr>`
+).join('') || '<tr><td colspan="4" style="color:#484f58">No detections</td></tr>'}
+</table>
+
+<div class="footer">
+  ATS v9 | Auto-refresh 30s | Started: ${new Date(this._startedAt).toISOString()} |
+  <a href="/api/status" style="color:#58a6ff">JSON API</a>
+</div>
+</body>
+</html>`;
+  }
+
+  // ─── Status & Health ────────────────────────────────
+
+  _getHealth() {
+    const uptime = Date.now() - (this._startedAt || Date.now());
+    return {
+      healthy:           !this.orderService.halted && !this._isCircuitBroken(),
+      uptimeMs:          uptime,
+      uptimeHours:       +(uptime / 3_600_000).toFixed(1),
+      orderEngineHalted: this.orderService.halted,
+      haltReason:        this.orderService.haltReason,
+      mode:              BOT_MODE,
+      dryRun:            DRY_RUN,
+      timestamp:         new Date().toISOString(),
+    };
+  }
+
+  _getFullStatus() {
+    return {
+      health:      this._getHealth(),
+      regime:      this.regimeEngine.getSummary(),
+      calibration: this.calibEngine.getSummary(),
+      strategyA:   this.strategyA.getSummary(),
+      strategyB:   this.strategyB.getSummary(),
+      orderEngine: this.orderService.getSummary(),
+      config: {
+        initialCapital: INITIAL_KRW,
+        capitalA:       CAPITAL_A,
+        capitalB:       CAPITAL_B,
+        botMode:        BOT_MODE,
+        dryRun:         DRY_RUN,
+      },
+    };
+  }
+
+  _logHealth() {
+    const h = this._getHealth();
+    const a = this.strategyA.getSummary();
+    const b = this.strategyB.getSummary();
+    const r = this.regimeEngine.getSummary();
     console.log(
-      `[Bot] 실현 손익 ${pnlKrw >= 0 ? "+" : ""}${pnlKrw.toFixed(0)}원 | ` +
-      `오늘 누적 ${this.dailyStats.realizedPnl.toFixed(0)}원`,
+      `[TradingBot] health -- ${h.healthy ? "OK" : "UNHEALTHY"} | ` +
+      `uptime: ${h.uptimeHours}h | regime: ${r.regime} | ` +
+      `A: ${a.pnlRate}% (${a.totalTrades} trades) | ` +
+      `B: ${b.pnlRate}% (${b.totalTrades} trades) | ` +
+      `positions: A=${a.position ? 1 : 0} B=${(b.positions || []).length}`
     );
   }
 
-  // ─── 켈리 사이징 ────────────────────────────────────
+  // ─── Circuit Breaker ────────────────────────────────
 
-  computeBudget(krwBalance) {
-    const cal = this.calibration.getCalibratedConfig();
-
-    let fraction;
-    if (cal?.kellyFraction && cal.evPositive) {
-      fraction = cal.kellyFraction;
-    } else {
-      // 캘리브레이션 전: 적정 고정값 (R/R 3:1 기반 최소 켈리)
-      fraction = 0.08;
+  _isCircuitBroken() {
+    const today = new Date().toLocaleDateString("ko-KR");
+    if (this._dailyStats.date !== today) {
+      this._dailyStats = { date: today, realizedPnl: 0, tradeCount: 0, consLosses: 0 };
     }
-
-    const budget = Math.min(krwBalance, INITIAL_KRW * fraction);
-    return Math.floor(budget);
-  }
-
-  // ─── 캘리브레이션 파라미터 적용 ─────────────────────
-
-  applyCalibratedConfig() {
-    const cal = this.calibration.getCalibratedConfig();
-    if (!cal || cal._applied || !cal.evPositive) return;
-
-    const cfg = this.mds.simulationConfig;
-    cfg.volTargetMult          = cal.volTargetMult;
-    cfg.volStopMult            = cal.volStopMult;
-    cfg.minBullishProbability  = cal.minBullishProbability;
-    cal._applied               = true;
-
-    console.log(
-      `[Bot] 캘리브레이션 적용 — ` +
-      `승률 ${(cal.observedWinRate * 100).toFixed(1)}% | ` +
-      `EV ${(cal.ev * 100).toFixed(3)}% | ` +
-      `켈리 ${(cal.kellyFraction * 100).toFixed(1)}%`,
-    );
-  }
-
-  // ─── 서킷브레이커 ────────────────────────────────────
-
-  isHalted() {
-    const s = this.dailyStats;
-    if (s.realizedPnl < -this.MAX_DAILY_LOSS) {
-      console.warn(`[Bot] 일일 손실 한도 도달 (${s.realizedPnl.toFixed(0)}원)`);
-      return true;
-    }
-    if (s.tradeCount >= this.MAX_DAILY_TRADES) {
-      console.warn(`[Bot] 일일 최대 거래 횟수 도달 (${s.tradeCount}회)`);
-      return true;
-    }
-    if (s.consLosses >= this.MAX_CONS_LOSSES) {
-      console.warn(`[Bot] ${this.MAX_CONS_LOSSES}연속 손절 — 오늘 종료`);
-      return true;
-    }
-    if (this.orderService.halted) {
-      console.warn(`[Bot] 주문 엔진 중단: ${this.orderService.haltReason}`);
-      return true;
-    }
+    const s = this._dailyStats;
+    if (s.realizedPnl < -this.MAX_DAILY_LOSS) return true;
+    if (s.tradeCount >= this.MAX_DAILY_TRADES) return true;
+    if (s.consLosses >= this.MAX_CONS_LOSSES) return true;
     return false;
   }
 
-  resetDailyStatsIfNeeded(now) {
-    const today = new Date(now).toLocaleDateString("ko-KR");
-    if (this.dailyStats.date !== today) {
-      this.dailyStats = { date: today, realizedPnl: 0, tradeCount: 0, consLosses: 0 };
-    }
-  }
-
-  // ─── 실거래 프리플라이트 체크 ────────────────────────
+  // ─── Preflight Check ───────────────────────────────
 
   async _preflight() {
-    console.log("[Bot] 프리플라이트 체크 시작...");
+    console.log("[TradingBot] preflight check...");
     const checks = [];
 
-    // 1. API 키 유효성
-    const hasKeys = this.orderService.getSummary().hasApiKeys;
-    checks.push({ name: "API 키", ok: hasKeys });
+    // API keys
+    checks.push({ name: "API keys", ok: this.orderService.getSummary().hasApiKeys });
 
-    // 2. 계좌 잔고 조회
-    let krwBalance = 0;
+    // Account balance
+    let krw = 0;
     try {
-      krwBalance = await this.orderService.getBalance("KRW");
-      checks.push({ name: `KRW 잔고 (${krwBalance.toLocaleString()}원)`, ok: krwBalance >= 5_000 });
+      krw = await this.orderService.getBalance("KRW");
+      checks.push({ name: `KRW balance (${krw.toLocaleString()})`, ok: krw >= 5000 });
     } catch (e) {
-      checks.push({ name: "KRW 잔고 조회", ok: false, reason: e.message });
+      checks.push({ name: "KRW balance", ok: false, reason: e.message });
     }
 
-    // 3. 최소 자본 대비 잔고 확인
+    // Capital check
     checks.push({
-      name: `잔고 ≥ 자본설정(${INITIAL_KRW.toLocaleString()}원)의 50%`,
-      ok: krwBalance >= INITIAL_KRW * 0.5,
+      name: `balance >= 50% of INITIAL_CAPITAL (${INITIAL_KRW.toLocaleString()})`,
+      ok: krw >= INITIAL_KRW * 0.5,
     });
 
-    // 4. 업비트 API 응답 테스트
+    // Upbit API
     try {
-      const res = await fetch("https://api.upbit.com/v1/ticker?markets=KRW-BTC");
-      checks.push({ name: "업비트 API 응답", ok: res.ok });
+      const res = await safeFetch("https://api.upbit.com/v1/ticker?markets=KRW-BTC");
+      checks.push({ name: "Upbit API response", ok: res.ok });
     } catch (e) {
-      checks.push({ name: "업비트 API 응답", ok: false });
+      console.warn("[TradingBot] healthCheck:", e.message);
+      checks.push({ name: "Upbit API response", ok: false });
     }
 
-    // 결과 출력
     let allOk = true;
-    console.log("[Bot] ─── 프리플라이트 결과 ───────────────");
+    console.log("[TradingBot] --- preflight results ---");
     for (const c of checks) {
-      const mark = c.ok ? "✅" : "❌";
-      console.log(`[Bot]   ${mark} ${c.name}${c.reason ? ` — ${c.reason}` : ""}`);
+      const mark = c.ok ? "PASS" : "FAIL";
+      console.log(`[TradingBot]   [${mark}] ${c.name}${c.reason ? ` -- ${c.reason}` : ""}`);
       if (!c.ok) allOk = false;
     }
-    console.log("[Bot] ────────────────────────────────────");
+    console.log("[TradingBot] ----------------------------");
 
-    if (allOk) {
-      console.log("[Bot] 프리플라이트 통과 — 실거래 시작");
-    } else {
-      console.error("[Bot] 프리플라이트 실패 항목 있음");
-    }
     return allOk;
   }
 
-  // ─── 종료 ───────────────────────────────────────────
+  // ─── Shutdown ───────────────────────────────────────
 
   async shutdown(signal) {
-    console.log(`\n[Bot] 종료 (${signal})`);
-    if (this.mainLoopId) clearInterval(this.mainLoopId);
-    this.calibration.stop();
-    this.dashboard.stop();
-    this.macroEngine.stop();
-    this.regimeEngine.stop();
-    this.fundingEngine.stop();
-    this.upbitWs.stop();
-    this.dataEngine.stop();
+    if (this._shutdownCalled) return;
+    this._shutdownCalled = true;
+
+    console.log(`\n[TradingBot] shutdown (${signal})`);
+
+    // Stop intervals
+    if (this._regimeIntervalId)  clearInterval(this._regimeIntervalId);
+    if (this._healthIntervalId)  clearInterval(this._healthIntervalId);
+
+    // Stop engines
+    this.calibEngine.stop();
     this.strategyA.stop();
     this.strategyB.stop();
-    this.listingScanner.stop();
-    this.crossArb.stop();
-    this.multiExWs.stop();
-    this.rebalancer.stop();
-    this.arbDataLogger.stop();
-    this.tradeLogger.close();
 
-    if (this.livePosition && !DRY_RUN && this.orderService.getSummary().hasApiKeys) {
-      console.log("[Bot] 포지션 청산 중...");
-      if (this.livePosition.limitSellUuid) {
-        await this.orderService.cancelOrder(this.livePosition.limitSellUuid).catch(() => {});
-      }
-      const bal = await this.orderService
-        .getBalance(this.livePosition.market.split("-")[1])
-        .catch(() => 0);
-      if (bal > 0.00001) {
-        await this.orderService.marketSell(this.livePosition.market, bal).catch((e) => {
-          console.error("[Bot] 청산 실패 — 수동 확인 필요:", e.message);
-        });
+    // Stop arbitrage subsystem
+    this._stopArbSubsystem();
+
+    // Close WebSocket
+    if (this._ws) {
+      try { this._ws.close(); } catch {}
+    }
+
+    // Close HTTP server
+    if (this._server) {
+      this._server.close();
+    }
+
+    // Emergency position close (live mode)
+    if (!DRY_RUN && this.orderService.getSummary().hasApiKeys) {
+      console.log("[TradingBot] closing live positions...");
+      try {
+        const accounts = await this.orderService.getAccounts();
+        for (const acc of accounts) {
+          if (acc.currency === "KRW") continue;
+          const bal = Number(acc.balance);
+          if (bal > 0.00001) {
+            const market = `KRW-${acc.currency}`;
+            await this.orderService.cancelAllOpenOrders(market).catch(() => {});
+            await this.orderService.marketSell(market, bal)
+              .catch(e => console.error(`[TradingBot] failed to close ${market}:`, e.message));
+          }
+        }
+      } catch (e) {
+        console.error("[TradingBot] position close error:", e.message);
       }
     }
 
-    console.log("[Bot] 종료 완료");
+    console.log("[TradingBot] shutdown complete");
     process.exit(0);
   }
 }
 
+// ─── Global Error Handlers ────────────────────────────
+
 process.on("uncaughtException", (err) => {
-  console.error("[Bot] 처리되지 않은 예외:", err.message, err.stack);
+  console.error("[TradingBot] uncaught exception:", err.message, err.stack);
 });
 
 process.on("unhandledRejection", (reason) => {
-  console.error("[Bot] 처리되지 않은 Promise 거부:", reason);
+  console.error("[TradingBot] unhandled rejection:", reason);
 });
 
+// ─── Entry Point ──────────────────────────────────────
+
 const bot = new TradingBot();
-bot.start().catch((e) => { console.error(e); process.exit(1); });
+bot.start().catch((e) => {
+  console.error("[TradingBot] startup failed:", e.message);
+  process.exit(1);
+});

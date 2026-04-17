@@ -1,5 +1,7 @@
 "use strict";
 
+const { safeFetch } = require("./exchange-adapter");
+
 /**
  * BybitFundingEngine — BTC 무기한 선물 펀딩비 모니터링
  *
@@ -37,7 +39,7 @@ class BybitFundingEngine {
 
   async _fetch() {
     try {
-      const res  = await fetch(
+      const res  = await safeFetch(
         `https://api.bybit.com/v5/market/tickers?category=linear&symbol=${SYMBOL}`
       );
       if (!res.ok) throw new Error(`HTTP ${res.status}`);

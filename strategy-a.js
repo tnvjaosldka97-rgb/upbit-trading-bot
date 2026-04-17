@@ -1,469 +1,435 @@
 "use strict";
 
 /**
- * Strategy A v3 — 신호 퓨전 기반 1시간봉 스윙
+ * Strategy A v3 — 1h Swing Strategy (BTC only)
  *
- * 핵심 설계 철학:
- *   단일 지표 → 복합 점수 퓨전
- *   MacroEngine + DataEngine + RegimeEngine + 기술적지표를 하나의 점수로 통합
- *   각 신호가 독립적으로 검증하므로 가짜 신호가 대폭 감소
+ * Signal fusion: RSI + MACD + Bollinger Band squeeze
+ * Entry: RSI oversold in non-bear regime + volume spike
+ * Exit: Kelly-calibrated target profit or trailing stop
+ * WebSocket real-time stop-loss (receives price updates)
  *
- * 진입 점수 구성 (진입 임계값: ≥ 40점):
- *   [필수] 골든크로스 (MA8 > MA21, 전봉 MA8 < MA21): 통과 아니면 즉시 종료
- *   [레짐] RegimeEngine:   BULL +25 / NEUTRAL 0 / BEAR → 즉시 차단
- *   [기술] EMA200 위:      +8  / 아래: -20
- *   [기술] MACD 양전환:    +10 / 음수:  -5
- *   [기술] VWAP 위:        +5  / 아래:  -3
- *   [기술] RSI 42~58:      +5  (35~65 범위 외: 차단)
- *   [기술] 거래량 급등:    +5
- *   [매크로] MacroEngine: -30 ~ +30
- *   [데이터] DataEngine:  -25 ~ +25  (OI/테이커/L·S/뉴스)
- *
- * 사이징:
- *   기본 예산 × RegimeEngine.getKellyMultiplier()
- *   BULL: 1.5x / NEUTRAL: 1.0x / BEAR: 0x
- *
- * 청산:
- *   - 부분청산: +2% 달성 시 50% 익절, 스탑 → 진입가 이동
- *   - ATR 트레일링 스탑 (+2% 이후 나머지)
- *   - 레짐 전환 청산: BULL→BEAR 즉시 전량 / BULL→NEUTRAL 스탑 브레이크이븐
- *   - 타임스탑 12h
- *   - 손절 후 2h 쿨다운
- *
- * 펀딩비 연동 (BybitFundingEngine):
- *   극단 롱크라우딩 (rate > 0.1%/8h): score -= 15
- *   LONG_COLLECT (rate < -0.03%): score += 8
- *   SHORT_COLLECT 중간 (0.03~0.1%): score -= 5
+ * Exports: class StrategyA with evaluate(candles, regime, calibration) method
  */
 
-const MARKETS          = ["KRW-BTC"];
-const ENTRY_THRESHOLD  = 40;          // 진입 최소 점수
-const TARGET_RATE      = 0.035;       // +3.5% 기본 목표
-const PARTIAL_RATE     = 0.020;       // +2% 부분청산 트리거
-const STOP_RATE        = -0.015;      // -1.5% 기본 손절
-const MAX_HOLD_MS      = 12 * 60 * 60_000;
-const ATR_TRAIL_MULT   = 2.0;
-const LOSS_COOLDOWN_MS = 2 * 60 * 60_000;
-const TICK_MS          = 5 * 60_000;
+const { safeFetch } = require("./exchange-adapter");
+const CFG = require("./config");
+const indicators = require("./lib/indicators");
+const UPBIT_API = "https://api.upbit.com";
+
+const MARKET         = CFG.A_MARKET;
+const RSI_OVERSOLD   = CFG.A_RSI_OVERSOLD;
+const RSI_OVERBOUGHT = CFG.A_RSI_OVERBOUGHT;
+const ENTRY_THRESHOLD = CFG.A_ENTRY_THRESHOLD;
+const DEFAULT_TARGET = CFG.A_DEFAULT_TARGET;
+const DEFAULT_STOP   = CFG.A_DEFAULT_STOP;
+const PARTIAL_RATE   = CFG.A_PARTIAL_RATE;
+const ATR_TRAIL_MULT = CFG.A_ATR_TRAIL_MULT;
+const MAX_HOLD_MS    = CFG.A_MAX_HOLD_MS;
+const COOLDOWN_MS    = CFG.A_COOLDOWN_MS;
 
 class StrategyA {
-  constructor({ orderService, macroEngine, dataEngine, regimeEngine, fundingEngine, initialCapital, dryRun }) {
-    this.orderService  = orderService;
-    this.macroEngine   = macroEngine;
-    this.dataEngine    = dataEngine;
-    this.regimeEngine  = regimeEngine;
-    this.fundingEngine = fundingEngine ?? null;   // BybitFundingEngine (선택적)
-    this.dryRun        = dryRun ?? true;
-    this.initialCapital = initialCapital;
+  constructor(options = {}) {
+    this.orderService  = options.orderService  || null;
+    this.regimeEngine  = options.regimeEngine  || null;
+    this.calibEngine   = options.calibEngine   || null;
+    this.dryRun        = options.dryRun ?? true;
+    this.initialCapital = options.initialCapital || 100_000;
 
+    // Simulation state
     this.sim = {
-      cash:        initialCapital,
-      position:    null,
-      realizedPnl: 0,
-      totalTrades: 0,
+      cash:         this.initialCapital,
+      position:     null,
+      realizedPnl:  0,
+      totalTrades:  0,
       wins: 0, losses: 0,
       history:      [],
       tradeReturns: [],
     };
 
-    this.livePosition  = null;
-    this.enteringLock  = false;
-    this._intervalId   = null;
-    this._lastLossAt   = 0;
+    this.livePosition   = null;
+    this._enteringLock  = false;
+    this._lastLossAt    = 0;
+    this._intervalId    = null;
 
-    // WebSocket 실시간
-    this._wsPrice      = null;   // 마지막 수신 가격
-    this._wsActive     = false;  // WS 연결 여부
-    this._stoppingLive = false;  // 실거래 손절 중복 방지 락
-    this._obImbalance  = null;   // 호가창 불균형 (-1 ~ +1, 양수=매수압)
+    // WebSocket real-time price
+    this._wsPrice       = null;
+    this._wsActive      = false;
+    this._stoppingLive  = false;
   }
 
-  start() {
+  // ─── Lifecycle ──────────────────────────────────────
+
+  start(intervalMs = 60 * 60_000) {
     this._tick();
-    this._intervalId = setInterval(() => this._tick(), TICK_MS);
-    console.log("[StrategyA v3] 신호 퓨전 스윙 시작 — BTC");
+    this._intervalId = setInterval(() => this._tick(), intervalMs);
+    console.log(`[StrategyA] started -- 1h swing, market: ${MARKET}, interval: ${intervalMs / 60_000}min`);
   }
 
   stop() {
-    if (this._intervalId) clearInterval(this._intervalId);
+    if (this._intervalId) {
+      clearInterval(this._intervalId);
+      this._intervalId = null;
+    }
   }
 
+  // ─── WebSocket Integration ──────────────────────────
+
   /**
-   * WebSocket 주입 (trading-bot.js에서 호출)
-   * WS 연결 시 손절 감시가 5분 폴링 → ~100ms 실시간으로 전환됨
+   * Receive real-time price updates for stop-loss monitoring.
+   * Call from trading-bot.js when ws price arrives for KRW-BTC.
    */
-  setWebSocket(ws) {
+  onPriceUpdate(price) {
+    this._wsPrice  = price;
     this._wsActive = true;
-    ws.subscribe("KRW-BTC");
-
-    // 가격 → 실시간 손절/목표 감시
-    ws.onPrice((market, price) => {
-      if (market !== "KRW-BTC") return;
-      this._wsPrice = price;
-      this._onWsPrice(price);
-    });
-
-    // 호가창 → 진입 타이밍 신호 (REST 봇이 못 보는 엣지)
-    ws.onOrderbook((market, imbalance) => {
-      if (market === "KRW-BTC") this._obImbalance = imbalance;
-    });
-
-    console.log("[StrategyA] WebSocket 활성화 — 손절 실시간(~100ms) + 호가 불균형 신호");
+    this._checkRealTimeExit(price);
   }
+
+  // ─── Core Evaluate Method ───────────────────────────
 
   /**
-   * WebSocket 가격 수신 시 실시간 호출 (~100ms 간격)
-   * 손절/목표/트레일링/타임스탑 즉시 체크
+   * evaluate(candles, regime, calibration)
+   *
+   * @param {Array} candles - 1h candles with { open, high, low, close, volume }
+   * @param {{ regime: string, confidence: number }} regime - from RegimeEngine
+   * @param {{ suggestedPositionPct: number, expectedValue: number }} calibration - from CalibrationEngine
+   * @returns {{ action: string, reason: string, confidence: number, stopLoss: number, takeProfit: number } | null}
    */
-  _onWsPrice(price) {
-    // ── 시뮬 포지션 (동기, 즉시 처리) ──────────────────
-    if (this.sim.position) {
-      const pos = this.sim.position;
-      if (price > pos.peakPrice) pos.peakPrice = price;
-
-      const move = (price - pos.entryPrice) / pos.entryPrice;
-
-      // ── 레짐 전환 청산 ────────────────────────────────
-      const curRegime = this.regimeEngine?.getRegime?.();
-      if (pos.regime === "BULL" && curRegime === "BEAR") {
-        console.warn(`[A] 레짐 전환 청산(BULL→BEAR) — ${pos.market}`);
-        const pnlRate = (price - pos.entryPrice) / pos.entryPrice;
-        if (pnlRate < 0) this._lastLossAt = Date.now();
-        this._recordSimClose(pos, price, pnlRate, pnlRate * pos.budget, "레짐전환BEAR");
-        return;
-      }
-      if (pos.regime === "BULL" && curRegime === "NEUTRAL" && !pos.partialDone) {
-        // NEUTRAL 전환 → 스탑을 브레이크이븐으로 올림 (청산하진 않음)
-        if (pos.entryPrice > pos.stopPrice) {
-          pos.stopPrice = pos.entryPrice * 1.001;
-          console.log(`[A] 레짐 NEUTRAL 전환 — 스탑 브레이크이븐으로 상향`);
-        }
-      }
-
-      // ── 부분청산: +PARTIAL_RATE 달성 시 50% 익절 ────
-      if (!pos.partialDone && move >= PARTIAL_RATE) {
-        const halfBudget = pos.budget * 0.5;
-        const halfPnl    = halfBudget * move;
-        this.sim.cash       += halfBudget + halfPnl;
-        this.sim.realizedPnl += halfPnl;
-        pos.budget   *= 0.5;
-        pos.quantity *= 0.5;
-        pos.partialDone = true;
-        // 스탑을 진입가로 이동 (이후 리스크 0)
-        if (pos.entryPrice > pos.stopPrice) pos.stopPrice = pos.entryPrice * 1.001;
-        pos.trailActive = true;
-        console.log(
-          `[A] 부분청산(WS) +${(move * 100).toFixed(2)}% — ` +
-          `50% 익절, 스탑→진입가, 나머지 트레일링`
-        );
-      }
-
-      if (!pos.trailActive && move >= 0.02) {
-        pos.trailActive = true;
-      }
-      if (pos.trailActive) {
-        const newStop = pos.peakPrice * (1 - pos.atrStop);
-        if (newStop > pos.stopPrice) pos.stopPrice = newStop;
-      }
-
-      const timeout  = Date.now() - pos.openedAt > MAX_HOLD_MS;
-      const hitTarget = price >= pos.targetPrice;
-      const hitStop   = price <= pos.stopPrice;
-
-      if (hitTarget || hitStop || timeout) {
-        const pnlRate = (price - pos.entryPrice) / pos.entryPrice;
-        const reason  = hitTarget ? "목표" : hitStop ? "손절" : "타임";
-        if (hitStop && pnlRate < 0) this._lastLossAt = Date.now();
-        this._recordSimClose(pos, price, pnlRate, pnlRate * pos.budget, reason);
-      }
+  evaluate(candles, regime, calibration) {
+    if (!candles || candles.length < 50) {
+      return { action: "HOLD", reason: "insufficient data", confidence: 0 };
     }
-
-    // ── 실거래 포지션 (비동기, 락으로 중복 방지) ────────
-    if (this.livePosition && !this._stoppingLive) {
-      const pos = this.livePosition;
-      if (price > pos.peakPrice) pos.peakPrice = price;
-
-      const move = (price - pos.entryPrice) / pos.entryPrice;
-      if (!pos.trailActive && move >= 0.02) pos.trailActive = true;
-      if (pos.trailActive) {
-        const newStop = pos.peakPrice * (1 - pos.atrStop);
-        if (newStop > pos.stopPrice) pos.stopPrice = newStop;
-      }
-
-      if (price <= pos.stopPrice) {
-        this._stoppingLive = true;
-        this._executeLiveStop(pos, price)
-          .finally(() => { this._stoppingLive = false; });
-      }
-    }
-  }
-
-  async _executeLiveStop(pos, price) {
-    console.warn(
-      `[A] 손절 실행(WS 실시간) — ${pos.market} ` +
-      `현재가 ${price.toLocaleString()} ≤ 손절선 ${pos.stopPrice.toLocaleString()}`
-    );
-    if (!this.dryRun && this.orderService?.getSummary().hasApiKeys) {
-      if (pos.limitSellUuid) {
-        await this.orderService.cancelOrder(pos.limitSellUuid).catch(() => {});
-      }
-      const bal = await this.orderService
-        .getBalance(pos.market.split("-")[1]).catch(() => 0);
-      if (bal > 0.00001) {
-        await this.orderService.marketSell(pos.market, bal)
-          .catch(e => console.error("[A] 손절 매도 실패:", e.message));
-      }
-    }
-    this._closeLive("손절(WS)");
-  }
-
-  // ── 메인 틱 ──────────────────────────────────────────
-  async _tick() {
-    try {
-      // 쿨다운 체크
-      if (Date.now() - this._lastLossAt < LOSS_COOLDOWN_MS) return;
-
-      // 손절/목표 감시: WS 없을 때만 폴링 (WS 있으면 _onWsPrice에서 실시간 처리)
-      if (!this._wsActive) {
-        if (this.sim.position)  await this._manageSimPos();
-        if (this.livePosition)  await this._manageLivePos();
-      }
-
-      if (!this.sim.position && !this.livePosition && !this.enteringLock) {
-        for (const market of MARKETS) {
-          const result = await this._evaluate(market);
-          if (result && result.score >= ENTRY_THRESHOLD) {
-            await this._enter(market, result);
-            break;
-          }
-        }
-      }
-    } catch (e) {
-      console.error("[A] tick 오류:", e.message);
-    }
-  }
-
-  // ── 신호 퓨전 평가 ───────────────────────────────────
-  /**
-   * 모든 신호를 통합해 단일 점수 반환.
-   * 골든크로스가 없거나 BEAR 레짐이면 null.
-   * 점수 >= ENTRY_THRESHOLD 이면 진입.
-   */
-  async _evaluate(market) {
-    const candles = await this._fetch1h(market, 200);
-    if (!candles || candles.length < 50) return null;
 
     const closes  = candles.map(c => c.close);
+    const highs   = candles.map(c => c.high);
+    const lows    = candles.map(c => c.low);
     const volumes = candles.map(c => c.volume);
     const price   = closes[closes.length - 1];
 
-    // ── [필수] 골든크로스 ───────────────────────────────
-    const ma8   = this._sma(closes, 8);
-    const ma21  = this._sma(closes, 21);
-    const ma8p  = this._sma(closes.slice(0, -1), 8);
-    const ma21p = this._sma(closes.slice(0, -1), 21);
-    if (!ma8 || !ma21 || !ma8p || !ma21p) return null;
+    // ── SELL check (existing position) ────────────────
+    if (this.sim.position) {
+      return this._evaluateExit(price, regime);
+    }
 
-    const golden = ma8p < ma21p && ma8 > ma21;
-    if (!golden) return null;  // 골든크로스 없으면 종료
+    // ── Cooldown check ────────────────────────────────
+    if (Date.now() - this._lastLossAt < COOLDOWN_MS) {
+      return { action: "HOLD", reason: "loss cooldown active", confidence: 0 };
+    }
 
+    // ── BEAR regime hard block ────────────────────────
+    const regimeStr = regime?.regime || "RANGE";
+    if (regimeStr === "BEAR_STRONG") {
+      return { action: "HOLD", reason: "BEAR_STRONG regime block", confidence: 0 };
+    }
+
+    // ── Signal Fusion Scoring ─────────────────────────
     let score = 0;
     const reasons = [];
 
-    // ── [레짐] RegimeEngine ─────────────────────────────
-    const regimeScore = this.regimeEngine?.getScoreContribution?.() ?? 0;
-    if (regimeScore <= -999) return null;  // BEAR → 즉시 차단
-    score += regimeScore;
-    const regime = this.regimeEngine?.getRegime?.() ?? "NEUTRAL";
-    if (regime === "BULL") reasons.push("BULL_REGIME");
-
-    // 골든크로스 자체 점수
-    score += 15;
-    reasons.push("GOLDEN_CROSS");
-
-    // ── [기술] EMA200 ───────────────────────────────────
-    const ema200 = this._ema(closes, 200);
-    if (ema200) {
-      if (price >= ema200 * 0.998) {
-        score += 8;
-        reasons.push("ABOVE_EMA200");
-      } else {
-        score -= 20;
-        reasons.push("BELOW_EMA200");
-      }
+    // 1) RSI14
+    const rsi = this._rsi(closes, 14);
+    if (rsi < RSI_OVERSOLD) {
+      score += 15;
+      reasons.push(`RSI_OVERSOLD(${rsi.toFixed(0)})`);
+    } else if (rsi > RSI_OVERBOUGHT) {
+      score -= 10;
+      reasons.push(`RSI_OVERBOUGHT(${rsi.toFixed(0)})`);
+    } else if (rsi >= 42 && rsi <= 58) {
+      score += 5;
+      reasons.push(`RSI_NEUTRAL(${rsi.toFixed(0)})`);
     }
 
-    // ── [기술] MACD(12,26,9) ────────────────────────────
+    // 2) MACD(12, 26, 9)
     const macd = this._macd(closes);
     if (macd) {
       if (macd.histogram > 0 && macd.histogram > macd.prevHistogram) {
-        score += 10;
-        reasons.push("MACD_MOMENTUM");
+        score += 12;
+        reasons.push("MACD_BULLISH_MOMENTUM");
       } else if (macd.histogram <= 0) {
         score -= 5;
         reasons.push("MACD_NEGATIVE");
       }
     }
 
-    // ── [기술] VWAP ─────────────────────────────────────
-    const vwap = this._vwap(candles.slice(-24));
-    if (vwap > 0) {
-      if (price > vwap) { score += 5; reasons.push("ABOVE_VWAP"); }
-      else              { score -= 3; reasons.push("BELOW_VWAP"); }
+    // 3) Bollinger Band squeeze (BB width < 2% = squeeze)
+    const bb = this._bollingerBands(closes, 20, 2);
+    if (bb) {
+      const bbWidth = (bb.upper - bb.lower) / bb.middle;
+      if (bbWidth < 0.02 && price > bb.middle) {
+        score += 10;
+        reasons.push("BB_SQUEEZE_BREAKOUT");
+      } else if (bbWidth < 0.02) {
+        score += 5;
+        reasons.push("BB_SQUEEZE");
+      }
+      if (price < bb.lower) {
+        score += 8;
+        reasons.push("BB_OVERSOLD");
+      }
     }
 
-    // ── [기술] RSI ──────────────────────────────────────
-    const rsi = this._rsi(closes, 14);
-    if (rsi < 35 || rsi > 68) return null;  // 극단 RSI 하드 차단
-    if (rsi >= 42 && rsi <= 58) { score += 5; reasons.push(`RSI_SWEET(${rsi.toFixed(0)})`); }
-
-    // ── [기술] 거래량 급등 ──────────────────────────────
-    const recentVol = this._avg(volumes.slice(-3));
-    const baseVol   = this._avg(volumes.slice(-23, -3));
-    if (baseVol > 0 && recentVol > baseVol * 1.3) {
-      score += 5;
+    // 4) Volume spike (recent 3 vs prior 20)
+    const recentVol = this._mean(volumes.slice(-3));
+    const baseVol   = this._mean(volumes.slice(-23, -3));
+    if (baseVol > 0 && recentVol > baseVol * 1.5) {
+      score += 8;
       reasons.push("VOLUME_SPIKE");
     }
 
-    // ── [매크로] MacroEngine (-30 ~ +30) ────────────────
-    const macroSig = this.macroEngine?.getSignals?.(market);
-    if (macroSig) {
-      score += macroSig.macroScore;
-      if (macroSig.macroScore > 10)  reasons.push("MACRO_BULLISH");
-      if (macroSig.macroScore < -10) reasons.push("MACRO_BEARISH");
-      // 극단 매크로 차단 (김치프리미엄 과열 등)
-      if (macroSig.flags?.includes("KIMCHI_OVERPRICED")) {
-        score -= 10;
-        reasons.push("KIMCHI_OVERHEATED");
-      }
+    // 5) Golden cross (MA8 > MA21)
+    const ma8  = this._sma(closes, 8);
+    const ma21 = this._sma(closes, 21);
+    if (ma8 && ma21 && ma8 > ma21) {
+      score += 10;
+      reasons.push("GOLDEN_CROSS");
     }
 
-    // ── [데이터] DataEngine (-25 ~ +25) ─────────────────
-    const dataSig = this.dataEngine?.getSignals?.(market);
-    if (dataSig) {
-      score += dataSig.dataScore;
-      if (dataSig.flags?.includes("OI_SURGE"))             reasons.push("OI_SURGE");
-      if (dataSig.flags?.includes("TAKER_BUY_DOMINANT"))   reasons.push("TAKER_BUY");
-      if (dataSig.flags?.includes("LS_CROWDED_SHORT"))     reasons.push("SHORT_SQUEEZE");
-      if (dataSig.flags?.includes("OI_CONFIRMED_CROSS_EXCHANGE")) reasons.push("OI_CROSS_CONFIRM");
+    // 6) EMA200 position
+    const ema200 = this._ema(closes, 200);
+    if (ema200 && price > ema200) {
+      score += 8;
+      reasons.push("ABOVE_EMA200");
+    } else if (ema200) {
+      score -= 15;
+      reasons.push("BELOW_EMA200");
     }
 
-    // ── [실시간] 호가창 불균형 (-10 ~ +10) ─────────────
-    // REST 폴링 봇이 볼 수 없는 ~100ms 실시간 매수/매도 압력
-    // imbalance = (총매수잔량 - 총매도잔량) / 총잔량
-    if (this._obImbalance !== null) {
-      const ob = this._obImbalance;
-      if (ob > 0.30) {
-        score += 10;
-        reasons.push(`OB_BID(${(ob * 100).toFixed(0)}%)`);   // 강한 매수압
-      } else if (ob > 0.10) {
-        score += 5;
-        reasons.push(`OB_BID_WEAK`);
-      } else if (ob < -0.30) {
-        score -= 10;
-        reasons.push(`OB_ASK(${(Math.abs(ob) * 100).toFixed(0)}%)`);  // 강한 매도압
-      } else if (ob < -0.10) {
-        score -= 5;
-        reasons.push(`OB_ASK_WEAK`);
-      }
-    }
+    // 7) Regime contribution
+    const regimeScore = this._regimeScore(regimeStr);
+    score += regimeScore;
+    if (regimeScore > 0) reasons.push(`REGIME_${regimeStr}`);
 
-    const atr = this._atr(candles.slice(-14));
+    // ── Confidence ────────────────────────────────────
+    const confidence = Math.min(Math.max(score / 80, 0), 1);
 
-    // ── 호가창 하드 게이트 (강한 매도압 = 진입 차단) ────
-    // 점수가 충분해도 매도압이 압도적이면 진입 타이밍이 아님
-    // OB 데이터 있고, 강한 매도압(-0.35 이하)이면 null 반환
-    if (this._obImbalance !== null && this._obImbalance < -0.35) {
+    // ── Kelly-calibrated targets ──────────────────────
+    const atr = this._atr(highs, lows, closes, 14);
+    const atrPct = price > 0 ? atr / price : 0;
+    const calPct = calibration?.suggestedPositionPct || 0.05;
+
+    const targetRate = atrPct > 0
+      ? Math.max(DEFAULT_TARGET, atrPct * 2.5 * (1 + calPct))
+      : DEFAULT_TARGET;
+    const stopRate = atrPct > 0
+      ? Math.min(DEFAULT_STOP, -(atrPct * 1.2))
+      : DEFAULT_STOP;
+
+    const takeProfit = Math.round(price * (1 + targetRate));
+    const stopLoss   = Math.round(price * (1 + stopRate));
+
+    if (score >= ENTRY_THRESHOLD) {
       console.log(
-        `[A] 진입 차단(OB 하드게이트) — ${market} 점수:${score} ` +
-        `매도압 ${(Math.abs(this._obImbalance) * 100).toFixed(0)}% 우세`
+        `[StrategyA] BUY signal -- ${MARKET} score:${score} ` +
+        `confidence:${confidence.toFixed(2)} [${reasons.join(",")}]`
       );
-      return null;
+      return {
+        action: "BUY",
+        reason: reasons.join(", "),
+        confidence,
+        stopLoss,
+        takeProfit,
+        score,
+        _meta: { rsi, atr, atrPct, targetRate, stopRate, calPct },
+      };
     }
 
-    // ── [펀딩비] BybitFundingEngine (-15 ~ +8) ───────────
-    // 극단 롱크라우딩(rate>0.1%/8h): 롱 포지션 청산 압력 위험 → 강하게 차단
-    // LONG_COLLECT(rate<-0.03%): 롱에게 유리 → 보너스
-    const funding = this.fundingEngine?.state;
-    if (funding?.fundingRate != null) {
-      const rate = funding.fundingRate;
-      if (rate > 0.001) {
-        // 극단 크라우딩 (0.1%/8h ≈ 연 109%) → 진입 차단
-        score -= 15;
-        reasons.push(`FUND_EXTREME(${(rate * 100).toFixed(3)}%)`);
-        if (score < ENTRY_THRESHOLD) {
-          console.log(`[A] 차단(극단 펀딩비) — rate=${(rate * 100).toFixed(3)}%/8h`);
-          return null;
-        }
-      } else if (rate > 0.0003) {
-        // SHORT_COLLECT 중간 수준
-        score -= 5;
-        reasons.push(`FUND_SHORT_COLLECT`);
-      } else if (rate < -0.0003) {
-        // LONG_COLLECT → 롱에게 유리
-        score += 8;
-        reasons.push(`FUND_LONG_COLLECT`);
-      }
-    }
-
-    console.log(
-      `[A] 평가 — ${market} 점수:${score} (임계:${ENTRY_THRESHOLD}) ` +
-      `[${reasons.join(",")}]`
-    );
-
-    return { score, reasons, price, rsi, ema200, vwap, ma8, ma21, atr, regime };
+    return {
+      action: "HOLD",
+      reason: `score ${score} < threshold ${ENTRY_THRESHOLD}`,
+      confidence,
+      stopLoss,
+      takeProfit,
+      score,
+    };
   }
 
-  // ── 진입 ─────────────────────────────────────────────
-  async _enter(market, sig) {
-    if (this.enteringLock) return;
-    this.enteringLock = true;
+  // ─── Exit Evaluation ────────────────────────────────
+
+  _evaluateExit(price, regime) {
+    const pos = this.sim.position;
+    if (!pos) return { action: "HOLD", reason: "no position", confidence: 0 };
+
+    const move = (price - pos.entryPrice) / pos.entryPrice;
+    const holdTime = Date.now() - pos.openedAt;
+
+    // Regime shift: BULL -> BEAR_STRONG = immediate exit
+    const regimeStr = regime?.regime || "RANGE";
+    if (pos.regime && (pos.regime.startsWith("BULL")) && regimeStr === "BEAR_STRONG") {
+      return {
+        action: "SELL",
+        reason: "regime shift to BEAR_STRONG",
+        confidence: 0.9,
+        stopLoss: 0,
+        takeProfit: 0,
+      };
+    }
+
+    // Target hit
+    if (price >= pos.targetPrice) {
+      return {
+        action: "SELL",
+        reason: `target hit +${(move * 100).toFixed(2)}%`,
+        confidence: 1.0,
+        stopLoss: 0,
+        takeProfit: 0,
+      };
+    }
+
+    // Stop hit
+    if (price <= pos.stopPrice) {
+      return {
+        action: "SELL",
+        reason: `stop loss ${(move * 100).toFixed(2)}%`,
+        confidence: 1.0,
+        stopLoss: 0,
+        takeProfit: 0,
+      };
+    }
+
+    // Time stop
+    if (holdTime > MAX_HOLD_MS) {
+      return {
+        action: "SELL",
+        reason: `time stop (${(holdTime / 3_600_000).toFixed(1)}h)`,
+        confidence: 0.7,
+        stopLoss: 0,
+        takeProfit: 0,
+      };
+    }
+
+    return { action: "HOLD", reason: "position active", confidence: 0 };
+  }
+
+  // ─── Real-time WebSocket Exit Check ─────────────────
+
+  _checkRealTimeExit(price) {
+    if (!this.sim.position) return;
+    const pos = this.sim.position;
+
+    // Update peak
+    if (price > pos.peakPrice) pos.peakPrice = price;
+    const move = (price - pos.entryPrice) / pos.entryPrice;
+
+    // Partial take-profit at +2%
+    if (!pos.partialDone && move >= PARTIAL_RATE) {
+      const halfBudget = pos.budget * 0.5;
+      const halfPnl    = halfBudget * move;
+      this.sim.cash        += halfBudget + halfPnl;
+      this.sim.realizedPnl += halfPnl;
+      pos.budget      *= 0.5;
+      pos.quantity    *= 0.5;
+      pos.partialDone  = true;
+      pos.stopPrice    = pos.entryPrice * 1.001; // move stop to breakeven
+      pos.trailActive  = true;
+      console.log(`[StrategyA] partial TP +${(move * 100).toFixed(2)}% -- 50% sold, stop -> breakeven`);
+    }
+
+    // ATR trailing stop
+    if (!pos.trailActive && move >= 0.02) pos.trailActive = true;
+    if (pos.trailActive) {
+      const newStop = pos.peakPrice * (1 - pos.atrStop);
+      if (newStop > pos.stopPrice) pos.stopPrice = newStop;
+    }
+
+    // Check exits
+    const hitTarget = price >= pos.targetPrice;
+    const hitStop   = price <= pos.stopPrice;
+    const timeout   = Date.now() - pos.openedAt > MAX_HOLD_MS;
+
+    if (hitTarget || hitStop || timeout) {
+      const pnlRate = (price - pos.entryPrice) / pos.entryPrice;
+      const pnlKrw  = pnlRate * pos.budget;
+      const reason   = hitTarget ? "target" : hitStop ? "stop" : "timeout";
+      if (hitStop && pnlRate < 0) this._lastLossAt = Date.now();
+      this._closeSimPosition(pos, price, pnlRate, pnlKrw, reason);
+    }
+
+    // Live position stop
+    if (this.livePosition && !this._stoppingLive && price <= this.livePosition.stopPrice) {
+      this._stoppingLive = true;
+      this._executeLiveStop(this.livePosition, price)
+        .finally(() => { this._stoppingLive = false; });
+    }
+  }
+
+  // ─── Internal Tick ──────────────────────────────────
+
+  async _tick() {
     try {
-      const price = sig.price;
+      if (Date.now() - this._lastLossAt < COOLDOWN_MS) return;
 
-      // 레짐 기반 예산 배율
+      // Manage existing position via polling (backup for no-WS)
+      if (!this._wsActive && this.sim.position) {
+        await this._manageSimPosition();
+      }
+
+      // Entry evaluation
+      if (!this.sim.position && !this.livePosition && !this._enteringLock) {
+        const candles = await this._fetchCandles(MARKET, 200);
+        if (!candles) return;
+
+        const regime = this.regimeEngine
+          ? await this.regimeEngine.detect(MARKET)
+          : { regime: "RANGE", confidence: 0 };
+        const calibration = this.calibEngine
+          ? this.calibEngine.getResult()
+          : null;
+
+        const signal = this.evaluate(candles, regime, calibration);
+        if (signal && signal.action === "BUY") {
+          await this._enter(MARKET, signal, regime, calibration);
+        }
+      }
+    } catch (e) {
+      console.error("[StrategyA] tick error:", e.message);
+    }
+  }
+
+  // ─── Entry Execution ────────────────────────────────
+
+  async _enter(market, signal, regime, calibration) {
+    if (this._enteringLock) return;
+    this._enteringLock = true;
+    try {
+      const price = signal._meta?.rsi ? await this._getPrice(market) : signal.takeProfit / (1 + DEFAULT_TARGET);
+      if (!price) return;
+
       const kellyMult = this.regimeEngine?.getKellyMultiplier?.() ?? 1.0;
-      const budget    = this.sim.cash * 0.95 * Math.min(kellyMult, 1.5);
+      const calPct    = calibration?.suggestedPositionPct || 0.05;
+      const budget    = Math.floor(this.sim.cash * Math.min(calPct * kellyMult * 10, 0.95));
 
-      // 변동성 기반 동적 목표/손절
-      const dynTarget = sig.atr > 0
-        ? Math.max(TARGET_RATE, (sig.atr / price) * 2.5)
-        : TARGET_RATE;
-      const dynStop = sig.atr > 0
-        ? Math.max(STOP_RATE, -((sig.atr / price) * 1.2))
-        : STOP_RATE;
-      const atrStop = sig.atr > 0
-        ? (sig.atr / price) * ATR_TRAIL_MULT
-        : 0.015;
+      if (budget < 5000) {
+        console.warn("[StrategyA] insufficient budget");
+        return;
+      }
+
+      const atr = signal._meta?.atr || price * 0.01;
+      const atrStop = atr > 0 ? (atr / price) * ATR_TRAIL_MULT : 0.015;
 
       this.sim.position = {
         market,
-        entryPrice:   price,
-        quantity:     budget / price,
+        entryPrice:  price,
+        quantity:    budget / price,
         budget,
-        targetPrice:  price * (1 + dynTarget),
-        stopPrice:    price * (1 + dynStop),
+        targetPrice: signal.takeProfit || price * (1 + DEFAULT_TARGET),
+        stopPrice:   signal.stopLoss   || price * (1 + DEFAULT_STOP),
         atrStop,
-        peakPrice:    price,
-        trailActive:  false,
-        partialDone:  false,    // 부분청산 완료 여부
-        openedAt:     Date.now(),
-        entryScore:   sig.score,
-        entryReasons: sig.reasons,
-        rsiAtEntry:   sig.rsi,
-        regime:       sig.regime,
+        peakPrice:   price,
+        trailActive: false,
+        partialDone: false,
+        openedAt:    Date.now(),
+        entryScore:  signal.score,
+        regime:      regime?.regime || "RANGE",
       };
       this.sim.cash -= budget;
 
       console.log(
-        `[A] ✅ 진입 — ${market} @${price.toLocaleString()} ` +
-        `점수:${sig.score} 레짐:${sig.regime} ` +
-        `목표:+${(dynTarget * 100).toFixed(1)}% ` +
-        `손절:${(dynStop * 100).toFixed(1)}% ` +
-        `예산배율:${kellyMult}x`
+        `[StrategyA] ENTERED -- ${market} @${price.toLocaleString()} ` +
+        `budget:${budget.toLocaleString()} regime:${regime?.regime} ` +
+        `target:${this.sim.position.targetPrice.toLocaleString()} ` +
+        `stop:${this.sim.position.stopPrice.toLocaleString()}`
       );
 
-      // 실거래
+      // Live order execution
       if (!this.dryRun && this.orderService?.getSummary().hasApiKeys) {
         const krw = await this.orderService.getBalance("KRW").catch(() => 0);
         const liveBudget = Math.min(krw * 0.9, this.initialCapital * 0.6 * kellyMult);
@@ -471,79 +437,67 @@ class StrategyA {
           const res = await this.orderService.smartLimitBuy(market, Math.floor(liveBudget));
           if (res.filled) {
             const ep = res.avgPrice;
-            const lp = {
+            this.livePosition = {
               market, quantity: res.executedVolume,
               entryPrice: ep, budget: liveBudget,
-              targetPrice: ep * (1 + dynTarget),
-              stopPrice:   ep * (1 + dynStop),
+              targetPrice: ep * (1 + (signal._meta?.targetRate || DEFAULT_TARGET)),
+              stopPrice:   ep * (1 + (signal._meta?.stopRate || DEFAULT_STOP)),
               atrStop, peakPrice: ep, trailActive: false,
               openedAt: Date.now(),
             };
-            const sell = await this.orderService.limitSell(market, res.executedVolume, lp.targetPrice);
-            lp.limitSellUuid = sell.uuid;
-            this.livePosition = lp;
+            const sell = await this.orderService.limitSell(market, res.executedVolume, this.livePosition.targetPrice);
+            this.livePosition.limitSellUuid = sell.uuid;
             this.orderService
               .waitForFillOrMarketSell(sell.uuid, market, res.executedVolume)
               .then(() => this._closeLive("TARGET"))
-              .catch(e => console.error("[A] 매도 감시:", e.message));
+              .catch(e => console.error("[StrategyA] sell monitor:", e.message));
           }
         }
       }
     } catch (e) {
-      console.error("[A] 진입 오류:", e.message);
+      console.error("[StrategyA] entry error:", e.message);
     } finally {
-      this.enteringLock = false;
+      this._enteringLock = false;
     }
   }
 
-  // ── 시뮬 포지션 관리 ─────────────────────────────────
-  async _manageSimPos() {
+  async _executeLiveStop(pos, price) {
+    console.warn(
+      `[StrategyA] live stop triggered -- ${pos.market} ` +
+      `price:${price.toLocaleString()} <= stop:${pos.stopPrice.toLocaleString()}`
+    );
+    if (!this.dryRun && this.orderService?.getSummary().hasApiKeys) {
+      if (pos.limitSellUuid) {
+        await this.orderService.cancelOrder(pos.limitSellUuid).catch(() => {});
+      }
+      const bal = await this.orderService.getBalance(pos.market.split("-")[1]).catch(() => 0);
+      if (bal > 0.00001) {
+        await this.orderService.marketSell(pos.market, bal)
+          .catch(e => console.error("[StrategyA] stop sell failed:", e.message));
+      }
+    }
+    this._closeLive("STOP");
+  }
+
+  _closeLive(reason) {
+    if (!this.livePosition) return;
+    console.log(`[StrategyA] live position closed (${reason}) -- ${this.livePosition.market}`);
+    this.livePosition = null;
+  }
+
+  // ─── Sim Position Management (polling fallback) ─────
+
+  async _manageSimPosition() {
     const pos = this.sim.position;
     if (!pos) return;
 
-    const candles = await this._fetch1h(pos.market, 3).catch(() => null);
-    if (!candles?.length) return;
+    const cur = await this._getPrice(pos.market);
+    if (!cur) return;
 
-    const cur     = candles[candles.length - 1].close;
-    const move    = (cur - pos.entryPrice) / pos.entryPrice;
-    const timeout = Date.now() - pos.openedAt > MAX_HOLD_MS;
-
-    // 최고가 갱신
     if (cur > pos.peakPrice) pos.peakPrice = cur;
+    const move = (cur - pos.entryPrice) / pos.entryPrice;
 
-    // ── 레짐 전환 청산 ────────────────────────────────
-    const curRegime = this.regimeEngine?.getRegime?.();
-    if (pos.regime === "BULL" && curRegime === "BEAR") {
-      const pnlRate = (cur - pos.entryPrice) / pos.entryPrice;
-      if (pnlRate < 0) this._lastLossAt = Date.now();
-      this._recordSimClose(pos, cur, pnlRate, pnlRate * pos.budget, "레짐전환BEAR");
-      return;
-    }
-    if (pos.regime === "BULL" && curRegime === "NEUTRAL" && !pos.partialDone) {
-      if (pos.entryPrice > pos.stopPrice) {
-        pos.stopPrice = pos.entryPrice * 1.001;
-        console.log(`[A] 레짐 NEUTRAL — 스탑 브레이크이븐 상향`);
-      }
-    }
-
-    // ── 부분청산 (폴링 경로, WS 없을 때) ─────────────
-    if (!pos.partialDone && move >= PARTIAL_RATE) {
-      const halfBudget = pos.budget * 0.5;
-      const halfPnl    = halfBudget * move;
-      this.sim.cash        += halfBudget + halfPnl;
-      this.sim.realizedPnl += halfPnl;
-      pos.budget   *= 0.5;
-      pos.quantity *= 0.5;
-      pos.partialDone = true;
-      if (pos.entryPrice > pos.stopPrice) pos.stopPrice = pos.entryPrice * 1.001;
-      pos.trailActive = true;
-      console.log(`[A] 부분청산(폴링) +${(move * 100).toFixed(1)}% — 50% 익절, 스탑→진입가`);
-    }
-
-    // ATR 트레일링 스탑
-    if (!pos.trailActive && move >= 0.02) {
-      pos.trailActive = true;
-    }
+    if (!pos.trailActive && move >= 0.02) pos.trailActive = true;
     if (pos.trailActive) {
       const newStop = pos.peakPrice * (1 - pos.atrStop);
       if (newStop > pos.stopPrice) pos.stopPrice = newStop;
@@ -551,17 +505,18 @@ class StrategyA {
 
     const hitTarget = cur >= pos.targetPrice;
     const hitStop   = cur <= pos.stopPrice;
+    const timeout   = Date.now() - pos.openedAt > MAX_HOLD_MS;
 
     if (hitTarget || hitStop || timeout) {
       const pnlRate = (cur - pos.entryPrice) / pos.entryPrice;
       const pnlKrw  = pnlRate * pos.budget;
-      const reason  = hitTarget ? "목표" : hitStop ? "손절" : "타임";
+      const reason   = hitTarget ? "target" : hitStop ? "stop" : "timeout";
       if (hitStop && pnlRate < 0) this._lastLossAt = Date.now();
-      this._recordSimClose(pos, cur, pnlRate, pnlKrw, reason);
+      this._closeSimPosition(pos, cur, pnlRate, pnlKrw, reason);
     }
   }
 
-  _recordSimClose(pos, exitPrice, pnlRate, pnlKrw, reason) {
+  _closeSimPosition(pos, exitPrice, pnlRate, pnlKrw, reason) {
     this.sim.cash += pos.budget * (1 + pnlRate);
     this.sim.realizedPnl += pnlKrw;
     this.sim.totalTrades++;
@@ -576,153 +531,83 @@ class StrategyA {
     });
     this.sim.history = this.sim.history.slice(0, 30);
     this.sim.position = null;
+
     console.log(
-      `[A] 청산(${reason}) — ${pos.market} ` +
+      `[StrategyA] closed (${reason}) -- ${pos.market} ` +
       `${pnlRate >= 0 ? "+" : ""}${(pnlRate * 100).toFixed(2)}% ` +
-      `(${Math.round(pnlKrw).toLocaleString()}원)`
+      `(${Math.round(pnlKrw).toLocaleString()} KRW)`
     );
+
+    // Record for CalibrationEngine
+    if (this.calibEngine) {
+      this.calibEngine.recordTrade({ pnlRate, market: pos.market, reason });
+    }
   }
 
-  // ── 실거래 포지션 관리 ───────────────────────────────
-  async _manageLivePos() {
-    if (!this.livePosition) return;
-    const pos = this.livePosition;
+  // ─── Data Fetching ──────────────────────────────────
 
-    let cur;
+  async _fetchCandles(market, count) {
     try {
-      const res  = await fetch(`https://api.upbit.com/v1/ticker?markets=${pos.market}`);
+      const res = await safeFetch(
+        `${UPBIT_API}/v1/candles/minutes/60?market=${market}&count=${count}`,
+        { headers: { accept: "application/json" } }
+      );
+      if (!res.ok) return null;
       const data = await res.json();
-      cur = data[0]?.trade_price;
-    } catch { return; }
-    if (!cur) return;
-
-    const move = (cur - pos.entryPrice) / pos.entryPrice;
-    if (cur > pos.peakPrice) pos.peakPrice = cur;
-    if (!pos.trailActive && move >= 0.02) pos.trailActive = true;
-    if (pos.trailActive) {
-      const newStop = pos.peakPrice * (1 - pos.atrStop);
-      if (newStop > pos.stopPrice) pos.stopPrice = newStop;
-    }
-
-    if (cur <= pos.stopPrice) {
-      console.warn(`[A] 손절 트리거 — ${pos.market} ${cur.toLocaleString()} ≤ ${pos.stopPrice.toLocaleString()}`);
-      if (!this.dryRun && this.orderService?.getSummary().hasApiKeys) {
-        if (pos.limitSellUuid) await this.orderService.cancelOrder(pos.limitSellUuid).catch(() => {});
-        const bal = await this.orderService.getBalance(pos.market.split("-")[1]).catch(() => 0);
-        if (bal > 0.00001) {
-          await this.orderService.marketSell(pos.market, bal).catch(e => console.error("[A]", e.message));
-        }
-      }
-      this._closeLive("손절");
+      return data.reverse().map(c => ({
+        time:   new Date(c.candle_date_time_utc).getTime(),
+        open:   c.opening_price,
+        high:   c.high_price,
+        low:    c.low_price,
+        close:  c.trade_price,
+        volume: c.candle_acc_trade_volume,
+      }));
+    } catch (e) {
+      console.error("[StrategyA] fetch candles error:", e.message);
+      return null;
     }
   }
 
-  _closeLive(reason) {
-    if (!this.livePosition) return;
-    console.log(`[A] 실거래 청산(${reason}) — ${this.livePosition.market}`);
-    this.livePosition = null;
+  async _getPrice(market) {
+    if (this._wsPrice && market === MARKET) return this._wsPrice;
+    try {
+      const res  = await safeFetch(`${UPBIT_API}/v1/ticker?markets=${market}`);
+      const data = await res.json();
+      return data[0]?.trade_price || null;
+    } catch (e) { console.warn("[StrategyA] _getPrice:", e.message); return null; }
   }
 
-  // ── 데이터 수집 ──────────────────────────────────────
-  async _fetch1h(market, count = 200) {
-    const res  = await fetch(
-      `https://api.upbit.com/v1/candles/minutes/60?market=${market}&count=${count}`
-    );
-    if (!res.ok) return null;
-    const data = await res.json();
-    return data.reverse().map(c => ({
-      time:   new Date(c.candle_date_time_utc).getTime(),
-      open:   c.opening_price, high: c.high_price,
-      low:    c.low_price,     close: c.trade_price,
-      volume: c.candle_acc_trade_volume,
-    }));
-  }
+  // ─── Technical Indicators (delegated to lib/indicators.js) ──
 
-  // ── 기술적 지표 ──────────────────────────────────────
-  _sma(arr, n) {
-    if (!arr || arr.length < n) return null;
-    return arr.slice(-n).reduce((s, v) => s + v, 0) / n;
-  }
+  _sma(arr, n)     { return indicators.sma(arr, n); }
+  _ema(arr, n)     { return indicators.ema(arr, n); }
+  _emaArr(arr, n)  { return indicators.emaArr(arr, n); }
+  _rsi(closes, p)  { return indicators.rsi(closes, p); }
+  _macd(closes, fast, slow, sig) { return indicators.macd(closes, fast, slow, sig); }
+  _bollingerBands(closes, period, mult) { return indicators.bollingerBands(closes, period, mult); }
+  _atr(highs, lows, closes, period) { return indicators.atr(highs, lows, closes, period); }
+  _mean(arr)       { return indicators.mean(arr); }
 
-  _ema(arr, n) {
-    if (!arr || arr.length < n) return null;
-    const k = 2 / (n + 1);
-    let ema = arr.slice(0, n).reduce((s, v) => s + v, 0) / n;
-    for (let i = n; i < arr.length; i++) ema = arr[i] * k + ema * (1 - k);
-    return ema;
-  }
-
-  _emaArr(arr, n) {
-    if (!arr || arr.length < n) return null;
-    const k = 2 / (n + 1);
-    const out = [];
-    let ema = arr.slice(0, n).reduce((s, v) => s + v, 0) / n;
-    out.push(ema);
-    for (let i = n; i < arr.length; i++) { ema = arr[i] * k + ema * (1 - k); out.push(ema); }
-    return out;
-  }
-
-  _macd(closes, fast = 12, slow = 26, sig = 9) {
-    if (closes.length < slow + sig + 2) return null;
-    const emaF = this._emaArr(closes, fast);
-    const emaS = this._emaArr(closes, slow);
-    if (!emaF || !emaS) return null;
-    const offset   = emaF.length - emaS.length;
-    const macdLine = emaS.map((s, i) => emaF[offset + i] - s);
-    const sigArr   = this._emaArr(macdLine, sig);
-    if (!sigArr || sigArr.length < 2) return null;
-    const n = macdLine.length, sn = sigArr.length;
-    return {
-      histogram:     macdLine[n - 1] - sigArr[sn - 1],
-      prevHistogram: macdLine[n - 2] - sigArr[sn - 2],
-    };
-  }
-
-  _vwap(candles) {
-    let cumVP = 0, cumV = 0;
-    for (const c of candles) {
-      const tp = (c.high + c.low + c.close) / 3;
-      cumVP += tp * c.volume;
-      cumV  += c.volume;
+  _regimeScore(regime) {
+    switch (regime) {
+      case "BULL_STRONG": return 25;
+      case "BULL_WEAK":   return 15;
+      case "RANGE":       return 0;
+      case "BEAR_WEAK":   return -10;
+      case "BEAR_STRONG": return -999;
+      default:            return 0;
     }
-    return cumV > 0 ? cumVP / cumV : 0;
   }
 
-  _rsi(closes, p = 14) {
-    if (closes.length < p + 1) return 50;
-    let g = 0, l = 0;
-    for (let i = closes.length - p; i < closes.length; i++) {
-      const d = closes[i] - closes[i - 1];
-      if (d > 0) g += d; else l -= d;
-    }
-    const al = l / p;
-    return al === 0 ? 99 : 100 - 100 / (1 + (g / p) / al);
-  }
+  // ─── Dashboard Summary ──────────────────────────────
 
-  _atr(candles) {
-    if (candles.length < 2) return 0;
-    const trs = candles.slice(1).map((c, i) =>
-      Math.max(
-        c.high - c.low,
-        Math.abs(c.high - candles[i].close),
-        Math.abs(c.low  - candles[i].close)
-      )
-    );
-    return trs.reduce((s, v) => s + v, 0) / trs.length;
-  }
-
-  _avg(arr) {
-    return arr.length ? arr.reduce((s, v) => s + v, 0) / arr.length : 0;
-  }
-
-  // ── 대시보드 요약 ────────────────────────────────────
   getSummary() {
     const pos  = this.sim.position;
     const init = this.initialCapital;
     const inPos = pos ? pos.budget : 0;
     const total = this.sim.cash + inPos;
     return {
-      name: "A — 신호퓨전 스윙 v3",
+      name: "A -- 1h Swing v3 (BTC)",
       pnlRate:     +((total - init) / init * 100).toFixed(3),
       totalAsset:  Math.round(total),
       realizedPnl: Math.round(this.sim.realizedPnl),
@@ -730,22 +615,24 @@ class StrategyA {
       wins: this.sim.wins, losses: this.sim.losses,
       winRate: this.sim.totalTrades > 0
         ? +(this.sim.wins / this.sim.totalTrades * 100).toFixed(1) : null,
-      regime:    this.regimeEngine?.getRegime?.() ?? "N/A",
       position: pos ? {
-        market:       pos.market,
-        entryPrice:   Math.round(pos.entryPrice),
-        targetPrice:  Math.round(pos.targetPrice),
-        stopPrice:    Math.round(pos.stopPrice),
-        peakPrice:    Math.round(pos.peakPrice),
-        trailActive:  pos.trailActive,
-        openedAt:     pos.openedAt,
-        entryScore:   pos.entryScore,
-        entryReasons: pos.entryReasons,
-        regime:       pos.regime,
+        market:      pos.market,
+        entryPrice:  Math.round(pos.entryPrice),
+        targetPrice: Math.round(pos.targetPrice),
+        stopPrice:   Math.round(pos.stopPrice),
+        peakPrice:   Math.round(pos.peakPrice),
+        trailActive: pos.trailActive,
+        openedAt:    pos.openedAt,
+        entryScore:  pos.entryScore,
+        regime:      pos.regime,
       } : null,
-      livePosition:  this.livePosition,
-      history:       this.sim.history.slice(0, 8),
-      tradeReturns:  this.sim.tradeReturns,
+      livePosition: this.livePosition ? {
+        market:     this.livePosition.market,
+        entryPrice: Math.round(this.livePosition.entryPrice),
+        stopPrice:  Math.round(this.livePosition.stopPrice),
+      } : null,
+      history:      this.sim.history.slice(0, 8),
+      wsActive:     this._wsActive,
     };
   }
 }

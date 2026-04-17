@@ -1,69 +1,69 @@
-"use strict";
+'use strict';
+
+const CFG = require("./config");
 
 /**
- * ArbDataLogger — 글로벌 아비트라지 데이터 축적 엔진
+ * ArbDataLogger — SQLite 아비트라지 데이터 축적 엔진
  *
- * 24일까지 시뮬레이션 데이터 축적 → 분석 → 실전 투입
+ * DB: arb-data.db (better-sqlite3)
  *
- * 수집 데이터:
- *   1) price_snapshots  — 6개 거래소 가격 (30초 간격)
- *   2) spread_events    — 차익 기회 (감지/실행/스킵)
- *   3) arb_executions   — 시뮬 실행 결과 (P&L)
- *   4) orderbook_depth  — 호가 깊이 (5분 간격)
- *   5) daily_summary    — 일별 집계
+ * 테이블 5개:
+ *   1) price_snapshots   — 30초 간격, 거래소별 가격
+ *   2) spread_events     — 차익 기회 감지 이벤트
+ *   3) arb_executions    — 실행 결과 (시뮬/실전)
+ *   4) orderbook_depth   — 5분 간격, 호가 깊이 (JSON)
+ *   5) daily_summary     — 일별 집계
  *
- * 백업: 1시간마다 SQLite WAL 체크포인트 + 일별 CSV 내보내기
+ * WAL 모드 (동시 읽기), 1시간 WAL 백업, 자정 CSV 내보내기
+ *
+ * 필요 패키지: npm install better-sqlite3
  */
 
 let Database;
-try { Database = require("better-sqlite3"); } catch { Database = null; }
+try { Database = require('better-sqlite3'); } catch {
+  Database = null;
+}
 
-const fs   = require("fs");
-const path = require("path");
+const fs   = require('fs');
+const path = require('path');
 
-const SNAPSHOT_INTERVAL   = 30_000;   // 30초
-const DEPTH_INTERVAL      = 5 * 60_000; // 5분
-const BACKUP_INTERVAL     = 60 * 60_000; // 1시간
-const DAILY_EXPORT_HOUR   = 0; // 자정에 전일 데이터 CSV 내보내기
+const SNAPSHOT_INTERVAL_MS = 30_000;       // 30초
+const DEPTH_INTERVAL_MS    = 5 * 60_000;   // 5분
+const WAL_BACKUP_INTERVAL  = 60 * 60_000;  // 1시간
+const DAILY_EXPORT_HOUR    = 0;            // 자정
 
 class ArbDataLogger {
   /**
    * @param {Object} opts
-   * @param {string} opts.dbPath      - SQLite 경로
-   * @param {string} opts.backupDir   - 백업 디렉토리
+   * @param {string} opts.dbPath      - SQLite 파일 경로 (기본: ./arb-data.db)
+   * @param {string} opts.backupDir   - CSV 백업 디렉토리 (기본: ./arb-backups)
    * @param {Object} opts.exchanges   - { name: ExchangeAdapter }
-   * @param {Object} opts.crossArb    - CrossExchangeArb 인스턴스
-   * @param {Object} opts.arbExecutor - ArbExecutor 인스턴스
-   * @param {number} opts.usdKrw      - 환율
+   * @param {number} opts.usdKrw      - USD/KRW 환율
    */
   constructor({
-    dbPath = "./arb-data.db",
-    backupDir = "./arb-backups",
+    dbPath    = './arb-data.db',
+    backupDir = './arb-backups',
     exchanges = {},
-    crossArb = null,
-    arbExecutor = null,
-    usdKrw = 1350,
+    usdKrw    = CFG.DEFAULT_USD_KRW,
   } = {}) {
     this._dbPath    = dbPath;
     this._backupDir = backupDir;
     this._exchanges = exchanges;
-    this._crossArb  = crossArb;
-    this._arbExec   = arbExecutor;
     this._usdKrw    = usdKrw;
     this._db        = null;
+    this._stmts     = {};
     this._ready     = false;
-    this._timers    = [];
     this._running   = false;
+    this._timers    = [];
 
-    // 통계
     this._stats = {
-      snapshots:    0,
-      spreads:      0,
-      executions:   0,
-      depths:       0,
-      exports:      0,
-      errors:       0,
-      startedAt:    null,
+      snapshots:  0,
+      spreads:    0,
+      executions: 0,
+      depths:     0,
+      exports:    0,
+      errors:     0,
+      startedAt:  null,
     };
 
     this._init();
@@ -71,9 +71,11 @@ class ArbDataLogger {
 
   setUsdKrw(rate) { if (rate > 0) this._usdKrw = rate; }
 
+  // ── 초기화 ─────────────────────────────────────────────
+
   _init() {
     if (!Database) {
-      console.warn("[ArbData] better-sqlite3 없음 — 데이터 축적 비활성화");
+      console.warn('[ArbDataLogger] better-sqlite3 없음 — 데이터 축적 비활성화');
       return;
     }
 
@@ -84,159 +86,161 @@ class ArbDataLogger {
       }
 
       this._db = new Database(this._dbPath);
-      this._db.pragma("journal_mode = WAL");
-      this._db.pragma("synchronous = NORMAL");
+      this._db.pragma('journal_mode = WAL');
+      this._db.pragma('synchronous = NORMAL');
       this._migrate();
       this._ready = true;
-      console.log(`[ArbData] 초기화 완료 — ${this._dbPath}`);
+      console.log(`[ArbDataLogger] 초기화 완료 — ${this._dbPath}`);
     } catch (e) {
-      console.error(`[ArbData] 초기화 실패: ${e.message}`);
+      console.error(`[ArbDataLogger] 초기화 실패: ${e.message}`);
     }
   }
 
   _migrate() {
+    const SCHEMA_VERSION = 2;
+    const currentVersion = this._db.pragma('user_version', { simple: true });
+
+    if (currentVersion !== SCHEMA_VERSION) {
+      // Rename any legacy tables to preserve old data, then recreate fresh
+      const legacySuffix = `_legacy_v${currentVersion}_${Date.now()}`;
+      const tables = ['price_snapshots', 'spread_events', 'arb_executions', 'orderbook_depth', 'daily_summary'];
+      for (const t of tables) {
+        const exists = this._db.prepare(
+          `SELECT name FROM sqlite_master WHERE type='table' AND name=?`
+        ).get(t);
+        if (exists) {
+          try {
+            this._db.exec(`ALTER TABLE ${t} RENAME TO ${t}${legacySuffix}`);
+            console.log(`[ArbDataLogger] legacy table preserved: ${t}${legacySuffix}`);
+          } catch (e) {
+            console.warn(`[ArbDataLogger] could not rename ${t}: ${e.message} — dropping`);
+            this._db.exec(`DROP TABLE IF EXISTS ${t}`);
+          }
+        }
+      }
+      this._db.pragma(`user_version = ${SCHEMA_VERSION}`);
+    }
+
     this._db.exec(`
-      -- 가격 스냅샷 (6개 거래소, 30초 간격)
+      -- 1) 가격 스냅샷 (30초 간격)
       CREATE TABLE IF NOT EXISTS price_snapshots (
-        id         INTEGER PRIMARY KEY AUTOINCREMENT,
-        coin       TEXT    NOT NULL,
-        exchange   TEXT    NOT NULL,
-        price_raw  REAL    NOT NULL,
-        price_usd  REAL    NOT NULL,
-        quote_ccy  TEXT    NOT NULL,
-        volume_24h REAL    DEFAULT NULL,
-        ts         INTEGER NOT NULL
+        id        INTEGER PRIMARY KEY AUTOINCREMENT,
+        timestamp INTEGER NOT NULL,
+        exchange  TEXT    NOT NULL,
+        symbol    TEXT    NOT NULL,
+        bid       REAL,
+        ask       REAL,
+        price     REAL    NOT NULL,
+        volume    REAL    DEFAULT 0
       );
-      CREATE INDEX IF NOT EXISTS idx_snap_coin_ts ON price_snapshots(coin, ts);
-      CREATE INDEX IF NOT EXISTS idx_snap_ts ON price_snapshots(ts);
+      CREATE INDEX IF NOT EXISTS idx_ps_ts     ON price_snapshots(timestamp);
+      CREATE INDEX IF NOT EXISTS idx_ps_sym_ts ON price_snapshots(symbol, timestamp);
 
-      -- 스프레드 이벤트 (차익 기회 감지)
+      -- 2) 스프레드 이벤트
       CREATE TABLE IF NOT EXISTS spread_events (
-        id             INTEGER PRIMARY KEY AUTOINCREMENT,
-        coin           TEXT    NOT NULL,
-        buy_exchange   TEXT    NOT NULL,
-        sell_exchange  TEXT    NOT NULL,
-        buy_price_usd  REAL    NOT NULL,
-        sell_price_usd REAL    NOT NULL,
-        spread_pct     REAL    NOT NULL,
-        net_profit_pct REAL    NOT NULL,
-        source         TEXT    DEFAULT 'rest',
-        action         TEXT    DEFAULT 'detected',
-        skip_reason    TEXT    DEFAULT NULL,
-        ts             INTEGER NOT NULL
-      );
-      CREATE INDEX IF NOT EXISTS idx_spread_ts ON spread_events(ts);
-      CREATE INDEX IF NOT EXISTS idx_spread_coin ON spread_events(coin);
-
-      -- 아비트라지 실행 결과 (시뮬/실전)
-      CREATE TABLE IF NOT EXISTS arb_executions (
         id              INTEGER PRIMARY KEY AUTOINCREMENT,
-        coin            TEXT    NOT NULL,
+        timestamp       INTEGER NOT NULL,
         buy_exchange    TEXT    NOT NULL,
         sell_exchange   TEXT    NOT NULL,
-        buy_price_usd   REAL    NOT NULL,
-        sell_price_usd  REAL    NOT NULL,
-        quantity        REAL    NOT NULL,
-        position_usd    REAL    NOT NULL,
+        symbol          TEXT    NOT NULL,
         spread_pct      REAL    NOT NULL,
-        profit_usd      REAL    NOT NULL,
-        profit_pct      REAL    NOT NULL,
-        slippage_pct    REAL    DEFAULT 0,
-        dry_run         INTEGER DEFAULT 1,
-        ts              INTEGER NOT NULL
+        net_spread_pct  REAL    NOT NULL
       );
-      CREATE INDEX IF NOT EXISTS idx_exec_ts ON arb_executions(ts);
+      CREATE INDEX IF NOT EXISTS idx_se_ts ON spread_events(timestamp);
 
-      -- 호가 깊이 (5분 간격)
-      CREATE TABLE IF NOT EXISTS orderbook_depth (
-        id           INTEGER PRIMARY KEY AUTOINCREMENT,
-        coin         TEXT    NOT NULL,
-        exchange     TEXT    NOT NULL,
-        bid_depth_usd REAL   NOT NULL,
-        ask_depth_usd REAL   NOT NULL,
-        bid_count    INTEGER DEFAULT 0,
-        ask_count    INTEGER DEFAULT 0,
-        spread_bps   REAL    DEFAULT NULL,
-        ts           INTEGER NOT NULL
-      );
-      CREATE INDEX IF NOT EXISTS idx_depth_ts ON orderbook_depth(ts);
-
-      -- 일별 요약
-      CREATE TABLE IF NOT EXISTS daily_summary (
+      -- 3) 아비트라지 실행 결과
+      CREATE TABLE IF NOT EXISTS arb_executions (
         id              INTEGER PRIMARY KEY AUTOINCREMENT,
-        date            TEXT    NOT NULL UNIQUE,
-        total_snapshots INTEGER DEFAULT 0,
-        total_spreads   INTEGER DEFAULT 0,
-        total_execs     INTEGER DEFAULT 0,
-        avg_kimchi_prem REAL    DEFAULT NULL,
-        max_spread_pct  REAL    DEFAULT 0,
-        total_profit_usd REAL   DEFAULT 0,
-        win_count       INTEGER DEFAULT 0,
-        loss_count      INTEGER DEFAULT 0,
-        best_coin       TEXT    DEFAULT NULL,
-        exchanges_active INTEGER DEFAULT 0
+        timestamp       INTEGER NOT NULL,
+        buy_exchange    TEXT    NOT NULL,
+        sell_exchange   TEXT    NOT NULL,
+        symbol          TEXT    NOT NULL,
+        amount          REAL    NOT NULL,
+        spread_pct      REAL    NOT NULL,
+        pnl             REAL    NOT NULL,
+        status          TEXT    DEFAULT 'completed'
+      );
+      CREATE INDEX IF NOT EXISTS idx_ae_ts ON arb_executions(timestamp);
+
+      -- 4) 호가 깊이 (5분 간격, JSON)
+      CREATE TABLE IF NOT EXISTS orderbook_depth (
+        id              INTEGER PRIMARY KEY AUTOINCREMENT,
+        timestamp       INTEGER NOT NULL,
+        exchange        TEXT    NOT NULL,
+        symbol          TEXT    NOT NULL,
+        bid_depth_json  TEXT,
+        ask_depth_json  TEXT
+      );
+      CREATE INDEX IF NOT EXISTS idx_od_ts ON orderbook_depth(timestamp);
+
+      -- 5) 일별 요약
+      CREATE TABLE IF NOT EXISTS daily_summary (
+        id                  INTEGER PRIMARY KEY AUTOINCREMENT,
+        date                TEXT    NOT NULL UNIQUE,
+        total_opportunities INTEGER DEFAULT 0,
+        executed            INTEGER DEFAULT 0,
+        total_pnl           REAL    DEFAULT 0,
+        avg_spread          REAL    DEFAULT 0
       );
     `);
 
     // 프리페어드 스테이트먼트
     this._stmts = {
-      insertSnap: this._db.prepare(`
-        INSERT INTO price_snapshots (coin, exchange, price_raw, price_usd, quote_ccy, volume_24h, ts)
+      insertSnapshot: this._db.prepare(`
+        INSERT INTO price_snapshots (timestamp, exchange, symbol, bid, ask, price, volume)
         VALUES (?, ?, ?, ?, ?, ?, ?)
       `),
       insertSpread: this._db.prepare(`
-        INSERT INTO spread_events (coin, buy_exchange, sell_exchange, buy_price_usd, sell_price_usd, spread_pct, net_profit_pct, source, action, skip_reason, ts)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        INSERT INTO spread_events (timestamp, buy_exchange, sell_exchange, symbol, spread_pct, net_spread_pct)
+        VALUES (?, ?, ?, ?, ?, ?)
       `),
-      insertExec: this._db.prepare(`
-        INSERT INTO arb_executions (coin, buy_exchange, sell_exchange, buy_price_usd, sell_price_usd, quantity, position_usd, spread_pct, profit_usd, profit_pct, slippage_pct, dry_run, ts)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-      `),
-      insertDepth: this._db.prepare(`
-        INSERT INTO orderbook_depth (coin, exchange, bid_depth_usd, ask_depth_usd, bid_count, ask_count, spread_bps, ts)
+      insertExecution: this._db.prepare(`
+        INSERT INTO arb_executions (timestamp, buy_exchange, sell_exchange, symbol, amount, spread_pct, pnl, status)
         VALUES (?, ?, ?, ?, ?, ?, ?, ?)
       `),
+      insertDepth: this._db.prepare(`
+        INSERT INTO orderbook_depth (timestamp, exchange, symbol, bid_depth_json, ask_depth_json)
+        VALUES (?, ?, ?, ?, ?)
+      `),
       upsertDaily: this._db.prepare(`
-        INSERT INTO daily_summary (date, total_snapshots, total_spreads, total_execs, avg_kimchi_prem, max_spread_pct, total_profit_usd, win_count, loss_count, best_coin, exchanges_active)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        INSERT INTO daily_summary (date, total_opportunities, executed, total_pnl, avg_spread)
+        VALUES (?, ?, ?, ?, ?)
         ON CONFLICT(date) DO UPDATE SET
-          total_snapshots = excluded.total_snapshots,
-          total_spreads   = excluded.total_spreads,
-          total_execs     = excluded.total_execs,
-          avg_kimchi_prem = excluded.avg_kimchi_prem,
-          max_spread_pct  = excluded.max_spread_pct,
-          total_profit_usd = excluded.total_profit_usd,
-          win_count       = excluded.win_count,
-          loss_count      = excluded.loss_count,
-          best_coin       = excluded.best_coin,
-          exchanges_active = excluded.exchanges_active
+          total_opportunities = excluded.total_opportunities,
+          executed            = excluded.executed,
+          total_pnl           = excluded.total_pnl,
+          avg_spread          = excluded.avg_spread
       `),
     };
   }
 
-  // ── 시작/종료 ──────────────────────────────────────────────
+  // ── 시작/종료 ──────────────────────────────────────────
 
   async start() {
     if (!this._ready || this._running) return;
     this._running = true;
     this._stats.startedAt = Date.now();
 
-    console.log(`[ArbData] 데이터 축적 시작 — 스냅샷:${SNAPSHOT_INTERVAL/1000}초, 호가:${DEPTH_INTERVAL/60000}분, 백업:${BACKUP_INTERVAL/3600000}시간`);
+    console.log(
+      `[ArbDataLogger] 데이터 축적 시작 — ` +
+      `스냅샷:${SNAPSHOT_INTERVAL_MS / 1000}초, 호가:${DEPTH_INTERVAL_MS / 60_000}분, ` +
+      `WAL백업:${WAL_BACKUP_INTERVAL / 3600_000}시간`
+    );
 
     // 가격 스냅샷 (30초)
-    this._timers.push(setInterval(() => this._captureSnapshots().catch(this._err), SNAPSHOT_INTERVAL));
+    this._timers.push(setInterval(() => this._captureSnapshots().catch(this._onErr), SNAPSHOT_INTERVAL_MS));
 
     // 호가 깊이 (5분)
-    this._timers.push(setInterval(() => this._captureDepth().catch(this._err), DEPTH_INTERVAL));
+    this._timers.push(setInterval(() => this._captureDepth().catch(this._onErr), DEPTH_INTERVAL_MS));
 
-    // 백업 (1시간)
-    this._timers.push(setInterval(() => this._backup(), BACKUP_INTERVAL));
+    // WAL 백업 (1시간)
+    this._timers.push(setInterval(() => this._walBackup(), WAL_BACKUP_INTERVAL));
 
-    // 일별 CSV 내보내기 (1분마다 체크, 자정에 실행)
-    this._timers.push(setInterval(() => this._checkDailyExport(), 60_000));
+    // 일별 CSV 내보내기 (1분 체크, 자정 실행)
+    this._timers.push(setInterval(() => this._checkMidnightExport(), 60_000));
 
     // 즉시 1회 스냅샷
-    await this._captureSnapshots().catch(this._err);
+    await this._captureSnapshots().catch(this._onErr);
   }
 
   stop() {
@@ -244,194 +248,181 @@ class ArbDataLogger {
     for (const t of this._timers) clearInterval(t);
     this._timers = [];
 
-    // 종료 전 WAL 체크포인트 (백업은 DB 열려 있을 때만)
     if (this._db) {
-      try { this._db.pragma("wal_checkpoint(TRUNCATE)"); } catch {}
+      try { this._db.pragma('wal_checkpoint(TRUNCATE)'); } catch {}
       try { this._db.close(); } catch {}
     }
-    console.log(`[ArbData] 종료 — 스냅샷:${this._stats.snapshots}, 스프레드:${this._stats.spreads}, 실행:${this._stats.executions}`);
+    console.log(
+      `[ArbDataLogger] 종료 — 스냅샷:${this._stats.snapshots}, ` +
+      `스프레드:${this._stats.spreads}, 실행:${this._stats.executions}`
+    );
   }
 
-  _err = (e) => {
+  _onErr = (e) => {
     this._stats.errors++;
-    console.error(`[ArbData] ${e.message}`);
-  }
+    console.error(`[ArbDataLogger] ${e.message}`);
+  };
 
-  // ── 가격 스냅샷 수집 ──────────────────────────────────────
+  // ── 가격 스냅샷 수집 (30초) ────────────────────────────
 
   async _captureSnapshots() {
     if (!this._ready) return;
     const now = Date.now();
-    // 핵심 코인만 (메모리 절약)
-    const coins = ["BTC", "ETH", "XRP", "SOL", "DOGE"];
+    // 실전 데이터 기반: ARB/OP가 실제 스프레드 발생 코인 (BTC/ETH 아님)
+    const coins = ['BTC', 'ETH', 'XRP', 'SOL', 'DOGE', 'ADA', 'AVAX', 'ARB', 'OP'];
     const exchangeList = Object.entries(this._exchanges);
 
-    // 거래소별 순차 처리 (동시 요청 폭발 방지)
-    const allRows = [];
+    const rows = [];
+    const failures = {};
     for (const [name, ex] of exchangeList) {
       const batch = await Promise.allSettled(
         coins.map(coin =>
-          ex.getTicker(coin)
-            .then(t => ({
-              coin, exchange: name,
-              priceRaw: t.price,
-              priceUsd: ex.quoteCurrency === "KRW" ? t.price / this._usdKrw : t.price,
-              quoteCcy: ex.quoteCurrency,
-              volume: t.volume24h,
-            }))
-            .catch(() => null)
+          ex.getTicker(coin).then(t => ({
+            exchange: name, symbol: coin,
+            bid:    t.bid    || t.price,
+            ask:    t.ask    || t.price,
+            price:  t.price,
+            volume: t.volume24h || 0,
+          }))
         )
       );
-      for (const r of batch) {
-        if (r.status === "fulfilled" && r.value) allRows.push(r.value);
+      for (let i = 0; i < batch.length; i++) {
+        const r = batch[i];
+        if (r.status === 'fulfilled' && r.value) {
+          rows.push(r.value);
+        } else {
+          failures[name] = failures[name] || [];
+          failures[name].push(`${coins[i]}:${r.reason?.message || 'null'}`);
+        }
       }
-      // 거래소 간 100ms 간격 (rate limit 보호)
       await new Promise(r => setTimeout(r, 100));
     }
+    if (Object.keys(failures).length > 0 && this._stats.snapshots === 0) {
+      console.warn('[ArbDataLogger] snapshot failures:', JSON.stringify(failures));
+    }
 
-    if (allRows.length > 0) {
-      const insertMany = this._db.transaction((rows) => {
-        for (const r of rows) {
-          this._stmts.insertSnap.run(
-            r.coin, r.exchange, r.priceRaw, r.priceUsd, r.quoteCcy, r.volume, now
-          );
+    if (rows.length > 0) {
+      const insertMany = this._db.transaction((items) => {
+        for (const r of items) {
+          this._stmts.insertSnapshot.run(now, r.exchange, r.symbol, r.bid, r.ask, r.price, r.volume);
         }
       });
-      insertMany(allRows);
-      this._stats.snapshots += allRows.length;
+      insertMany(rows);
+      this._stats.snapshots += rows.length;
     }
   }
 
-  // ── 스프레드 이벤트 기록 ──────────────────────────────────
+  // ── 스프레드 이벤트 기록 ───────────────────────────────
 
   logSpreadEvent(event) {
     if (!this._ready) return;
     try {
       this._stmts.insertSpread.run(
-        event.coin,
+        event.timestamp || Date.now(),
         event.buyExchange,
         event.sellExchange,
-        event.buyPrice,
-        event.sellPrice,
-        event.spreadPct,
-        event.netProfitPct || 0,
-        event.source || "rest",
-        event.action || "detected",
-        event.skipReason || null,
-        event.ts || Date.now()
+        event.symbol,
+        event.spread      || event.spreadPct || 0,
+        event.netSpread   || event.netSpreadPct || 0,
       );
       this._stats.spreads++;
-    } catch (e) { this._err(e); }
+    } catch (e) { this._onErr(e); }
   }
 
-  // ── 실행 결과 기록 ────────────────────────────────────────
+  // ── 실행 결과 기록 ─────────────────────────────────────
 
   logExecution(result) {
     if (!this._ready || !result.executed) return;
     try {
-      this._stmts.insertExec.run(
-        result.coin,
+      this._stmts.insertExecution.run(
+        result.timestamp || Date.now(),
         result.buyExchange,
         result.sellExchange,
-        result.buyPrice,
-        result.sellPrice,
-        result.quantity || 0,
-        result.positionUsd || 0,
-        result.spreadPct || 0,
-        result.profitUsd || 0,
-        result.profitPct || 0,
-        result.slippage || 0,
-        result.dryRun ? 1 : 0,
-        result.timestamp || Date.now()
+        result.coin || result.symbol,
+        result.positionUsd || result.amount || 0,
+        result.spreadPct   || 0,
+        result.profitUsd   || result.pnl || 0,
+        result.dryRun ? 'dry_run' : 'completed',
       );
       this._stats.executions++;
-    } catch (e) { this._err(e); }
+    } catch (e) { this._onErr(e); }
   }
 
-  // ── 호가 깊이 수집 ────────────────────────────────────────
+  // ── 호가 깊이 수집 (5분) ──────────────────────────────
 
   async _captureDepth() {
     if (!this._ready) return;
     const now = Date.now();
-    const coins = ["BTC", "ETH"];  // 핵심 2개만 (메모리 절약)
+    const coins = ['BTC', 'ETH'];
 
-    const allRows = [];
+    const rows = [];
     for (const [name, ex] of Object.entries(this._exchanges)) {
+      if (!ex.getOrderbook) continue;
       const batch = await Promise.allSettled(
         coins.map(coin =>
-          ex.getOrderbook(coin, 5)  // depth 5로 축소
-            .then(ob => {
-              const bidDepth = ob.bids.reduce((s, b) => {
-                const p = ex.quoteCurrency === "KRW" ? b.price / this._usdKrw : b.price;
-                return s + p * b.qty;
-              }, 0);
-              const askDepth = ob.asks.reduce((s, a) => {
-                const p = ex.quoteCurrency === "KRW" ? a.price / this._usdKrw : a.price;
-                return s + p * a.qty;
-              }, 0);
-              const bestBid = ob.bids[0]?.price || 0;
-              const bestAsk = ob.asks[0]?.price || 0;
-              const spreadBps = bestBid > 0 ? (bestAsk - bestBid) / bestBid * 10000 : 0;
-              return { coin, exchange: name, bidDepth, askDepth, bidCount: ob.bids.length, askCount: ob.asks.length, spreadBps };
-            })
+          ex.getOrderbook(coin, 5)
+            .then(ob => ({
+              exchange:     name,
+              symbol:       coin,
+              bidDepthJson: JSON.stringify(ob.bids || []),
+              askDepthJson: JSON.stringify(ob.asks || []),
+            }))
             .catch(() => null)
         )
       );
       for (const r of batch) {
-        if (r.status === "fulfilled" && r.value) allRows.push(r.value);
+        if (r.status === 'fulfilled' && r.value) rows.push(r.value);
       }
       await new Promise(r => setTimeout(r, 100));
     }
 
-    if (allRows.length > 0) {
-      const insertMany = this._db.transaction((rows) => {
-        for (const r of rows) {
-          this._stmts.insertDepth.run(r.coin, r.exchange, r.bidDepth, r.askDepth, r.bidCount, r.askCount, r.spreadBps, now);
+    if (rows.length > 0) {
+      const insertMany = this._db.transaction((items) => {
+        for (const r of items) {
+          this._stmts.insertDepth.run(now, r.exchange, r.symbol, r.bidDepthJson, r.askDepthJson);
         }
       });
-      insertMany(allRows);
-      this._stats.depths += allRows.length;
+      insertMany(rows);
+      this._stats.depths += rows.length;
     }
   }
 
-  // ── 백업 ──────────────────────────────────────────────────
+  // ── WAL 백업 (1시간) ──────────────────────────────────
 
-  _backup() {
+  _walBackup() {
     if (!this._db) return;
     try {
-      this._db.pragma("wal_checkpoint(TRUNCATE)");
+      this._db.pragma('wal_checkpoint(TRUNCATE)');
 
-      // DB 파일 복사
-      const ts = new Date().toISOString().replace(/[:.]/g, "-").slice(0, 16);
+      const ts   = new Date().toISOString().replace(/[:.]/g, '-').slice(0, 16);
       const dest = path.join(this._backupDir, `arb-data-${ts}.db`);
-      this._db.backup(dest).then(() => {
-        console.log(`[ArbData] 백업 완료 → ${dest}`);
-
-        // 오래된 백업 정리 (7일 이상)
-        this._cleanOldBackups();
-      }).catch(e => console.error(`[ArbData] 백업 실패: ${e.message}`));
+      this._db.backup(dest)
+        .then(() => {
+          console.log(`[ArbDataLogger] WAL 백업 완료 → ${dest}`);
+          this._cleanOldBackups();
+        })
+        .catch(e => console.error(`[ArbDataLogger] 백업 실패: ${e.message}`));
     } catch (e) {
-      console.error(`[ArbData] 백업 오류: ${e.message}`);
+      console.error(`[ArbDataLogger] WAL 체크포인트 오류: ${e.message}`);
     }
   }
 
   _cleanOldBackups() {
     try {
       const cutoff = Date.now() - 7 * 24 * 60 * 60_000;
-      const files = fs.readdirSync(this._backupDir);
+      const files  = fs.readdirSync(this._backupDir);
       for (const f of files) {
-        const fp = path.join(this._backupDir, f);
+        if (!f.endsWith('.db')) continue;
+        const fp   = path.join(this._backupDir, f);
         const stat = fs.statSync(fp);
-        if (stat.mtimeMs < cutoff) {
-          fs.unlinkSync(fp);
-        }
+        if (stat.mtimeMs < cutoff) fs.unlinkSync(fp);
       }
     } catch {}
   }
 
-  // ── 일별 CSV 내보내기 ─────────────────────────────────────
+  // ── 자정 CSV 내보내기 ──────────────────────────────────
 
-  _checkDailyExport() {
+  _checkMidnightExport() {
     const now = new Date();
     if (now.getHours() === DAILY_EXPORT_HOUR && now.getMinutes() === 0) {
       this._exportDailyCSV();
@@ -443,40 +434,55 @@ class ArbDataLogger {
     if (!this._db) return;
     try {
       const yesterday = new Date(Date.now() - 86400_000).toISOString().slice(0, 10);
-      const startTs = new Date(yesterday + "T00:00:00").getTime();
-      const endTs   = startTs + 86400_000;
+      const startTs   = new Date(yesterday + 'T00:00:00').getTime();
+      const endTs     = startTs + 86400_000;
 
-      // 스프레드 이벤트 CSV
+      // spread_events CSV
       const spreads = this._db.prepare(
-        `SELECT * FROM spread_events WHERE ts >= ? AND ts < ? ORDER BY ts`
+        'SELECT * FROM spread_events WHERE timestamp >= ? AND timestamp < ? ORDER BY timestamp'
       ).all(startTs, endTs);
 
       if (spreads.length > 0) {
         const csvPath = path.join(this._backupDir, `spreads-${yesterday}.csv`);
-        const header = "ts,coin,buy_exchange,sell_exchange,buy_price,sell_price,spread_pct,net_profit_pct,source,action,skip_reason\n";
-        const rows = spreads.map(r =>
-          `${r.ts},${r.coin},${r.buy_exchange},${r.sell_exchange},${r.buy_price_usd},${r.sell_price_usd},${r.spread_pct},${r.net_profit_pct},${r.source},${r.action},${r.skip_reason || ""}`
-        ).join("\n");
+        const header  = 'timestamp,buy_exchange,sell_exchange,symbol,spread_pct,net_spread_pct\n';
+        const rows    = spreads.map(r =>
+          `${r.timestamp},${r.buy_exchange},${r.sell_exchange},${r.symbol},${r.spread_pct},${r.net_spread_pct}`
+        ).join('\n');
         fs.writeFileSync(csvPath, header + rows);
-        this._stats.exports++;
-        console.log(`[ArbData] CSV 내보내기 → ${csvPath} (${spreads.length}건)`);
+        console.log(`[ArbDataLogger] CSV 내보내기 → ${csvPath} (${spreads.length}건)`);
       }
 
-      // 실행 결과 CSV
+      // arb_executions CSV
       const execs = this._db.prepare(
-        `SELECT * FROM arb_executions WHERE ts >= ? AND ts < ? ORDER BY ts`
+        'SELECT * FROM arb_executions WHERE timestamp >= ? AND timestamp < ? ORDER BY timestamp'
       ).all(startTs, endTs);
 
       if (execs.length > 0) {
         const csvPath = path.join(this._backupDir, `executions-${yesterday}.csv`);
-        const header = "ts,coin,buy_exchange,sell_exchange,buy_price,sell_price,qty,position_usd,spread_pct,profit_usd,profit_pct,slippage,dry_run\n";
-        const rows = execs.map(r =>
-          `${r.ts},${r.coin},${r.buy_exchange},${r.sell_exchange},${r.buy_price_usd},${r.sell_price_usd},${r.quantity},${r.position_usd},${r.spread_pct},${r.profit_usd},${r.profit_pct},${r.slippage_pct},${r.dry_run}`
-        ).join("\n");
+        const header  = 'timestamp,buy_exchange,sell_exchange,symbol,amount,spread_pct,pnl,status\n';
+        const rows    = execs.map(r =>
+          `${r.timestamp},${r.buy_exchange},${r.sell_exchange},${r.symbol},${r.amount},${r.spread_pct},${r.pnl},${r.status}`
+        ).join('\n');
         fs.writeFileSync(csvPath, header + rows);
       }
+
+      // price_snapshots CSV
+      const snaps = this._db.prepare(
+        'SELECT * FROM price_snapshots WHERE timestamp >= ? AND timestamp < ? ORDER BY timestamp'
+      ).all(startTs, endTs);
+
+      if (snaps.length > 0) {
+        const csvPath = path.join(this._backupDir, `prices-${yesterday}.csv`);
+        const header  = 'timestamp,exchange,symbol,bid,ask,price,volume\n';
+        const rows    = snaps.map(r =>
+          `${r.timestamp},${r.exchange},${r.symbol},${r.bid},${r.ask},${r.price},${r.volume}`
+        ).join('\n');
+        fs.writeFileSync(csvPath, header + rows);
+      }
+
+      this._stats.exports++;
     } catch (e) {
-      console.error(`[ArbData] CSV 내보내기 실패: ${e.message}`);
+      console.error(`[ArbDataLogger] CSV 내보내기 실패: ${e.message}`);
     }
   }
 
@@ -484,132 +490,69 @@ class ArbDataLogger {
     if (!this._db) return;
     try {
       const yesterday = new Date(Date.now() - 86400_000).toISOString().slice(0, 10);
-      const startTs = new Date(yesterday + "T00:00:00").getTime();
-      const endTs   = startTs + 86400_000;
-
-      const snapCount = this._db.prepare(
-        `SELECT COUNT(*) as cnt FROM price_snapshots WHERE ts >= ? AND ts < ?`
-      ).get(startTs, endTs)?.cnt || 0;
+      const startTs   = new Date(yesterday + 'T00:00:00').getTime();
+      const endTs     = startTs + 86400_000;
 
       const spreadCount = this._db.prepare(
-        `SELECT COUNT(*) as cnt FROM spread_events WHERE ts >= ? AND ts < ?`
+        'SELECT COUNT(*) as cnt FROM spread_events WHERE timestamp >= ? AND timestamp < ?'
       ).get(startTs, endTs)?.cnt || 0;
 
       const execStats = this._db.prepare(`
         SELECT
           COUNT(*) as cnt,
-          SUM(profit_usd) as totalProfit,
-          MAX(spread_pct) as maxSpread,
-          SUM(CASE WHEN profit_usd >= 0 THEN 1 ELSE 0 END) as wins,
-          SUM(CASE WHEN profit_usd < 0 THEN 1 ELSE 0 END) as losses
-        FROM arb_executions WHERE ts >= ? AND ts < ?
+          SUM(pnl) as totalPnl,
+          AVG(spread_pct) as avgSpread
+        FROM arb_executions WHERE timestamp >= ? AND timestamp < ?
       `).get(startTs, endTs);
-
-      // 김치프리미엄 평균 계산
-      const kimchi = this._db.prepare(`
-        SELECT AVG(s1.price_usd / s2.price_usd - 1) * 100 as avg_prem
-        FROM price_snapshots s1
-        JOIN price_snapshots s2 ON s1.coin = s2.coin AND s1.ts = s2.ts
-        WHERE s1.exchange = 'upbit' AND s2.exchange = 'binance'
-          AND s1.ts >= ? AND s1.ts < ?
-          AND s1.coin = 'BTC'
-      `).get(startTs, endTs);
-
-      const activeExchanges = this._db.prepare(`
-        SELECT COUNT(DISTINCT exchange) as cnt
-        FROM price_snapshots WHERE ts >= ? AND ts < ?
-      `).get(startTs, endTs)?.cnt || 0;
 
       this._stmts.upsertDaily.run(
         yesterday,
-        snapCount,
         spreadCount,
         execStats?.cnt || 0,
-        kimchi?.avg_prem || null,
-        execStats?.maxSpread || 0,
-        execStats?.totalProfit || 0,
-        execStats?.wins || 0,
-        execStats?.losses || 0,
-        null,
-        activeExchanges
+        execStats?.totalPnl || 0,
+        execStats?.avgSpread || 0,
       );
     } catch (e) {
-      console.error(`[ArbData] 일별 요약 실패: ${e.message}`);
+      console.error(`[ArbDataLogger] 일별 요약 실패: ${e.message}`);
     }
   }
 
-  // ── 조회 API (분석용) ─────────────────────────────────────
+  // ── 조회 API ───────────────────────────────────────────
 
   /** 특정 코인의 거래소별 가격 히스토리 */
-  getPriceHistory(coin, hours = 24) {
+  getPriceHistory(symbol, hours = 24) {
     if (!this._db) return [];
     const since = Date.now() - hours * 3600_000;
-    return this._db.prepare(`
-      SELECT exchange, price_usd, ts
-      FROM price_snapshots
-      WHERE coin = ? AND ts >= ?
-      ORDER BY ts
-    `).all(coin, since);
+    return this._db.prepare(
+      'SELECT exchange, price, timestamp FROM price_snapshots WHERE symbol = ? AND timestamp >= ? ORDER BY timestamp'
+    ).all(symbol, since);
   }
 
-  /** 스프레드 분포 (분석용) */
+  /** 스프레드 분포 분석 */
   getSpreadDistribution(hours = 24) {
     if (!this._db) return [];
     const since = Date.now() - hours * 3600_000;
     return this._db.prepare(`
-      SELECT
-        coin,
-        buy_exchange,
-        sell_exchange,
-        COUNT(*) as count,
-        AVG(spread_pct) as avgSpread,
-        MAX(spread_pct) as maxSpread,
-        MIN(spread_pct) as minSpread,
-        AVG(net_profit_pct) as avgNetProfit
-      FROM spread_events
-      WHERE ts >= ?
-      GROUP BY coin, buy_exchange, sell_exchange
-      ORDER BY avgSpread DESC
-    `).all(since);
-  }
-
-  /** 김치프리미엄 히스토리 */
-  getKimchiPremiumHistory(hours = 24) {
-    if (!this._db) return [];
-    const since = Date.now() - hours * 3600_000;
-    return this._db.prepare(`
-      SELECT
-        s1.ts,
-        s1.price_usd as upbit_usd,
-        s2.price_usd as binance_usd,
-        (s1.price_usd / s2.price_usd - 1) * 100 as premium_pct
-      FROM price_snapshots s1
-      JOIN price_snapshots s2 ON s1.coin = s2.coin AND s1.ts = s2.ts
-      WHERE s1.exchange = 'upbit' AND s2.exchange = 'binance'
-        AND s1.coin = 'BTC'
-        AND s1.ts >= ?
-      ORDER BY s1.ts
+      SELECT symbol, buy_exchange, sell_exchange,
+        COUNT(*) as count, AVG(spread_pct) as avg_spread,
+        MAX(spread_pct) as max_spread, AVG(net_spread_pct) as avg_net
+      FROM spread_events WHERE timestamp >= ?
+      GROUP BY symbol, buy_exchange, sell_exchange
+      ORDER BY avg_spread DESC
     `).all(since);
   }
 
   /** 수익성 분석 */
   getProfitAnalysis(days = 7) {
-    if (!this._db) return {};
+    if (!this._db) return [];
     const since = Date.now() - days * 86400_000;
     return this._db.prepare(`
-      SELECT
-        coin,
-        COUNT(*) as trades,
-        SUM(profit_usd) as totalProfit,
-        AVG(profit_pct) as avgProfitPct,
-        MAX(profit_pct) as bestTradePct,
-        AVG(spread_pct) as avgSpread,
-        SUM(CASE WHEN profit_usd >= 0 THEN 1 ELSE 0 END) as wins,
-        SUM(CASE WHEN profit_usd < 0 THEN 1 ELSE 0 END) as losses
-      FROM arb_executions
-      WHERE ts >= ?
-      GROUP BY coin
-      ORDER BY totalProfit DESC
+      SELECT symbol, COUNT(*) as trades, SUM(pnl) as total_pnl,
+        AVG(spread_pct) as avg_spread,
+        SUM(CASE WHEN pnl >= 0 THEN 1 ELSE 0 END) as wins,
+        SUM(CASE WHEN pnl < 0 THEN 1 ELSE 0 END) as losses
+      FROM arb_executions WHERE timestamp >= ?
+      GROUP BY symbol ORDER BY total_pnl DESC
     `).all(since);
   }
 
@@ -623,11 +566,11 @@ class ArbDataLogger {
     try { dbSize = fs.statSync(this._dbPath).size; } catch {}
 
     return {
-      running:    this._running,
-      uptimeHrs:  uptime,
-      stats:      { ...this._stats },
-      dbSizeMb:   +(dbSize / 1024 / 1024).toFixed(2),
-      backupDir:  this._backupDir,
+      running:   this._running,
+      uptimeHrs: uptime,
+      stats:     { ...this._stats },
+      dbSizeMb:  +(dbSize / 1024 / 1024).toFixed(2),
+      backupDir: this._backupDir,
     };
   }
 }
