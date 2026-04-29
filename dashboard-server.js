@@ -116,19 +116,19 @@ class DashboardServer {
   // ── 아비트라지 데이터 API ─────────────────────────────────
 
   _arbSpreads(res) {
-    const data = this.bot.arbDataLogger?.getSpreadDistribution(24) || [];
+    const data = this.bot.arbLogger?.getSpreadDistribution(24) || [];
     res.writeHead(200, { "Content-Type": "application/json", "Access-Control-Allow-Origin": "*" });
     res.end(JSON.stringify(data));
   }
 
   _arbKimchi(res) {
-    const data = this.bot.arbDataLogger?.getKimchiPremiumHistory(24) || [];
+    const data = this.bot.arbLogger?.getKimchiPremiumHistory(24) || [];
     res.writeHead(200, { "Content-Type": "application/json", "Access-Control-Allow-Origin": "*" });
     res.end(JSON.stringify(data));
   }
 
   _arbProfit(res) {
-    const data = this.bot.arbDataLogger?.getProfitAnalysis(7) || [];
+    const data = this.bot.arbLogger?.getProfitAnalysis(7) || [];
     res.writeHead(200, { "Content-Type": "application/json", "Access-Control-Allow-Origin": "*" });
     res.end(JSON.stringify(data));
   }
@@ -137,7 +137,7 @@ class DashboardServer {
   _getData() {
     const bot   = this.bot;
     const sim   = bot.mds?.state?.simulation;
-    const cal   = bot.calibration?.getSummary();
+    const cal   = bot.calibEngine?.getSummary();
     const snaps = (bot.mds?.state?.lastAnalysisSnapshots || []).slice(0, 6);
 
     // Strategy A/B 요약
@@ -208,15 +208,16 @@ class DashboardServer {
         riskPct:   +dailyRiskPct.toFixed(1),
       },
       cal: {
-        completed:    cal?.totalCompleted || 0,
+        completed:    cal?.totalTrades || 0,
         minNeeded:    20,
-        winRate:      cal?.currentWinRate != null ? +(cal.currentWinRate * 100).toFixed(1) : null,
-        onlineWinRate: cal?.onlineWinRate != null ? +(cal.onlineWinRate * 100).toFixed(1) : null,
-        ev:           cal?.calibratedConfig?.ev != null ? +(cal.calibratedConfig.ev * 100).toFixed(3) : null,
-        kelly:        cal?.calibratedConfig?.kellyFraction != null ? +(cal.calibratedConfig.kellyFraction * 100).toFixed(1) : null,
-        evPositive:   cal?.calibratedConfig?.evPositive || false,
-        mode:         cal?.mode || "CALIBRATING",
-        pending:      bot.calibration?.state?.pendingOutcomes?.length || 0,
+        winRate:      cal?.winRate != null ? +(cal.winRate * 100).toFixed(1) : null,
+        ev:           cal?.expectedValue != null ? +(cal.expectedValue * 100).toFixed(3) : null,
+        kelly:        cal?.kellyFraction != null ? +(cal.kellyFraction * 100).toFixed(1) : null,
+        halfKelly:    cal?.halfKelly != null ? +(cal.halfKelly * 100).toFixed(1) : null,
+        suggestedPosPct: cal?.suggestedPosPct != null ? +(cal.suggestedPosPct * 100).toFixed(1) : null,
+        payoffRatio:  cal?.payoffRatio || null,
+        evPositive:   cal?.expectedValue > 0,
+        mode:         cal?.mode || "WAITING",
       },
       position: pos ? {
         market:      pos.marketCode,
@@ -310,11 +311,11 @@ class DashboardServer {
       alpha: bot.alphaEngine?.getSummary() || null,
       // ── 글로벌 거래소 ──────────────────────────────────────
       globalListings: bot.listingScanner?.getSummary() || null,
-      crossArb:       bot.crossArb?.getSummary() || null,
+      crossArb:       bot.arb?.getSummary() || null,
       arbExecutor:    bot.arbExecutor?.getSummary() || null,
-      arbData:        bot.arbDataLogger?.getSummary() || null,
+      arbData:        bot.arbLogger?.getSummary() || null,
       rebalancer:     bot.rebalancer?.getSummary() || null,
-      multiExWs:      bot.multiExWs?.getSummary() || null,
+      multiExWs:      bot.arbMultiWs?.getSummary() || null,
     };
   }
 
