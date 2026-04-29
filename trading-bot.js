@@ -38,6 +38,10 @@ const { CrossExchangeArb }          = require("./cross-exchange-arb");
 const { ArbDataLogger }             = require("./arb-data-logger");
 const { ArbExecutor }               = require("./arb-executor");
 
+// Trade journal (SQLite-backed, viewed via dashboard)
+const { TradeLogger }               = require("./trade-logger");
+const { TelegramNotifier }          = require("./telegram-notifier");
+
 // ─── Config ───────────────────────────────────────────
 
 const INITIAL_KRW = Number(process.env.INITIAL_CAPITAL || 100_000);
@@ -76,6 +80,16 @@ class TradingBot {
       minTrades:     20,
     });
 
+    // ── Trade journal (sim + live, SQLite) ─────────
+    this.tradeLogger = new TradeLogger("./trades.db");
+
+    // ── Telegram notifier (자동 비활성화 if no .env keys) ──
+    this.notifier = new TelegramNotifier({
+      token:  process.env.TELEGRAM_TOKEN,
+      chatId: process.env.TELEGRAM_CHAT_ID,
+    });
+    this.tradeLogger.setOnLogged((row) => this._onTradeLogged(row));
+
     // ── Multi-factor signal engines ───────────────
     this.mds           = new MarketDataService();
     this.macroEngine   = new MacroSignalEngine(this.mds);
@@ -90,6 +104,7 @@ class TradingBot {
       macroEngine:    this.macroEngine,
       dataAggEngine:  this.dataAggEngine,
       alphaEngine:    this.alphaEngine,
+      tradeLogger:    this.tradeLogger,
       initialCapital: CAPITAL_A,
       dryRun:         DRY_RUN,
     });
@@ -97,6 +112,7 @@ class TradingBot {
     // ── Strategy B: New Listing Pattern ─────────────
     this.strategyB = new StrategyB({
       orderService:   this.orderService,
+      tradeLogger:    this.tradeLogger,
       initialCapital: CAPITAL_B,
       dryRun:         DRY_RUN,
     });
@@ -148,13 +164,15 @@ class TradingBot {
     console.log(`  Strategy B: ${CAPITAL_B.toLocaleString()} KRW (new listings)`);
     console.log("==================================================");
 
-    // ── Preflight check (live mode) ────────────────
+    // ── Preflight check (LIVE는 강제, DRY_RUN/CALIBRATION은 자가 점검) ──
+    const preflightOk = await this._preflight();
     if (!DRY_RUN && BOT_MODE === "LIVE") {
-      const ok = await this._preflight();
-      if (!ok) {
+      if (!preflightOk) {
         console.error("[TradingBot] preflight failed -- aborting. Set DRY_RUN=true to run in simulation.");
         process.exit(1);
       }
+    } else if (!preflightOk) {
+      console.warn("[TradingBot] preflight has FAIL items — DRY_RUN이라 계속 진행하지만 LIVE 전환 전 위 항목 해결 필요");
     }
 
     // ── Start dashboard ────────────────────────────
@@ -168,14 +186,23 @@ class TradingBot {
       console.error("[TradingBot] initial regime detect failed:", e.message);
     }
 
-    // Periodic regime refresh
+    // Periodic regime refresh + 전환 알림
+    this._lastRegime = null;
     this._regimeIntervalId = setInterval(async () => {
       try {
-        await this.regimeEngine.detect("KRW-BTC");
+        const r = await this.regimeEngine.detect("KRW-BTC");
+        if (r?.regime && this._lastRegime && r.regime !== this._lastRegime) {
+          this.notifier?.notifyRegime(this._lastRegime, r.regime);
+        }
+        if (r?.regime) this._lastRegime = r.regime;
       } catch (e) {
         console.error("[TradingBot] regime refresh error:", e.message);
       }
     }, REGIME_INTERVAL);
+
+    // ── Start Telegram notifier ─────────────────────
+    await this.notifier.init();
+    this.notifier.setDailySummaryCallback(() => this._sendDailySummary());
 
     // ── Start calibration engine ───────────────────
     this.calibEngine.start(60_000);
@@ -471,6 +498,24 @@ class TradingBot {
           return;
         }
 
+        if (url.pathname === "/api/trades") {
+          const limit = Number(url.searchParams.get("limit")) || 50;
+          res.writeHead(200, { "Content-Type": "application/json" });
+          res.end(JSON.stringify(this.tradeLogger?.getRecent(limit) || []));
+          return;
+        }
+
+        if (url.pathname === "/api/trade-stats") {
+          res.writeHead(200, { "Content-Type": "application/json" });
+          res.end(JSON.stringify({
+            all:   this.tradeLogger?.getStats() || {},
+            A:     this.tradeLogger?.getStats("A") || {},
+            B:     this.tradeLogger?.getStats("B") || {},
+            daily: this.tradeLogger?.getDailyPnl(30) || [],
+          }));
+          return;
+        }
+
         // Default: HTML dashboard
         res.writeHead(200, { "Content-Type": "text/html; charset=utf-8" });
         res.end(this._renderDashboard());
@@ -536,6 +581,28 @@ class TradingBot {
         `<td style="color:${h.pnlRate >= 0 ? '#2ecc71' : '#e74c3c'}">${(h.pnlRate * 100).toFixed(2)}%</td>` +
         `<td>${h.reason}</td></tr>`
       ).join("");
+
+    // Trade journal (DB-backed, both sim and live)
+    const journalRows = this.tradeLogger?.getRecent(20) || [];
+    const journalStats = this.tradeLogger?.getStats() || {};
+    const journalHtml = journalRows.map(t => {
+      const pnlPct = t.pnl_rate != null ? (t.pnl_rate * 100).toFixed(2) + "%" : "-";
+      const pnlKrw = t.pnl_krw != null ? Math.round(t.pnl_krw).toLocaleString() : "-";
+      const pnlColor = t.pnl_rate == null ? "#8b949e" : t.pnl_rate >= 0 ? "#2ecc71" : "#e74c3c";
+      const sideBadge = t.side === "BUY"
+        ? `<span class="badge" style="background:#1a4731;color:#2ecc71">BUY</span>`
+        : `<span class="badge" style="background:#4a1a1a;color:#e74c3c">SELL</span>`;
+      const modeBadge = t.dry_run
+        ? `<span class="badge badge-dry">SIM</span>`
+        : `<span class="badge badge-live">LIVE</span>`;
+      const time = (t.created_at || "").slice(5, 16);
+      return `<tr><td>${time}</td><td>${t.strategy}</td><td>${sideBadge} ${modeBadge}</td>` +
+        `<td>${t.market}</td><td>${(t.price || 0).toLocaleString()}</td>` +
+        `<td>${Math.round(t.budget || 0).toLocaleString()}</td>` +
+        `<td style="color:${pnlColor}">${pnlPct}</td>` +
+        `<td style="color:${pnlColor}">${pnlKrw}</td>` +
+        `<td style="color:#8b949e">${t.reason || ""}</td></tr>`;
+    }).join("");
 
     return `<!DOCTYPE html>
 <html lang="en">
@@ -621,10 +688,18 @@ class TradingBot {
 ${positionsHtml || '<tr><td colspan="5" style="color:#484f58">No active positions</td></tr>'}
 </table>
 
-<h2>Recent Trades</h2>
+<h2>Recent Trades (in-memory history)</h2>
 <table>
 <tr><th>Market</th><th>Entry</th><th>Exit</th><th>P&L</th><th>Reason</th></tr>
 ${historyHtml || '<tr><td colspan="5" style="color:#484f58">No trades yet</td></tr>'}
+</table>
+
+<h2>Trade Journal — SQLite (sim+live persistent)
+  <span style="font-size:0.7em;color:#8b949e">total: ${journalStats.total || 0} | wins: ${journalStats.wins || 0} | losses: ${journalStats.losses || 0} | WR: ${journalStats.winRate ?? "-"}% | total PnL: ${(journalStats.totalPnl || 0).toLocaleString()} KRW</span>
+</h2>
+<table>
+<tr><th>Time</th><th>Strat</th><th>Side</th><th>Market</th><th>Price</th><th>Budget</th><th>PnL%</th><th>PnL KRW</th><th>Reason</th></tr>
+${journalHtml || '<tr><td colspan="9" style="color:#484f58">No journal entries yet — trades will appear here once logged</td></tr>'}
 </table>
 
 <h2>New Listing Detections</h2>
@@ -697,46 +772,149 @@ ${(stratB.detections || []).slice(0, 10).map(d =>
   _isCircuitBroken() {
     const today = new Date().toLocaleDateString("ko-KR");
     if (this._dailyStats.date !== today) {
-      this._dailyStats = { date: today, realizedPnl: 0, tradeCount: 0, consLosses: 0 };
+      this._dailyStats = { date: today, realizedPnl: 0, tradeCount: 0, consLosses: 0, notifiedHalt: false };
     }
     const s = this._dailyStats;
-    if (s.realizedPnl < -this.MAX_DAILY_LOSS) return true;
-    if (s.tradeCount >= this.MAX_DAILY_TRADES) return true;
-    if (s.consLosses >= this.MAX_CONS_LOSSES) return true;
-    return false;
+    let reason = null;
+    if (s.realizedPnl < -this.MAX_DAILY_LOSS) reason = `일일 손실 한도 초과 (${Math.round(s.realizedPnl).toLocaleString()}원 / 한도 ${Math.round(this.MAX_DAILY_LOSS).toLocaleString()}원)`;
+    else if (s.tradeCount >= this.MAX_DAILY_TRADES) reason = `일일 최대 거래 횟수 초과 (${s.tradeCount}/${this.MAX_DAILY_TRADES})`;
+    else if (s.consLosses >= this.MAX_CONS_LOSSES) reason = `연속 손실 ${s.consLosses}회 — 서킷브레이커`;
+
+    if (reason && !s.notifiedHalt) {
+      s.notifiedHalt = true;
+      try { this.notifier?.notifyHalt(reason); } catch {}
+      console.error(`[TradingBot] ⛔ circuit breaker — ${reason}`);
+    }
+    return !!reason;
+  }
+
+  // ─── Telegram hooks ─────────────────────────────────
+
+  _onTradeLogged(row) {
+    if (!this.notifier) return;
+    // LIVE 거래만 Telegram 알림 (DRY_RUN 시뮬레이션은 노이즈)
+    if (row.dry_run) return;
+    try {
+      if (row.side === "BUY") {
+        const targetRate = row.strategy === "B" ? 0.30 : 0.035;
+        const stopRate   = row.strategy === "B" ? -0.08 : -0.015;
+        this.notifier.notifyEntry(row.strategy, row.market, row.price, row.budget, targetRate, stopRate);
+      } else if (row.side === "SELL") {
+        if (row.partial) {
+          this.notifier.notifyPartial(row.strategy, row.market, (row.pnl_rate || 0) * 100);
+        } else {
+          this.notifier.notifyExit(row.strategy, row.market, row.pnl_rate || 0, row.reason || "exit", false);
+        }
+      }
+    } catch (e) {
+      console.warn("[TradingBot] notifier hook error:", e.message);
+    }
+  }
+
+  _sendDailySummary() {
+    try {
+      const sA = this.strategyA.getSummary();
+      const sB = this.strategyB.getSummary();
+      const totalAsset = (sA?.totalAsset || 0) + (sB?.totalAsset || 0);
+      this.notifier?.dailySummary({
+        totalAsset,
+        initCap: INITIAL_KRW,
+        sA, sB,
+      });
+    } catch (e) {
+      console.warn("[TradingBot] daily summary error:", e.message);
+    }
   }
 
   // ─── Preflight Check ───────────────────────────────
+
+  async _fetchPublicIp() {
+    const sources = [
+      "https://api.ipify.org?format=json",
+      "https://ifconfig.co/json",
+      "https://ipinfo.io/json",
+    ];
+    for (const url of sources) {
+      try {
+        const res = await safeFetch(url, { headers: { accept: "application/json" } });
+        if (!res.ok) continue;
+        const data = await res.json();
+        return data.ip || data.address || null;
+      } catch {}
+    }
+    return null;
+  }
+
+  async _checkClockSkew() {
+    try {
+      const t0 = Date.now();
+      const res = await safeFetch("https://api.upbit.com/v1/ticker?markets=KRW-BTC");
+      const t1 = Date.now();
+      const serverDate = res.headers?.get?.("date");
+      if (!serverDate) return { ok: true, skewMs: null };
+      const serverMs = new Date(serverDate).getTime();
+      const localMs  = (t0 + t1) / 2;
+      const skewMs   = Math.abs(localMs - serverMs);
+      return { ok: skewMs < 5_000, skewMs };
+    } catch {
+      return { ok: false, skewMs: null };
+    }
+  }
 
   async _preflight() {
     console.log("[TradingBot] preflight check...");
     const checks = [];
 
-    // API keys
-    checks.push({ name: "API keys", ok: this.orderService.getSummary().hasApiKeys });
+    // 1. Public IP (Upbit IP whitelist 가이드용)
+    const publicIp = await this._fetchPublicIp();
+    if (publicIp) {
+      console.log(`[TradingBot]   현재 공인 IP: ${publicIp}`);
+      console.log(`[TradingBot]   → 이 IP를 Upbit "Open API 관리 > IP 허용 등록"에 추가해야 합니다.`);
+    } else {
+      console.warn("[TradingBot]   공인 IP 조회 실패 (네트워크 문제일 수 있음)");
+    }
+    checks.push({ name: `Public IP (${publicIp || "unknown"})`, ok: !!publicIp });
 
-    // Account balance
+    // 2. API keys
+    const hasKeys = this.orderService.getSummary().hasApiKeys;
+    checks.push({ name: "API keys (.env)", ok: hasKeys });
+
+    // 3. Clock skew (Upbit nonce auth requires sync)
+    const clock = await this._checkClockSkew();
+    checks.push({
+      name: `clock skew (${clock.skewMs != null ? clock.skewMs + "ms" : "unknown"})`,
+      ok: clock.ok,
+      reason: clock.ok ? null : "5초 이상 어긋남 — NTP 동기화 권장",
+    });
+
+    // 4. Account balance (인증된 IP 검증 + 잔고 동시 체크)
     let krw = 0;
+    let ipAuthed = true;
     try {
       krw = await this.orderService.getBalance("KRW");
       checks.push({ name: `KRW balance (${krw.toLocaleString()})`, ok: krw >= 5000 });
     } catch (e) {
-      checks.push({ name: "KRW balance", ok: false, reason: e.message });
+      const msg = e.message || "";
+      ipAuthed = !/인증된 IP|invalid_access_key|authorization/i.test(msg);
+      checks.push({
+        name: "KRW balance",
+        ok: false,
+        reason: ipAuthed ? msg : `${msg} ← Upbit IP 화이트리스트 미등록`,
+      });
     }
 
-    // Capital check
+    // 5. Capital
     checks.push({
       name: `balance >= 50% of INITIAL_CAPITAL (${INITIAL_KRW.toLocaleString()})`,
       ok: krw >= INITIAL_KRW * 0.5,
     });
 
-    // Upbit API
+    // 6. Upbit API public
     try {
       const res = await safeFetch("https://api.upbit.com/v1/ticker?markets=KRW-BTC");
-      checks.push({ name: "Upbit API response", ok: res.ok });
+      checks.push({ name: "Upbit API public", ok: res.ok });
     } catch (e) {
-      console.warn("[TradingBot] healthCheck:", e.message);
-      checks.push({ name: "Upbit API response", ok: false });
+      checks.push({ name: "Upbit API public", ok: false });
     }
 
     let allOk = true;
@@ -747,6 +925,11 @@ ${(stratB.detections || []).slice(0, 10).map(d =>
       if (!c.ok) allOk = false;
     }
     console.log("[TradingBot] ----------------------------");
+
+    if (!allOk && !ipAuthed) {
+      console.error("[TradingBot] 가장 자주 발생하는 LIVE 차단 사유: Upbit IP 화이트리스트 미등록");
+      console.error("[TradingBot] 해결: https://upbit.com/mypage/open_api_management 에서 위에 표시된 공인 IP를 추가");
+    }
 
     return allOk;
   }
@@ -772,6 +955,10 @@ ${(stratB.detections || []).slice(0, 10).map(d =>
 
     // Stop arbitrage subsystem
     this._stopArbSubsystem();
+
+    // Close trade journal + notifier
+    try { this.tradeLogger?.close(); } catch {}
+    try { this.notifier?.stop(); } catch {}
 
     // Close WebSocket
     if (this._ws) {
