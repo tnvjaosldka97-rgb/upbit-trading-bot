@@ -148,3 +148,57 @@ node trading-bot.js
 - **처음에는 반드시 `DRY_RUN=true`로 실행하세요.** 최소 1~2주 관찰 후 소액으로 전환.
 - 실거래 시 손실이 발생할 수 있습니다. 투자 판단은 본인 책임입니다.
 - API 키는 절대 외부에 노출하지 마세요. `.env` 파일은 `.gitignore`에 포함되어 있습니다.
+
+## LIVE 전환 체크리스트
+
+`DRY_RUN=true`로 부팅하면 자동으로 preflight 점검이 실행됩니다. 결과를 보고 모든 항목이 PASS인지 확인하세요.
+
+```
+[TradingBot]   현재 공인 IP: xxx.xxx.xxx.xxx
+[TradingBot]   → 이 IP를 Upbit "Open API 관리 > IP 허용 등록"에 추가해야 합니다.
+[TradingBot] --- preflight results ---
+[TradingBot]   [PASS] Public IP (xxx.xxx.xxx.xxx)
+[TradingBot]   [PASS] API keys (.env)
+[TradingBot]   [PASS] clock skew (xxx ms)
+[TradingBot]   [PASS] KRW balance (xxx)
+[TradingBot]   [PASS] balance >= 50% of INITIAL_CAPITAL
+[TradingBot]   [PASS] Upbit API public
+```
+
+### 1단계: Upbit IP 화이트리스트 등록
+1. 봇 부팅 시 표시된 공인 IP를 복사
+2. https://upbit.com/mypage/open_api_management 접속
+3. 발급된 API 키의 "IP 허용 등록"에 위 IP 추가
+4. 봇 재기동 후 KRW balance가 PASS로 바뀌는지 확인
+
+### 2단계: Telegram 알림 (선택)
+1. [@BotFather](https://t.me/BotFather)에서 봇 생성 → 토큰 복사
+2. 만든 봇에게 아무 메시지 1회 전송 (chat_id 자동 감지용)
+3. `.env`에 `TELEGRAM_TOKEN=...` 추가
+4. 봇 재기동 → 활성화 메시지 수신 확인
+
+### 3단계: LIVE 모드 전환
+```env
+BOT_MODE=LIVE
+DRY_RUN=false
+```
+- preflight 모든 항목 PASS여야 봇이 시작됨
+- 한 항목이라도 FAIL이면 자동으로 abort
+
+### 4단계: 모니터링
+- **대시보드**: http://localhost:4020 (Trade Journal 섹션에서 sim/live 거래 모두 확인)
+- **JSON API**:
+  - `/api/status` — 전체 상태
+  - `/api/trades?limit=50` — 최근 거래 (SQLite trades.db)
+  - `/api/trade-stats` — 전략별 승률/PnL/일별 차트
+  - `/api/calibration` — Kelly 캘리브레이션
+  - `/api/arb` — 아비트라지 모니터링 상태
+- **Telegram**: 진입/청산/부분청산/레짐 전환/서킷브레이커 자동 알림
+
+### 5단계: 서킷 브레이커 (자동 안전장치)
+다음 조건 중 하나 발생 시 봇이 자동으로 그날 거래 중단:
+- 일일 손실 ≥ 자본의 0.6%
+- 일일 거래 ≥ 8회
+- 연속 손실 ≥ 3회
+
+발동 시 Telegram에 즉시 알림 전송.

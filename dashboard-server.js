@@ -1,5 +1,9 @@
 "use strict";
 
+// ⚠️ DEPRECATED — 이 파일은 dead code. trading-bot.js 내장 dashboard 사용 중.
+// 보존 목적: 풍부한 UI 자료(필터 카드/검사항목/HTML 차트)는 강의 자료로 재활용 가능.
+// 통합 작업 시 trading-bot.js의 _renderDashboard()를 이쪽 디자인으로 대체할 것.
+
 const http = require("http");
 
 // ── 필터 메타데이터 ─────────────────────────────────────
