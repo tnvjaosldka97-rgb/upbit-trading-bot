@@ -33,6 +33,7 @@ const STABLECOINS = new Set(["USDT", "USDC", "DAI", "BUSD", "TUSD", "FDUSD", "PY
 class StrategyB {
   constructor(options = {}) {
     this.orderService   = options.orderService   || null;
+    this.tradeLogger    = options.tradeLogger    || null;
     this.dryRun         = options.dryRun ?? true;
     this.initialCapital = options.initialCapital || 100_000;
 
@@ -289,6 +290,17 @@ class StrategyB {
       `stop:${(STOP_RATE * 100)}%`
     );
 
+    this.tradeLogger?.logBuy({
+      strategy: "B",
+      market,
+      price,
+      quantity: pos.quantity,
+      budget,
+      qualityScore: signal.score || null,
+      qualityFlags: signal.flags || null,
+      dryRun: true,
+    });
+
     // Live order
     if (!this.dryRun && this.orderService?.getSummary().hasApiKeys) {
       try {
@@ -309,6 +321,16 @@ class StrategyB {
             lp.limitSellUuid = sell.uuid;
             this.livePositions.set(market, lp);
             console.log(`[StrategyB] live entry -- ${market} @${ep.toLocaleString()}`);
+            this.tradeLogger?.logBuy({
+              strategy: "B",
+              market,
+              price: ep,
+              quantity: result.executedVolume,
+              budget: liveBudget,
+              qualityScore: signal.score || null,
+              qualityFlags: signal.flags || null,
+              dryRun: false,
+            });
           }
         }
       } catch (e) {
@@ -340,6 +362,19 @@ class StrategyB {
         `50% sold, trailing ${(TRAIL_PCT * 100)}% started`
       );
       this._updateDetection(market, `partial(+${(move * 100).toFixed(0)}%)`);
+      this.tradeLogger?.logSell({
+        strategy: "B",
+        market,
+        price,
+        quantity: pos.quantity, // remaining = original/2 (already halved)
+        budget: half,
+        reason: "partial",
+        pnlRate: move,
+        pnlKrw: halfPnl,
+        partial: true,
+        trail: false,
+        dryRun: true,
+      });
     }
 
     // Trailing stop update
@@ -389,8 +424,26 @@ class StrategyB {
           await this.orderService.marketSell(market, bal).catch(e => console.error("[StrategyB]", e.message));
         }
       }
+      const pnlRate = (cur - pos.entryPrice) / pos.entryPrice;
+      const pnlKrw  = pnlRate * pos.budget;
+      this.tradeLogger?.logSell({
+        strategy: "B",
+        market,
+        price: cur,
+        quantity: pos.quantity,
+        budget: pos.budget,
+        reason: "stop",
+        pnlRate,
+        pnlKrw,
+        partial: pos.partialDone || false,
+        trail: false,
+        dryRun: false,
+      });
       this.livePositions.delete(market);
-      console.log(`[StrategyB] live stop -- ${market}`);
+      console.log(
+        `[StrategyB] live stop -- ${market} ` +
+        `${pnlRate >= 0 ? "+" : ""}${(pnlRate * 100).toFixed(2)}%`
+      );
     }
   }
 
@@ -420,6 +473,20 @@ class StrategyB {
       `[StrategyB] closed (${reason}) -- ${market} ` +
       `${pnlRate >= 0 ? "+" : ""}${(pnlRate * 100).toFixed(1)}%`
     );
+
+    this.tradeLogger?.logSell({
+      strategy: "B",
+      market,
+      price: exitPrice,
+      quantity: pos.quantity,
+      budget: pos.budget,
+      reason,
+      pnlRate,
+      pnlKrw,
+      partial: pos.partialDone || false,
+      trail: pos.trailActive || false,
+      dryRun: true,
+    });
   }
 
   // ─── Data Fetching ──────────────────────────────────

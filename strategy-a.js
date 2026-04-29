@@ -45,6 +45,7 @@ class StrategyA {
     this.macroEngine   = options.macroEngine   || null;
     this.dataAggEngine = options.dataAggEngine || null;
     this.alphaEngine   = options.alphaEngine   || null;
+    this.tradeLogger   = options.tradeLogger   || null;
     this.dryRun        = options.dryRun ?? true;
     this.initialCapital = options.initialCapital || 100_000;
 
@@ -537,6 +538,17 @@ class StrategyA {
         `stop:${this.sim.position.stopPrice.toLocaleString()}`
       );
 
+      this.tradeLogger?.logBuy({
+        strategy: "A",
+        market,
+        price,
+        quantity: this.sim.position.quantity,
+        budget,
+        qualityScore: signal.score,
+        qualityFlags: signal._meta?.flags || null,
+        dryRun: true,
+      });
+
       // Live order execution
       if (!this.dryRun && this.orderService?.getSummary().hasApiKeys) {
         const krw = await this.orderService.getBalance("KRW").catch(() => 0);
@@ -553,6 +565,16 @@ class StrategyA {
               atrStop, peakPrice: ep, trailActive: false,
               openedAt: Date.now(),
             };
+            this.tradeLogger?.logBuy({
+              strategy: "A",
+              market,
+              price: ep,
+              quantity: res.executedVolume,
+              budget: liveBudget,
+              qualityScore: signal.score,
+              qualityFlags: signal._meta?.flags || null,
+              dryRun: false,
+            });
             const sell = await this.orderService.limitSell(market, res.executedVolume, this.livePosition.targetPrice);
             this.livePosition.limitSellUuid = sell.uuid;
             this.orderService
@@ -584,12 +606,35 @@ class StrategyA {
           .catch(e => console.error("[StrategyA] stop sell failed:", e.message));
       }
     }
-    this._closeLive("STOP");
+    this._closeLive("STOP", price);
   }
 
-  _closeLive(reason) {
+  _closeLive(reason, exitPrice = null) {
     if (!this.livePosition) return;
-    console.log(`[StrategyA] live position closed (${reason}) -- ${this.livePosition.market}`);
+    const pos = this.livePosition;
+    const exit = exitPrice || pos.targetPrice;
+    const pnlRate = (exit - pos.entryPrice) / pos.entryPrice;
+    const pnlKrw  = pnlRate * pos.budget;
+
+    console.log(
+      `[StrategyA] live position closed (${reason}) -- ${pos.market} ` +
+      `${pnlRate >= 0 ? "+" : ""}${(pnlRate * 100).toFixed(2)}%`
+    );
+
+    this.tradeLogger?.logSell({
+      strategy: "A",
+      market: pos.market,
+      price: exit,
+      quantity: pos.quantity,
+      budget: pos.budget,
+      reason: reason.toLowerCase(),
+      pnlRate,
+      pnlKrw,
+      partial: false,
+      trail: pos.trailActive || false,
+      dryRun: false,
+    });
+
     this.livePosition = null;
   }
 
@@ -645,6 +690,20 @@ class StrategyA {
       `${pnlRate >= 0 ? "+" : ""}${(pnlRate * 100).toFixed(2)}% ` +
       `(${Math.round(pnlKrw).toLocaleString()} KRW)`
     );
+
+    this.tradeLogger?.logSell({
+      strategy: "A",
+      market: pos.market,
+      price: exitPrice,
+      quantity: pos.quantity,
+      budget: pos.budget,
+      reason,
+      pnlRate,
+      pnlKrw,
+      partial: false,
+      trail: pos.trailActive || false,
+      dryRun: true,
+    });
 
     // Record for CalibrationEngine
     if (this.calibEngine) {

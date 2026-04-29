@@ -18,6 +18,7 @@ class TradeLogger {
   constructor(dbPath = "./trades.db") {
     this.db = null;
     this._ready = false;
+    this._onLogged = null;
 
     if (!Database) {
       console.warn("[TradeLogger] better-sqlite3 없음 — 메모리 폴백");
@@ -37,6 +38,11 @@ class TradeLogger {
       this._memLog = [];
       this._ready = true;
     }
+  }
+
+  /** 알림/외부 hook 등록 — 모든 logBuy/logSell 후 호출됨 */
+  setOnLogged(cb) {
+    this._onLogged = cb;
   }
 
   _migrate() {
@@ -94,6 +100,12 @@ class TradeLogger {
       this._memLog.push(row);
       if (this._memLog.length > 500) this._memLog.shift();
     }
+
+    if (this._onLogged) {
+      try { this._onLogged(row); } catch (e) {
+        console.warn("[TradeLogger] onLogged 콜백 오류:", e.message);
+      }
+    }
   }
 
   /**
@@ -126,6 +138,12 @@ class TradeLogger {
     } else {
       this._memLog.push(row);
       if (this._memLog.length > 500) this._memLog.shift();
+    }
+
+    if (this._onLogged) {
+      try { this._onLogged(row); } catch (e) {
+        console.warn("[TradeLogger] onLogged 콜백 오류:", e.message);
+      }
     }
   }
 
