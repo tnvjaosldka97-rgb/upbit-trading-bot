@@ -53,6 +53,7 @@ const { RiskManager }               = require("./risk-manager");
 const { Reconciler }                = require("./reconciler");
 const { AutoBacktest }              = require("./auto-backtest");
 const { Watchdog }                  = require("./watchdog");
+const { SimulationValidator }       = require("./simulation-validator");
 
 // ─── Config ───────────────────────────────────────────
 
@@ -122,6 +123,11 @@ class TradingBot {
     this.watchdog = new Watchdog({
       bot:      this,
       notifier: this.notifier,
+    });
+    this.simValidator = new SimulationValidator({
+      tracker:  this.perfTracker,
+      notifier: this.notifier,
+      bot:      this,
     });
 
     // ── Multi-factor signal engines ───────────────
@@ -262,6 +268,12 @@ class TradingBot {
 
     // ── Watchdog (봇 뻘짓 감지) ───────────────────────
     this.watchdog.start();
+
+    // ── Simulation Validator (DRY_RUN일 때만 — LIVE 전환 자동 판정) ──
+    if (DRY_RUN) {
+      this.simValidator.start();
+      console.log("[TradingBot] SimulationValidator 시작 — 매시간 LIVE 전환 가능 여부 평가");
+    }
 
     // ── Start calibration engine ───────────────────
     this.calibEngine.start(60_000);
@@ -623,6 +635,13 @@ class TradingBot {
         if (url.pathname === "/api/watchdog") {
           res.writeHead(200, { "Content-Type": "application/json" });
           res.end(JSON.stringify(this.watchdog?.getSummary() || {}));
+          return;
+        }
+
+        if (url.pathname === "/api/sim-validation") {
+          // DRY_RUN 모드에서 LIVE 전환 가능 여부 + 통계
+          res.writeHead(200, { "Content-Type": "application/json" });
+          res.end(JSON.stringify(this.simValidator?.getLastReport() || { status: "not started" }));
           return;
         }
 
@@ -1167,6 +1186,7 @@ ${(stratB.detections || []).slice(0, 10).map(d =>
     try { this.autoBacktest?.stop(); } catch {}
     try { this.autoBacktest?.close(); } catch {}
     try { this.watchdog?.stop(); } catch {}
+    try { this.simValidator?.stop(); } catch {}
     try { this.perfTracker?.close(); } catch {}
     try { this.riskManager?.close(); } catch {}
     try { this.reconciler?.close(); } catch {}
