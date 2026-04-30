@@ -522,6 +522,12 @@ class TradingBot {
           return;
         }
 
+        if (url.pathname === "/api/strategy-c") {
+          res.writeHead(200, { "Content-Type": "application/json" });
+          res.end(JSON.stringify(this.strategyC?.getSummary() || { running: false, reason: "not initialized" }));
+          return;
+        }
+
         if (url.pathname === "/api/trades") {
           const limit = Number(url.searchParams.get("limit")) || 50;
           res.writeHead(200, { "Content-Type": "application/json" });
