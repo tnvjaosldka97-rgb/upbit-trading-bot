@@ -42,6 +42,10 @@ const { ArbExecutor }               = require("./arb-executor");
 const { TradeLogger }               = require("./trade-logger");
 const { TelegramNotifier }          = require("./telegram-notifier");
 
+// Strategy C — 한국 3사 동일지역 차익 모니터
+const { CoinoneAdapter }            = require("./exchange-coinone");
+const { StrategyC }                 = require("./strategy-c");
+
 // ─── Config ───────────────────────────────────────────
 
 const INITIAL_KRW = Number(process.env.INITIAL_CAPITAL || 100_000);
@@ -58,7 +62,8 @@ const CAPITAL_A = Math.floor(INITIAL_KRW * 0.60);
 const CAPITAL_B = Math.floor(INITIAL_KRW * 0.40);
 
 // Loop intervals
-const STRATEGY_A_INTERVAL = 60 * 60_000;  // 1h
+// Strategy A: 1h 캔들 기준이지만 5분 주기로 evaluate(시그널 성숙 시 즉시 진입)
+const STRATEGY_A_INTERVAL = 5 * 60_000;   // 5min evaluate (was 60min)
 const STRATEGY_B_INTERVAL = 5 * 60_000;   // 5min (scan)
 const REGIME_INTERVAL     = 15 * 60_000;  // 15min regime refresh
 const HEALTH_LOG_INTERVAL = 10 * 60_000;  // 10min health log
@@ -328,11 +333,22 @@ class TradingBot {
         });
       });
 
-      console.log("[TradingBot] arbitrage subsystem initialized (6 exchanges, public data)");
+      // Strategy C — 한국 3사 동일지역 차익 모니터 (시장 중립)
+      const coinone = new CoinoneAdapter({});
+      this.strategyC = new StrategyC({
+        upbit:     restExchanges.upbit,
+        bithumb:   restExchanges.bithumb,
+        coinone,
+        arbLogger: this.arbLogger,
+        notifier:  this.notifier,
+      });
+
+      console.log("[TradingBot] arbitrage subsystem initialized (6 exchanges + StrategyC KRW3, public data)");
     } catch (e) {
       console.error("[TradingBot] arb init failed:", e.message, e.stack);
       this.arb = null;
       this.arbLogger = null;
+      this.strategyC = null;
     }
   }
 
@@ -357,6 +373,13 @@ class TradingBot {
       // 3) Start detectors
       await this.arb.start();
       await this.arbLogger.start();
+
+      // 3b) Strategy C (한국 3사 동일지역 차익) — 시장 중립
+      try {
+        if (this.strategyC) await this.strategyC.start();
+      } catch (e) {
+        console.error("[TradingBot] StrategyC start failed:", e.message);
+      }
 
       // 4) Sanity check: logger actually ready?
       if (this.arbLogger._ready) {
@@ -389,6 +412,7 @@ class TradingBot {
     try { this.arbLogger?.stop(); } catch {}
     try { this.arbMultiWs?.stop(); } catch {}
     try { this.arbUpbitWs?.disconnect(); } catch {}
+    try { this.strategyC?.stop(); } catch {}
   }
 
   // ─── WebSocket Init (optional, ws package) ──────────

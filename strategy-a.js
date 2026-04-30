@@ -73,10 +73,10 @@ class StrategyA {
 
   // ─── Lifecycle ──────────────────────────────────────
 
-  start(intervalMs = 60 * 60_000) {
+  start(intervalMs = 5 * 60_000) {
     this._tick();
     this._intervalId = setInterval(() => this._tick(), intervalMs);
-    console.log(`[StrategyA] started -- 1h swing, market: ${MARKET}, interval: ${intervalMs / 60_000}min`);
+    console.log(`[StrategyA] started -- 1h candles, market: ${MARKET}, evaluate every ${intervalMs / 60_000}min`);
   }
 
   stop() {
@@ -457,8 +457,15 @@ class StrategyA {
 
       // Entry evaluation
       if (!this.sim.position && !this.livePosition && !this._enteringLock) {
-        const candles = await this._fetchCandles(MARKET, 200);
-        if (!candles) return;
+        // 1h candle 캐시 — 1시간 안에 같은 봉 fetch 반복 방지
+        const now = Date.now();
+        const cacheTtlMs = 5 * 60_000; // 5분 캐시 (5분 tick에서 매번 fetch X)
+        if (!this._candleCache || (now - this._candleCache.ts) > cacheTtlMs) {
+          const candles = await this._fetchCandles(MARKET, 200);
+          if (!candles) return;
+          this._candleCache = { ts: now, candles };
+        }
+        const candles = this._candleCache.candles;
 
         const regime = this.regimeEngine
           ? await this.regimeEngine.detect(MARKET)
