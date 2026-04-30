@@ -14,7 +14,12 @@
 const { safeFetch } = require("./exchange-adapter");
 const CFG = require("./config");
 const indicators = require("./lib/indicators");
+const mtf = require("./lib/multi-timeframe");
 const UPBIT_API = "https://api.upbit.com";
+
+// Multi-timeframe 통합 — 환경변수로 활성/비활성 제어
+const MTF_ENABLED = process.env.A_MTF_ENABLED === "true";
+const MTF_CACHE_MS = 5 * 60_000; // 5분 캐시 (4h 캔들 변동 거의 없으므로 충분)
 
 const MARKET         = CFG.A_MARKET;
 const RSI_OVERSOLD   = CFG.A_RSI_OVERSOLD;
@@ -276,15 +281,28 @@ class StrategyA {
     }
 
     // ═══════════════════════════════════════════════════
+    //  CATEGORY 5: MULTI-TIMEFRAME (4h+1h+15m+5m 정합) — max ±25
+    // ═══════════════════════════════════════════════════
+    let mtfScore = 0;
+    if (externalSignals.mtf) {
+      mtfScore = mtf.toScoreContribution(externalSignals.mtf);
+      if (mtfScore > 10) reasons.push(`MTF_STRONG_${externalSignals.mtf.direction}(${mtfScore})`);
+      else if (mtfScore > 0) reasons.push(`MTF_${externalSignals.mtf.direction}(${mtfScore})`);
+      else if (mtfScore < -10) reasons.push(`MTF_BEAR_BLOCK(${mtfScore})`);
+      else if (mtfScore < 0) reasons.push(`MTF_WEAK_BEAR(${mtfScore})`);
+    }
+
+    // ═══════════════════════════════════════════════════
     //  CONFLUENCE GATE + FINAL DECISION
     // ═══════════════════════════════════════════════════
-    const score = taScore + macroScore + dataScore + tapeScore;
+    const score = taScore + macroScore + dataScore + tapeScore + mtfScore;
 
     let confluence = 0;
     if (taScore > 0) confluence++;
     if (macroScore > 0) confluence++;
     if (dataScore > 0) confluence++;
     if (tapeScore > 0) confluence++;
+    if (mtfScore > 0) confluence++;
 
     const confidence = Math.min(Math.max(score / 120, 0), 1);
 
@@ -306,8 +324,8 @@ class StrategyA {
     if (score >= ENTRY_THRESHOLD && confluence >= MIN_CONFLUENCE) {
       console.log(
         `[StrategyA] BUY signal -- ${MARKET} score:${score} ` +
-        `confluence:${confluence}/4 ` +
-        `[TA:${taScore} MACRO:${macroScore} DATA:${dataScore} TAPE:${tapeScore}] ` +
+        `confluence:${confluence}/5 ` +
+        `[TA:${taScore} MACRO:${macroScore} DATA:${dataScore} TAPE:${tapeScore} MTF:${mtfScore}] ` +
         `[${reasons.join(",")}]`
       );
       return {
@@ -317,7 +335,7 @@ class StrategyA {
         stopLoss,
         takeProfit,
         score,
-        _meta: { rsi, atr, atrPct, targetRate, stopRate, calPct, taScore, macroScore, dataScore, tapeScore, confluence },
+        _meta: { rsi, atr, atrPct, targetRate, stopRate, calPct, taScore, macroScore, dataScore, tapeScore, mtfScore, confluence },
       };
     }
 
@@ -486,10 +504,26 @@ class StrategyA {
           if (this.alphaEngine) tapeSignals = await this.alphaEngine.analyzeTape(MARKET);
         } catch {}
 
+        // Multi-timeframe 정합 (옵션, 5분 캐시)
+        let mtfResult = null;
+        if (MTF_ENABLED) {
+          if (!this._mtfCache || (now - this._mtfCache.ts) > MTF_CACHE_MS) {
+            try {
+              mtfResult = await mtf.analyze(MARKET);
+              this._mtfCache = { ts: now, result: mtfResult };
+            } catch (e) {
+              console.warn("[StrategyA] MTF analyze failed:", e.message);
+            }
+          } else {
+            mtfResult = this._mtfCache.result;
+          }
+        }
+
         const signal = this.evaluate(candles, regime, calibration, {
           macro: macroSignals,
           data:  dataSignals,
           tape:  tapeSignals,
+          mtf:   mtfResult,
         });
         if (signal && signal.action === "BUY") {
           await this._enter(MARKET, signal, regime, calibration);
