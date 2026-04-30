@@ -16,6 +16,7 @@ const CFG = require("./config");
 const indicators = require("./lib/indicators");
 const mtf = require("./lib/multi-timeframe");
 const micro = require("./lib/microstructure");
+const sanity = require("./lib/sanity");
 const UPBIT_API = "https://api.upbit.com";
 
 // Multi-timeframe 통합 — 환경변수로 활성/비활성 제어
@@ -605,6 +606,19 @@ class StrategyA {
 
       if (budget < 5000) {
         console.warn("[StrategyA] insufficient budget");
+        return;
+      }
+
+      // Sanity check — 봇 뻘짓 방지 마지막 게이트
+      const sane = sanity.checkOrder({
+        price,
+        marketPrice: price,
+        quantity: budget / price,
+        budgetKrw: budget,
+        totalCapital: this.initialCapital,
+      });
+      if (!sane.ok) {
+        console.error(`[StrategyA] BUY blocked by SANITY — ${sane.reason}`);
         return;
       }
 

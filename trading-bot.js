@@ -52,6 +52,7 @@ const { RotationEngine }            = require("./rotation-engine");
 const { RiskManager }               = require("./risk-manager");
 const { Reconciler }                = require("./reconciler");
 const { AutoBacktest }              = require("./auto-backtest");
+const { Watchdog }                  = require("./watchdog");
 
 // ─── Config ───────────────────────────────────────────
 
@@ -116,6 +117,10 @@ class TradingBot {
       notifier:     this.notifier,
     });
     this.autoBacktest = new AutoBacktest({
+      notifier: this.notifier,
+    });
+    this.watchdog = new Watchdog({
+      bot:      this,
       notifier: this.notifier,
     });
 
@@ -254,6 +259,9 @@ class TradingBot {
 
     // ── Auto Backtest (매주 일요일 03:00 KST) ─────────
     this.autoBacktest.start();
+
+    // ── Watchdog (봇 뻘짓 감지) ───────────────────────
+    this.watchdog.start();
 
     // ── Start calibration engine ───────────────────
     this.calibEngine.start(60_000);
@@ -612,6 +620,31 @@ class TradingBot {
           return;
         }
 
+        if (url.pathname === "/api/watchdog") {
+          res.writeHead(200, { "Content-Type": "application/json" });
+          res.end(JSON.stringify(this.watchdog?.getSummary() || {}));
+          return;
+        }
+
+        if (url.pathname === "/api/kill") {
+          // 응급 정지 — 신규 진입 즉시 차단
+          const reason = url.searchParams.get("reason") || "manual_kill_switch";
+          try { this.orderService?.halt(reason); } catch {}
+          try { this.notifier?.send?.(`🛑 <b>Kill Switch 발동</b>\n사유: ${reason}\n신규 진입 차단됨.`); } catch {}
+          res.writeHead(200, { "Content-Type": "application/json" });
+          res.end(JSON.stringify({ status: "halted", reason }));
+          return;
+        }
+
+        if (url.pathname === "/api/resume") {
+          // 정지 해제
+          try { this.orderService.halted = false; this.orderService.haltReason = null; } catch {}
+          try { this.watchdog?.reset(); } catch {}
+          res.writeHead(200, { "Content-Type": "application/json" });
+          res.end(JSON.stringify({ status: "resumed" }));
+          return;
+        }
+
         if (url.pathname === "/api/trades") {
           const limit = Number(url.searchParams.get("limit")) || 50;
           res.writeHead(200, { "Content-Type": "application/json" });
@@ -956,6 +989,12 @@ ${(stratB.detections || []).slice(0, 10).map(d =>
   // ─── Telegram hooks ─────────────────────────────────
 
   _onTradeLogged(row) {
+    // Watchdog에 모든 거래 기록 (sim+live)
+    if (row.side === "BUY") {
+      try { this.watchdog?.recordTrade(row.market); } catch {}
+    }
+    try { this.watchdog?.heartbeat(); } catch {}
+
     if (!this.notifier) return;
     // LIVE 거래만 Telegram 알림 (DRY_RUN 시뮬레이션은 노이즈)
     if (row.dry_run) return;
@@ -1127,6 +1166,7 @@ ${(stratB.detections || []).slice(0, 10).map(d =>
     try { this.rotation?.stop(); } catch {}
     try { this.autoBacktest?.stop(); } catch {}
     try { this.autoBacktest?.close(); } catch {}
+    try { this.watchdog?.stop(); } catch {}
     try { this.perfTracker?.close(); } catch {}
     try { this.riskManager?.close(); } catch {}
     try { this.reconciler?.close(); } catch {}
