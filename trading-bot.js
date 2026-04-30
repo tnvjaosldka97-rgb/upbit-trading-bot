@@ -140,6 +140,8 @@ class TradingBot {
     this.strategyB = new StrategyB({
       orderService:   this.orderService,
       tradeLogger:    this.tradeLogger,
+      riskManager:    this.riskManager,
+      rotation:       this.rotation,
       initialCapital: CAPITAL_B,
       dryRun:         DRY_RUN,
     });
@@ -694,6 +696,19 @@ class TradingBot {
         `<td style="color:#8b949e">${t.reason || ""}</td></tr>`;
     }).join("");
 
+    // Risk/Rotation/Performance/StrategyC 카드용 데이터
+    const risk     = this.riskManager?.getSummary() || null;
+    const rotation = this.rotation?.getSummary() || {};
+    const sc       = this.strategyC?.getSummary() || null;
+    const fmtPct = v => v == null ? "-" : (v * 100).toFixed(2) + "%";
+    const stratStatusBadge = (key) => {
+      const s = rotation[key];
+      if (!s) return "";
+      return s.active
+        ? `<span class="badge badge-bull">${key} ON</span>`
+        : `<span class="badge badge-bear">${key} OFF</span>`;
+    };
+
     return `<!DOCTYPE html>
 <html lang="en">
 <head>
@@ -768,6 +783,44 @@ class TradingBot {
     <div class="value blue">${calib.mode}</div>
     <div style="font-size:0.75em; color:#8b949e">
       trades: ${calib.totalTrades} | kelly: ${calib.halfKelly ? (calib.halfKelly * 100).toFixed(1) + '%' : 'N/A'} | EV: ${calib.expectedValue ? (calib.expectedValue * 100).toFixed(3) + '%' : 'N/A'}
+    </div>
+  </div>
+</div>
+
+<h2>0.1% 퀀트 인프라 — Risk / Rotation / Strategy C</h2>
+<div class="grid">
+  <div class="card">
+    <div class="label">Risk Manager</div>
+    <div class="value ${risk && risk.daily.realizedPnl < 0 ? 'red' : 'green'}">
+      ${risk ? (risk.daily.realizedPnl >= 0 ? '+' : '') + risk.daily.realizedPnl.toLocaleString() + '원' : 'N/A'}
+    </div>
+    <div style="font-size:0.72em;color:#8b949e">
+      일일: ${risk?.daily.trades || 0}/${risk?.limits.maxDailyTrades || 0}건 · 한도 ${risk?.daily.lossLimitKrw?.toLocaleString() || 0}원<br>
+      월간 손실: ${risk?.monthly.loss?.toLocaleString() || 0}원 / ${risk?.monthly.lossLimit?.toLocaleString() || 0}원<br>
+      VaR95: ${risk?.var95 != null ? (risk.var95 * 100).toFixed(2) + '%' : 'N/A'} · 연속손실: ${risk?.daily.consecLosses || 0}/${risk?.limits.maxConsecLosses || 0}
+    </div>
+  </div>
+  <div class="card">
+    <div class="label">Rotation Engine — 알파 활성 상태</div>
+    <div class="value blue">
+      ${stratStatusBadge('A')} ${stratStatusBadge('B')} ${stratStatusBadge('C')}
+    </div>
+    <div style="font-size:0.72em;color:#8b949e">
+      A EV: ${fmtPct(rotation.A?.stats?.ev)} · ${rotation.A?.stats?.tradeCount || 0}건<br>
+      B EV: ${fmtPct(rotation.B?.stats?.ev)} · ${rotation.B?.stats?.tradeCount || 0}건<br>
+      C EV: ${fmtPct(rotation.C?.stats?.ev)} · ${rotation.C?.stats?.tradeCount || 0}건<br>
+      매일 자정(KST) 자동 평가 + 비활성/부활
+    </div>
+  </div>
+  <div class="card">
+    <div class="label">Strategy C — 한국 3사 차익</div>
+    <div class="value ${sc?.running ? 'green' : 'red'}">
+      ${sc?.running ? '가동 중' : '정지'}
+    </div>
+    <div style="font-size:0.72em;color:#8b949e">
+      모니터링: ${sc?.coins || 0}개 코인 · 사이클: ${sc?.stats?.cycles || 0}<br>
+      검출: ${sc?.stats?.detected || 0} · 지속: ${sc?.stats?.sustained || 0} · 알림: ${sc?.stats?.alerted || 0}<br>
+      가동: ${sc?.uptimeHrs || 0}h · 활성기회: ${sc?.activeOpportunities || 0}
     </div>
   </div>
 </div>

@@ -34,6 +34,8 @@ class StrategyB {
   constructor(options = {}) {
     this.orderService   = options.orderService   || null;
     this.tradeLogger    = options.tradeLogger    || null;
+    this.riskManager    = options.riskManager    || null;
+    this.rotation       = options.rotation       || null;
     this.dryRun         = options.dryRun ?? true;
     this.initialCapital = options.initialCapital || 100_000;
 
@@ -267,6 +269,27 @@ class StrategyB {
       return;
     }
 
+    // Rotation 게이트
+    if (this.rotation && !this.rotation.isStrategyActive("B")) {
+      console.warn("[StrategyB] BUY blocked — rotation engine deactivated");
+      return;
+    }
+
+    // Risk Manager 게이트
+    if (this.riskManager) {
+      const positionsObj = {};
+      for (const [m, p] of this.sim.positions) positionsObj[`B_${m}`] = p;
+      const check = this.riskManager.checkEntry({
+        strategy: "B",
+        budgetKrw: budget,
+        currentPositions: positionsObj,
+      });
+      if (!check.allowed) {
+        console.warn(`[StrategyB] BUY blocked by RiskManager — ${check.reason}`);
+        return;
+      }
+    }
+
     const pos = {
       market,
       entryPrice:  price,
@@ -487,6 +510,7 @@ class StrategyB {
       trail: pos.trailActive || false,
       dryRun: true,
     });
+    this.riskManager?.recordTrade({ pnlKrw, isLoss: pnlRate < 0 });
   }
 
   // ─── Data Fetching ──────────────────────────────────
