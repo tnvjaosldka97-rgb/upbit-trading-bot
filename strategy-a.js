@@ -15,11 +15,18 @@ const { safeFetch } = require("./exchange-adapter");
 const CFG = require("./config");
 const indicators = require("./lib/indicators");
 const mtf = require("./lib/multi-timeframe");
+const micro = require("./lib/microstructure");
 const UPBIT_API = "https://api.upbit.com";
 
 // Multi-timeframe 통합 — 환경변수로 활성/비활성 제어
 const MTF_ENABLED = process.env.A_MTF_ENABLED === "true";
 const MTF_CACHE_MS = 5 * 60_000; // 5분 캐시 (4h 캔들 변동 거의 없으므로 충분)
+
+// Microstructure entry guard
+const MICRO_GATE_ENABLED = process.env.A_MICRO_GATE_ENABLED === "true";
+const MICRO_MAX_SLIPPAGE_PCT = Number(process.env.A_MICRO_MAX_SLIPPAGE_PCT || 0.30); // 0.3%
+const MICRO_MIN_LIQUIDITY = process.env.A_MICRO_MIN_LIQUIDITY || "MEDIUM";
+const MICRO_BLOCK_SELL_PRESSURE = process.env.A_MICRO_BLOCK_SELL_PRESSURE !== "false"; // 기본 ON
 
 const MARKET         = CFG.A_MARKET;
 const RSI_OVERSOLD   = CFG.A_RSI_OVERSOLD;
@@ -526,6 +533,33 @@ class StrategyA {
           mtf:   mtfResult,
         });
         if (signal && signal.action === "BUY") {
+          // Microstructure entry gate — 진입 직전 슬리피지 + 호가창 검증
+          if (MICRO_GATE_ENABLED) {
+            try {
+              const microResult = await micro.analyze(MARKET, { simulatedBudgetKrw: 100_000 });
+              const passes = micro.passesEntryGate(microResult, {
+                maxSlippagePct: MICRO_MAX_SLIPPAGE_PCT,
+                minLiquidity:   MICRO_MIN_LIQUIDITY,
+              });
+              if (!passes) {
+                console.warn(
+                  `[StrategyA] BUY blocked by microstructure gate -- ` +
+                  `liq:${microResult.liquidityClass} slip:${microResult.buySlippagePct}% ` +
+                  `imb:${microResult.bidAskImbalance} signal:${microResult.microSignal}`
+                );
+                return;
+              }
+              if (MICRO_BLOCK_SELL_PRESSURE && microResult.microSignal === "SELL_PRESSURE") {
+                console.warn(
+                  `[StrategyA] BUY blocked by SELL_PRESSURE -- imb:${microResult.bidAskImbalance}`
+                );
+                return;
+              }
+            } catch (e) {
+              console.warn("[StrategyA] micro gate error:", e.message);
+              // 게이트 에러는 진입 차단 X (페일세이프) — 보수적이려면 차단으로 변경 가능
+            }
+          }
           await this._enter(MARKET, signal, regime, calibration);
         }
       }
