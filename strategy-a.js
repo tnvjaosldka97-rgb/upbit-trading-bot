@@ -58,6 +58,8 @@ class StrategyA {
     this.dataAggEngine = options.dataAggEngine || null;
     this.alphaEngine   = options.alphaEngine   || null;
     this.tradeLogger   = options.tradeLogger   || null;
+    this.riskManager   = options.riskManager   || null;
+    this.rotation      = options.rotation      || null;
     this.dryRun        = options.dryRun ?? true;
     this.initialCapital = options.initialCapital || 100_000;
 
@@ -533,6 +535,26 @@ class StrategyA {
           mtf:   mtfResult,
         });
         if (signal && signal.action === "BUY") {
+          // Rotation 게이트 — 전략 비활성 시 차단
+          if (this.rotation && !this.rotation.isStrategyActive("A")) {
+            console.warn("[StrategyA] BUY blocked — rotation engine deactivated");
+            return;
+          }
+
+          // Risk Manager 게이트 — 한도 + VaR 검증
+          if (this.riskManager) {
+            const budgetEstimate = Math.floor(this.initialCapital * 0.6); // Strategy A 자본 한도
+            const check = this.riskManager.checkEntry({
+              strategy: "A",
+              budgetKrw: budgetEstimate,
+              currentPositions: { A: this.sim.position },
+            });
+            if (!check.allowed) {
+              console.warn(`[StrategyA] BUY blocked by RiskManager — ${check.reason}`);
+              return;
+            }
+          }
+
           // Microstructure entry gate — 진입 직전 슬리피지 + 호가창 검증
           if (MICRO_GATE_ENABLED) {
             try {
@@ -779,6 +801,9 @@ class StrategyA {
       trail: pos.trailActive || false,
       dryRun: true,
     });
+
+    // Risk Manager 거래 결과 기록
+    this.riskManager?.recordTrade({ pnlKrw, isLoss: pnlRate < 0 });
 
     // Record for CalibrationEngine
     if (this.calibEngine) {

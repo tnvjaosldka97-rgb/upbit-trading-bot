@@ -46,6 +46,12 @@ const { TelegramNotifier }          = require("./telegram-notifier");
 const { CoinoneAdapter }            = require("./exchange-coinone");
 const { StrategyC }                 = require("./strategy-c");
 
+// 0.1% 퀀트 표준 인프라
+const { PerformanceTracker }        = require("./lib/performance");
+const { RotationEngine }            = require("./rotation-engine");
+const { RiskManager }               = require("./risk-manager");
+const { Reconciler }                = require("./reconciler");
+
 // ─── Config ───────────────────────────────────────────
 
 const INITIAL_KRW = Number(process.env.INITIAL_CAPITAL || 100_000);
@@ -95,6 +101,20 @@ class TradingBot {
     });
     this.tradeLogger.setOnLogged((row) => this._onTradeLogged(row));
 
+    // ── 0.1% 퀀트 인프라 (Performance + Rotation + Risk + Reconciler) ──
+    this.perfTracker = new PerformanceTracker();
+    this.rotation    = new RotationEngine({
+      tracker:  this.perfTracker,
+      notifier: this.notifier,
+    });
+    this.riskManager = new RiskManager({
+      totalCapital: INITIAL_KRW,
+    });
+    this.reconciler  = new Reconciler({
+      orderService: this.orderService,
+      notifier:     this.notifier,
+    });
+
     // ── Multi-factor signal engines ───────────────
     this.mds           = new MarketDataService();
     this.macroEngine   = new MacroSignalEngine(this.mds);
@@ -110,6 +130,8 @@ class TradingBot {
       dataAggEngine:  this.dataAggEngine,
       alphaEngine:    this.alphaEngine,
       tradeLogger:    this.tradeLogger,
+      riskManager:    this.riskManager,
+      rotation:       this.rotation,
       initialCapital: CAPITAL_A,
       dryRun:         DRY_RUN,
     });
@@ -208,6 +230,21 @@ class TradingBot {
     // ── Start Telegram notifier ─────────────────────
     await this.notifier.init();
     this.notifier.setDailySummaryCallback(() => this._sendDailySummary());
+
+    // ── Reconciliation (LIVE 모드일 때만) ──────────
+    if (!DRY_RUN) {
+      try {
+        const recon = await this.reconciler.reconcileOnStartup();
+        if (recon.openOrders.length > 0 || recon.balanceMismatch.length > 0) {
+          console.warn(`[TradingBot] reconciliation 발견사항: 미체결 ${recon.openOrders.length} / 잔고불일치 ${recon.balanceMismatch.length}`);
+        }
+      } catch (e) {
+        console.error("[TradingBot] reconciliation error:", e.message);
+      }
+    }
+
+    // ── Start Rotation Engine (매일 자정 알파 회귀 검증) ──
+    this.rotation.start();
 
     // ── Start calibration engine ───────────────────
     this.calibEngine.start(60_000);
@@ -525,6 +562,29 @@ class TradingBot {
         if (url.pathname === "/api/strategy-c") {
           res.writeHead(200, { "Content-Type": "application/json" });
           res.end(JSON.stringify(this.strategyC?.getSummary() || { running: false, reason: "not initialized" }));
+          return;
+        }
+
+        if (url.pathname === "/api/performance") {
+          const strategy = url.searchParams.get("strategy");
+          const days     = Number(url.searchParams.get("days")) || 30;
+          res.writeHead(200, { "Content-Type": "application/json" });
+          res.end(JSON.stringify({
+            stats:   this.perfTracker?.computeStats(strategy, days) || null,
+            history: this.perfTracker?.getHistory(strategy || "ALL", 90) || [],
+          }));
+          return;
+        }
+
+        if (url.pathname === "/api/rotation") {
+          res.writeHead(200, { "Content-Type": "application/json" });
+          res.end(JSON.stringify(this.rotation?.getSummary() || {}));
+          return;
+        }
+
+        if (url.pathname === "/api/risk") {
+          res.writeHead(200, { "Content-Type": "application/json" });
+          res.end(JSON.stringify(this.riskManager?.getSummary() || {}));
           return;
         }
 
@@ -986,9 +1046,13 @@ ${(stratB.detections || []).slice(0, 10).map(d =>
     // Stop arbitrage subsystem
     this._stopArbSubsystem();
 
-    // Close trade journal + notifier
+    // Close trade journal + notifier + 0.1% 인프라
     try { this.tradeLogger?.close(); } catch {}
     try { this.notifier?.stop(); } catch {}
+    try { this.rotation?.stop(); } catch {}
+    try { this.perfTracker?.close(); } catch {}
+    try { this.riskManager?.close(); } catch {}
+    try { this.reconciler?.close(); } catch {}
 
     // Close WebSocket
     if (this._ws) {
