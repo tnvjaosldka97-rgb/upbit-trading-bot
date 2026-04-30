@@ -51,6 +51,7 @@ const { PerformanceTracker }        = require("./lib/performance");
 const { RotationEngine }            = require("./rotation-engine");
 const { RiskManager }               = require("./risk-manager");
 const { Reconciler }                = require("./reconciler");
+const { AutoBacktest }              = require("./auto-backtest");
 
 // ─── Config ───────────────────────────────────────────
 
@@ -113,6 +114,9 @@ class TradingBot {
     this.reconciler  = new Reconciler({
       orderService: this.orderService,
       notifier:     this.notifier,
+    });
+    this.autoBacktest = new AutoBacktest({
+      notifier: this.notifier,
     });
 
     // ── Multi-factor signal engines ───────────────
@@ -247,6 +251,9 @@ class TradingBot {
 
     // ── Start Rotation Engine (매일 자정 알파 회귀 검증) ──
     this.rotation.start();
+
+    // ── Auto Backtest (매주 일요일 03:00 KST) ─────────
+    this.autoBacktest.start();
 
     // ── Start calibration engine ───────────────────
     this.calibEngine.start(60_000);
@@ -587,6 +594,21 @@ class TradingBot {
         if (url.pathname === "/api/risk") {
           res.writeHead(200, { "Content-Type": "application/json" });
           res.end(JSON.stringify(this.riskManager?.getSummary() || {}));
+          return;
+        }
+
+        if (url.pathname === "/api/backtest-history") {
+          const limit = Number(url.searchParams.get("limit")) || 10;
+          res.writeHead(200, { "Content-Type": "application/json" });
+          res.end(JSON.stringify(this.autoBacktest?.getRecentRuns(limit) || []));
+          return;
+        }
+
+        if (url.pathname === "/api/backtest-now") {
+          // 수동 트리거 (테스트용)
+          res.writeHead(202, { "Content-Type": "application/json" });
+          res.end(JSON.stringify({ status: "started" }));
+          this.autoBacktest?.runBacktest("multi").catch(() => {});
           return;
         }
 
@@ -1103,6 +1125,8 @@ ${(stratB.detections || []).slice(0, 10).map(d =>
     try { this.tradeLogger?.close(); } catch {}
     try { this.notifier?.stop(); } catch {}
     try { this.rotation?.stop(); } catch {}
+    try { this.autoBacktest?.stop(); } catch {}
+    try { this.autoBacktest?.close(); } catch {}
     try { this.perfTracker?.close(); } catch {}
     try { this.riskManager?.close(); } catch {}
     try { this.reconciler?.close(); } catch {}
