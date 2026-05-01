@@ -20,11 +20,13 @@
 const { EventEmitter } = require("events");
 
 const POLL_INTERVAL_MS  = 30_000;          // 3거래소 동시 폴링 주기
-const MIN_NET_PROFIT    = 0.005;            // 0.5% 순이익(수수료 차감 후) 이상만
+const MIN_NET_PROFIT    = 0.010;            // 1.0% 순이익 이상만 (0.5% → 1.0% 강화)
+const TELEGRAM_NET_PROFIT = 0.015;          // Telegram 알림은 1.5% 이상만
 const MAX_NET_PROFIT    = 0.05;             // 5% 초과는 데이터 이상 (sanity)
-const SUSTAIN_THRESHOLD = 30_000;          // 30초 이상 유지된 기회만 alert
-const MAX_CONCURRENT    = 8;                // 한 폴링 사이클당 동시 ticker 호출 한도
-const ALERT_DEDUP_MS    = 5 * 60_000;      // 같은 코인+페어 alert 5분 1회
+const SUSTAIN_THRESHOLD = 60_000;          // 60초 이상 유지된 기회만 alert (30s → 60s)
+const MAX_CONCURRENT    = 8;
+const ALERT_DEDUP_MS    = 60 * 60_000;     // 같은 코인+페어 alert 1시간 1회 (5분 → 1시간)
+const TELEGRAM_RATE_LIMIT_PER_HOUR = 10;   // 시간당 Telegram 알림 최대 10건
 
 // 메모리 leak 방지
 const COIN_STATS_PRUNE_MS = 24 * 60 * 60_000;  // 24h 안 본 코인 stats 제거
@@ -90,9 +92,10 @@ class StrategyC extends EventEmitter {
 
     this._intervalId   = null;
     this._running      = false;
-    this._commonCoins  = [];      // 3거래소 공통 KRW 코인 (대문자 base)
-    this._lastAlerts   = new Map(); // dedup: key=`${coin}-${buyEx}-${sellEx}` → ts
-    this._sustainTrack = new Map(); // 기회 시작 시각: key → firstSeenTs
+    this._commonCoins  = [];
+    this._lastAlerts   = new Map();
+    this._sustainTrack = new Map();
+    this._telegramSentTimes = []; // Telegram rate limit 추적
     this._stats = {
       cycles:    0,
       detected:  0,
@@ -357,17 +360,22 @@ class StrategyC extends EventEmitter {
       }
     }
 
-    // Telegram 알림
-    if (this.notifier?.send) {
-      try {
-        this.notifier.send(
-          `💎 <b>한국 3사 차익 (Strategy C)</b>\n` +
-          `코인: <b>${opp.coin}</b>\n` +
-          `${opp.buyExchange.toUpperCase()} ${opp.buyPrice.toLocaleString()}원 매수\n` +
-          `${opp.sellExchange.toUpperCase()} ${opp.sellPrice.toLocaleString()}원 매도\n` +
-          `순이익: <b>+${opp.netProfitPct.toFixed(2)}%</b> (${(opp.sustainedMs / 1000).toFixed(0)}초 지속)`
-        );
-      } catch {}
+    // Telegram 알림 — 1.5%+ 만 + 시간당 10건 rate limit
+    if (this.notifier?.send && opp.netProfitPct >= TELEGRAM_NET_PROFIT * 100) {
+      const now = Date.now();
+      this._telegramSentTimes = this._telegramSentTimes.filter(t => now - t < 60 * 60_000);
+      if (this._telegramSentTimes.length < TELEGRAM_RATE_LIMIT_PER_HOUR) {
+        this._telegramSentTimes.push(now);
+        try {
+          this.notifier.send(
+            `💎 <b>한국 차익 (Strategy C)</b>\n` +
+            `코인: <b>${opp.coin}</b>\n` +
+            `${opp.buyExchange.toUpperCase()} ${opp.buyPrice.toLocaleString()}원 매수\n` +
+            `${opp.sellExchange.toUpperCase()} ${opp.sellPrice.toLocaleString()}원 매도\n` +
+            `순이익: <b>+${opp.netProfitPct.toFixed(2)}%</b> (${(opp.sustainedMs / 1000).toFixed(0)}초 지속)`
+          );
+        } catch {}
+      }
     }
 
     this.emit("opportunity", opp);
