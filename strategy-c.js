@@ -18,6 +18,7 @@
  */
 
 const { EventEmitter } = require("events");
+const simExec = require("./lib/sim-execution");
 
 const POLL_INTERVAL_MS  = 30_000;          // 3거래소 동시 폴링 주기
 const MIN_NET_PROFIT    = 0.010;            // 1.0% 순이익 이상만 (0.5% → 1.0% 강화)
@@ -80,6 +81,8 @@ class StrategyC extends EventEmitter {
    * @param {Object} opts.korbit   KorbitAdapter (한국 4사 확장)
    * @param {Object} opts.arbLogger ArbDataLogger 인스턴스 (optional, 기록용)
    * @param {Object} opts.notifier TelegramNotifier 인스턴스 (optional, 알림용)
+   * @param {Object} opts.tradeLogger TradeLogger (sim 거래 기록용)
+   * @param {Object} opts.simBudgetKrw 시뮬 거래당 예산 (기본 100,000원)
    */
   constructor(opts = {}) {
     super();
@@ -89,6 +92,9 @@ class StrategyC extends EventEmitter {
     this.korbit   = opts.korbit   || null;
     this.arbLogger = opts.arbLogger || null;
     this.notifier = opts.notifier || null;
+    this.tradeLogger = opts.tradeLogger || null;
+    this.simBudgetKrw = opts.simBudgetKrw || 100_000;
+    this._simTradeTimes = []; // sim 거래 rate limit 추적
 
     this._intervalId   = null;
     this._running      = false;
@@ -324,8 +330,101 @@ class StrategyC extends EventEmitter {
     }
   }
 
+  /**
+   * Sim 거래 실행 — 차익 기회 발견 시 sim 매수+매도 동시 시뮬
+   *   라우팅 + 레이턴시 + 슬리피지 모두 반영
+   *   시간당 최대 5건 (rate limit)
+   */
+  async _executeSimTrade(opp) {
+    // Rate limit: 시간당 5건 sim 거래만
+    const now = Date.now();
+    this._simTradeTimes = this._simTradeTimes.filter(t => now - t < 60 * 60_000);
+    if (this._simTradeTimes.length >= 5) return;
+    this._simTradeTimes.push(now);
+
+    // 한국 거래소만 → KRW 마켓 (이미 KRW 페어임)
+    const buyMarket  = `KRW-${opp.coin}`;
+    const sellMarket = `KRW-${opp.coin}`;
+    const qty = this.simBudgetKrw / opp.buyPrice;
+
+    try {
+      // 매수 + 매도 동시 시뮬 (Promise.all = atomic execution 시뮬)
+      const [buyResult, sellResult] = await Promise.all([
+        simExec.simulateExecution({
+          market: buyMarket, side: "BUY", requestedQty: qty,
+          requestedPrice: opp.buyPrice, exchange: opp.buyExchange, useOrderbook: false,
+        }),
+        simExec.simulateExecution({
+          market: sellMarket, side: "SELL", requestedQty: qty,
+          requestedPrice: opp.sellPrice, exchange: opp.sellExchange, useOrderbook: false,
+        }),
+      ]);
+
+      const actualBuyPrice  = buyResult.avgPrice  || opp.buyPrice;
+      const actualSellPrice = sellResult.avgPrice || opp.sellPrice;
+      const actualQty = Math.min(buyResult.executedQty || qty, sellResult.executedQty || qty);
+
+      const grossPct = (actualSellPrice - actualBuyPrice) / actualBuyPrice;
+      const feePct   = (FEES[opp.buyExchange] || 0) + (FEES[opp.sellExchange] || 0);
+      const netPct   = grossPct - feePct;
+      const pnlKrw   = (actualSellPrice - actualBuyPrice) * actualQty - this.simBudgetKrw * feePct;
+
+      console.log(
+        `[StrategyC] SIM TRADE — ${opp.coin} ` +
+        `BUY ${opp.buyExchange}@${actualBuyPrice.toLocaleString()} ` +
+        `SELL ${opp.sellExchange}@${actualSellPrice.toLocaleString()} ` +
+        `net:${(netPct * 100).toFixed(3)}% PnL:${Math.round(pnlKrw)}원 ` +
+        `(buyLat:${buyResult.latencyMs}ms sellLat:${sellResult.latencyMs}ms)`
+      );
+
+      // TradeLogger 기록 (양쪽 거래 모두)
+      if (this.tradeLogger) {
+        this.tradeLogger.logBuy({
+          strategy: "C",
+          market:   `${opp.buyExchange}_${buyMarket}`,
+          price:    actualBuyPrice,
+          quantity: actualQty,
+          budget:   this.simBudgetKrw,
+          dryRun:   true,
+        });
+        this.tradeLogger.logSell({
+          strategy: "C",
+          market:   `${opp.sellExchange}_${sellMarket}`,
+          price:    actualSellPrice,
+          quantity: actualQty,
+          budget:   this.simBudgetKrw,
+          reason:   "arb_close",
+          pnlRate:  netPct,
+          pnlKrw:   pnlKrw,
+          dryRun:   true,
+        });
+      }
+
+      // Telegram — 매수+매도 한 메시지로
+      if (this.notifier?.send) {
+        const sign = pnlKrw >= 0 ? "💰" : "🛑";
+        this.notifier.send(
+          `${sign} <b>Strategy C SIM 거래</b>\n` +
+          `${opp.coin} ${opp.buyExchange.toUpperCase()}→${opp.sellExchange.toUpperCase()}\n` +
+          `매수: ${actualBuyPrice.toLocaleString()}원\n` +
+          `매도: ${actualSellPrice.toLocaleString()}원\n` +
+          `순이익: <b>+${(netPct * 100).toFixed(3)}%</b> = ${Math.round(pnlKrw).toLocaleString()}원\n` +
+          `슬리피지: 매수 ${buyResult.slippagePct.toFixed(3)}% / 매도 ${sellResult.slippagePct.toFixed(3)}%\n` +
+          `레이턴시: ${buyResult.latencyMs}+${sellResult.latencyMs}ms`
+        );
+      }
+    } catch (e) {
+      console.warn("[StrategyC] sim trade error:", e.message);
+    }
+  }
+
   _handleSustainedOpportunity(opp) {
     this._stats.alerted++;
+
+    // 시뮬 거래 실행 (1.5%+만, 시간당 5건 한도)
+    if (opp.netProfitPct >= 1.5) {
+      this._executeSimTrade(opp).catch(() => {});
+    }
 
     // Coin alpha tracking
     const cs = this._coinStats.get(opp.coin) || { count: 0, sumNet: 0, maxNet: 0, lastSeen: 0 };

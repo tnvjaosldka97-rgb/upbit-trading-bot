@@ -446,8 +446,10 @@ class TradingBot {
         bithumb:   restExchanges.bithumb,
         coinone,
         korbit,
-        arbLogger: this.arbLogger,
-        notifier:  this.notifier,
+        arbLogger:   this.arbLogger,
+        notifier:    this.notifier,
+        tradeLogger: this.tradeLogger,
+        simBudgetKrw: 100_000,
       });
 
       // Strategy Pairs — BTC/ETH/XRP/SOL/DOGE mean reversion (시장 중립 통계 차익)
