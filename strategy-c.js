@@ -26,6 +26,11 @@ const SUSTAIN_THRESHOLD = 30_000;          // 30초 이상 유지된 기회만 a
 const MAX_CONCURRENT    = 8;                // 한 폴링 사이클당 동시 ticker 호출 한도
 const ALERT_DEDUP_MS    = 5 * 60_000;      // 같은 코인+페어 alert 5분 1회
 
+// 메모리 leak 방지
+const COIN_STATS_PRUNE_MS = 24 * 60 * 60_000;  // 24h 안 본 코인 stats 제거
+const COIN_STATS_MAX_SIZE = 500;
+const LAST_ALERTS_PRUNE_MS = 60 * 60_000;      // 1h 지난 alert 제거
+
 // 2거래소 가격 비율 sanity — 한쪽이 다른쪽의 50%~200% 범위 벗어나면 단위 오류
 const MIN_PRICE_RATIO = 0.5;
 const MAX_PRICE_RATIO = 2.0;
@@ -269,9 +274,23 @@ class StrategyC extends EventEmitter {
     }
 
     // 알림 dedup map 정리 (1시간 지난 항목 제거)
-    const cutoff = now - 60 * 60_000;
+    const cutoff = now - LAST_ALERTS_PRUNE_MS;
     for (const [k, ts] of this._lastAlerts) {
       if (ts < cutoff) this._lastAlerts.delete(k);
+    }
+
+    // _coinStats prune (24h 안 본 코인 + 사이즈 한도)
+    if (this._stats.cycles % 60 === 0) {
+      const coinCutoff = now - COIN_STATS_PRUNE_MS;
+      for (const [coin, s] of this._coinStats) {
+        if (s.lastSeen < coinCutoff) this._coinStats.delete(coin);
+      }
+      if (this._coinStats.size > COIN_STATS_MAX_SIZE) {
+        // 가장 오래된 항목부터 제거
+        const sorted = [...this._coinStats.entries()].sort((a, b) => a[1].lastSeen - b[1].lastSeen);
+        const toRemove = sorted.slice(0, this._coinStats.size - COIN_STATS_MAX_SIZE);
+        for (const [c] of toRemove) this._coinStats.delete(c);
+      }
     }
 
     if (this._stats.cycles % 10 === 0) {
