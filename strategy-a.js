@@ -17,6 +17,7 @@ const indicators = require("./lib/indicators");
 const mtf = require("./lib/multi-timeframe");
 const micro = require("./lib/microstructure");
 const sanity = require("./lib/sanity");
+const simExec = require("./lib/sim-execution");
 const UPBIT_API = "https://api.upbit.com";
 
 // Multi-timeframe 통합 — 환경변수로 활성/비활성 제어
@@ -622,25 +623,50 @@ class StrategyA {
         return;
       }
 
+      // 시뮬 실행 — 라우팅 + 레이턴시 + 슬리피지 시뮬
+      const simResult = await simExec.simulateExecution({
+        market,
+        side: "BUY",
+        requestedQty: budget / price,
+        requestedPrice: price,
+        exchange: "upbit",
+        useOrderbook: true,
+      });
+      if (simResult.reason === "rejected_simulated") {
+        console.warn(`[StrategyA] sim 진입 rejected (${simResult.latencyMs}ms)`);
+        return;
+      }
+      // 시뮬 결과 반영 (실제 평균체결가 + 부분체결)
+      const simPrice = simResult.avgPrice || price;
+      const simQty   = simResult.executedQty || (budget / price);
+      const simBudget = simQty * simPrice;
+      console.log(
+        `[StrategyA] sim exec — ${market} ${simResult.partial ? "PARTIAL" : "FILLED"} ` +
+        `${simQty.toFixed(8)}@${simPrice.toLocaleString()} ` +
+        `(slip:${simResult.slippagePct.toFixed(3)}% lat:${simResult.latencyMs}ms)`
+      );
+
       const atr = signal._meta?.atr || price * 0.01;
       const atrStop = atr > 0 ? (atr / price) * ATR_TRAIL_MULT : 0.015;
 
       this.sim.position = {
         market,
-        entryPrice:  price,
-        quantity:    budget / price,
-        budget,
-        targetPrice: signal.takeProfit || price * (1 + DEFAULT_TARGET),
-        stopPrice:   signal.stopLoss   || price * (1 + DEFAULT_STOP),
+        entryPrice:  simPrice,           // 시뮬 평균체결가 (슬리피지 반영)
+        quantity:    simQty,             // 시뮬 실제 체결 수량 (부분체결 반영)
+        budget:      simBudget,
+        targetPrice: simPrice * (1 + ((signal.takeProfit / price - 1) || DEFAULT_TARGET)),
+        stopPrice:   simPrice * (1 + ((signal.stopLoss   / price - 1) || DEFAULT_STOP)),
         atrStop,
-        peakPrice:   price,
+        peakPrice:   simPrice,
         trailActive: false,
-        partialDone: false,
+        partialDone: simResult.partial || false,
         openedAt:    Date.now(),
         entryScore:  signal.score,
         regime:      regime?.regime || "RANGE",
+        slippagePct: simResult.slippagePct,
+        latencyMs:   simResult.latencyMs,
       };
-      this.sim.cash -= budget;
+      this.sim.cash -= simBudget;
 
       console.log(
         `[StrategyA] ENTERED -- ${market} @${price.toLocaleString()} ` +

@@ -113,8 +113,9 @@ class TradingBot {
     this.tradeLogger = new TradeLogger("./trades.db");
 
     // ── Telegram notifier (자동 비활성화 if no .env keys) ──
+    // TELEGRAM_TOKEN 또는 TELEGRAM_BOT_TOKEN (prediction_edge 호환) 둘 다 인식
     this.notifier = new TelegramNotifier({
-      token:  process.env.TELEGRAM_TOKEN,
+      token:  process.env.TELEGRAM_TOKEN || process.env.TELEGRAM_BOT_TOKEN,
       chatId: process.env.TELEGRAM_CHAT_ID,
     });
     this.tradeLogger.setOnLogged((row) => this._onTradeLogged(row));
@@ -1219,8 +1220,12 @@ ${(stratB.detections || []).slice(0, 10).map(d =>
     try { this.watchdog?.heartbeat(); } catch {}
 
     if (!this.notifier) return;
-    // LIVE 거래만 Telegram 알림 (DRY_RUN 시뮬레이션은 노이즈)
-    if (row.dry_run) return;
+
+    // DRY_RUN 거래도 Telegram 알림 (검증 단계 — 시뮬 거래 패턴 확인용)
+    // LIVE 전환 후 노이즈 줄이려면 NOTIFY_SIM_TRADES=false 환경변수
+    const notifySim = process.env.NOTIFY_SIM_TRADES !== "false";
+    if (row.dry_run && !notifySim) return;
+    const simBadge = row.dry_run ? " [SIM]" : "";
     try {
       if (row.side === "BUY") {
         const targetRate = row.strategy === "B" ? 0.30 : 0.035;
