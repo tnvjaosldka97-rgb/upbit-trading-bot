@@ -53,6 +53,9 @@ const { StrategyPairs }             = require("./strategy-pairs");
 // Strategy Funding — Cash & Carry (perp vs spot)
 const { StrategyFunding }           = require("./strategy-funding");
 
+// On-chain Whale Tracker
+const { WhaleTracker }              = require("./whale-tracker");
+
 // 0.1% 퀀트 표준 인프라
 const { PerformanceTracker }        = require("./lib/performance");
 const { RotationEngine }            = require("./rotation-engine");
@@ -458,6 +461,12 @@ class TradingBot {
         arbLogger: this.arbLogger,
       });
 
+      // Whale Tracker — 온체인 큰 트랜잭션 모니터
+      this.whaleTracker = new WhaleTracker({
+        notifier:  this.notifier,
+        arbLogger: this.arbLogger,
+      });
+
       console.log("[TradingBot] arbitrage subsystem initialized (6 exchanges + StrategyC KRW3, public data)");
     } catch (e) {
       console.error("[TradingBot] arb init failed:", e.message, e.stack);
@@ -510,6 +519,13 @@ class TradingBot {
         console.error("[TradingBot] StrategyFunding start failed:", e.message);
       }
 
+      // 3e) Whale Tracker — 온체인 큰 트랜잭션 모니터
+      try {
+        if (this.whaleTracker) await this.whaleTracker.start();
+      } catch (e) {
+        console.error("[TradingBot] WhaleTracker start failed:", e.message);
+      }
+
       // 4) Sanity check: logger actually ready?
       if (this.arbLogger._ready) {
         console.log("[TradingBot] ArbDataLogger ready — DB persistence active");
@@ -544,6 +560,7 @@ class TradingBot {
     try { this.strategyC?.stop(); } catch {}
     try { this.strategyPairs?.stop(); } catch {}
     try { this.strategyFunding?.stop(); } catch {}
+    try { this.whaleTracker?.stop(); } catch {}
   }
 
   // ─── WebSocket Init (optional, ws package) ──────────
@@ -668,6 +685,12 @@ class TradingBot {
         if (url.pathname === "/api/strategy-funding") {
           res.writeHead(200, { "Content-Type": "application/json" });
           res.end(JSON.stringify(this.strategyFunding?.getSummary() || { running: false }));
+          return;
+        }
+
+        if (url.pathname === "/api/whale-tracker") {
+          res.writeHead(200, { "Content-Type": "application/json" });
+          res.end(JSON.stringify(this.whaleTracker?.getSummary() || { running: false }));
           return;
         }
 
