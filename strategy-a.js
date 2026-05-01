@@ -18,6 +18,9 @@ const mtf = require("./lib/multi-timeframe");
 const micro = require("./lib/microstructure");
 const sanity = require("./lib/sanity");
 const simExec = require("./lib/sim-execution");
+const orderFlow = require("./lib/order-flow");
+
+const ORDER_FLOW_ENABLED = process.env.A_ORDER_FLOW_ENABLED !== "false"; // 기본 ON
 const UPBIT_API = "https://api.upbit.com";
 
 // Multi-timeframe 통합 — 환경변수로 활성/비활성 제어
@@ -292,6 +295,17 @@ class StrategyA {
     }
 
     // ═══════════════════════════════════════════════════
+    //  CATEGORY 6: ORDER FLOW TOXICITY (큰 손 vs 개미) — max ±15
+    // ═══════════════════════════════════════════════════
+    let flowScore = 0;
+    if (externalSignals.flow) {
+      flowScore = externalSignals.flow.scoreContribution || 0;
+      if (flowScore !== 0) {
+        reasons.push(`FLOW_${externalSignals.flow.signal}(${flowScore})`);
+      }
+    }
+
+    // ═══════════════════════════════════════════════════
     //  CATEGORY 5: MULTI-TIMEFRAME (4h+1h+15m+5m 정합) — max ±25
     // ═══════════════════════════════════════════════════
     let mtfScore = 0;
@@ -306,7 +320,7 @@ class StrategyA {
     // ═══════════════════════════════════════════════════
     //  CONFLUENCE GATE + FINAL DECISION
     // ═══════════════════════════════════════════════════
-    const score = taScore + macroScore + dataScore + tapeScore + mtfScore;
+    const score = taScore + macroScore + dataScore + tapeScore + mtfScore + flowScore;
 
     let confluence = 0;
     if (taScore > 0) confluence++;
@@ -314,6 +328,7 @@ class StrategyA {
     if (dataScore > 0) confluence++;
     if (tapeScore > 0) confluence++;
     if (mtfScore > 0) confluence++;
+    if (flowScore > 0) confluence++;
 
     const confidence = Math.min(Math.max(score / 120, 0), 1);
 
@@ -335,8 +350,8 @@ class StrategyA {
     if (score >= ENTRY_THRESHOLD && confluence >= MIN_CONFLUENCE) {
       console.log(
         `[StrategyA] BUY signal -- ${MARKET} score:${score} ` +
-        `confluence:${confluence}/5 ` +
-        `[TA:${taScore} MACRO:${macroScore} DATA:${dataScore} TAPE:${tapeScore} MTF:${mtfScore}] ` +
+        `confluence:${confluence}/6 ` +
+        `[TA:${taScore} MACRO:${macroScore} DATA:${dataScore} TAPE:${tapeScore} MTF:${mtfScore} FLOW:${flowScore}] ` +
         `[${reasons.join(",")}]`
       );
       return {
@@ -515,6 +530,21 @@ class StrategyA {
           if (this.alphaEngine) tapeSignals = await this.alphaEngine.analyzeTape(MARKET);
         } catch {}
 
+        // Order Flow Toxicity (1분 캐시)
+        let flowResult = null;
+        if (ORDER_FLOW_ENABLED) {
+          if (!this._flowCache || (now - this._flowCache.ts) > 60_000) {
+            try {
+              flowResult = await orderFlow.analyze(MARKET);
+              this._flowCache = { ts: now, result: flowResult };
+            } catch (e) {
+              console.warn("[StrategyA] order-flow:", e.message);
+            }
+          } else {
+            flowResult = this._flowCache.result;
+          }
+        }
+
         // Multi-timeframe 정합 (옵션, 5분 캐시)
         let mtfResult = null;
         if (MTF_ENABLED) {
@@ -535,6 +565,7 @@ class StrategyA {
           data:  dataSignals,
           tape:  tapeSignals,
           mtf:   mtfResult,
+          flow:  flowResult,
         });
         if (signal && signal.action === "BUY") {
           // Rotation 게이트 — 전략 비활성 시 차단
