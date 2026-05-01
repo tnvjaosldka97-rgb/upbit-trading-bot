@@ -56,6 +56,9 @@ const { StrategyFunding }           = require("./strategy-funding");
 // On-chain Whale Tracker
 const { WhaleTracker }              = require("./whale-tracker");
 
+// ML Alpha 자가 발견
+const { MLAlpha }                   = require("./lib/ml-alpha");
+
 // 0.1% 퀀트 표준 인프라
 const { PerformanceTracker }        = require("./lib/performance");
 const { RotationEngine }            = require("./rotation-engine");
@@ -470,6 +473,17 @@ class TradingBot {
         arbLogger: this.arbLogger,
       });
 
+      // ML Alpha 자가 발견 (logistic regression)
+      this.mlAlpha = new MLAlpha({});
+      // 매일 자정 자동 재학습 (Rotation engine과 함께)
+      this._mlIntervalId = setInterval(() => {
+        const now = new Date();
+        const kstHour = (now.getUTCHours() + 9) % 24;
+        if (kstHour === 0 && now.getUTCMinutes() < 5) {
+          this.mlAlpha.train().catch(e => console.error("[MLAlpha] train:", e.message));
+        }
+      }, 5 * 60_000);
+
       console.log("[TradingBot] arbitrage subsystem initialized (6 exchanges + StrategyC KRW3, public data)");
     } catch (e) {
       console.error("[TradingBot] arb init failed:", e.message, e.stack);
@@ -564,6 +578,8 @@ class TradingBot {
     try { this.strategyPairs?.stop(); } catch {}
     try { this.strategyFunding?.stop(); } catch {}
     try { this.whaleTracker?.stop(); } catch {}
+    try { if (this._mlIntervalId) clearInterval(this._mlIntervalId); } catch {}
+    try { this.mlAlpha?.close(); } catch {}
   }
 
   // ─── WebSocket Init (optional, ws package) ──────────
@@ -694,6 +710,19 @@ class TradingBot {
         if (url.pathname === "/api/whale-tracker") {
           res.writeHead(200, { "Content-Type": "application/json" });
           res.end(JSON.stringify(this.whaleTracker?.getSummary() || { running: false }));
+          return;
+        }
+
+        if (url.pathname === "/api/ml-alpha") {
+          res.writeHead(200, { "Content-Type": "application/json" });
+          res.end(JSON.stringify(this.mlAlpha?.getSummary() || {}));
+          return;
+        }
+
+        if (url.pathname === "/api/ml-train-now") {
+          res.writeHead(202, { "Content-Type": "application/json" });
+          res.end(JSON.stringify({ status: "training" }));
+          this.mlAlpha?.train().catch(() => {});
           return;
         }
 
