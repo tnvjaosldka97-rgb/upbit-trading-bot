@@ -21,6 +21,7 @@ const simExec = require("./lib/sim-execution");
 const orderFlow = require("./lib/order-flow");
 
 const ORDER_FLOW_ENABLED = process.env.A_ORDER_FLOW_ENABLED !== "false"; // 기본 ON
+const ORDER_TYPE = process.env.A_ORDER_TYPE === "maker" ? "maker" : "taker"; // 기본 taker
 const UPBIT_API = "https://api.upbit.com";
 
 // Multi-timeframe 통합 — 환경변수로 활성/비활성 제어
@@ -654,7 +655,7 @@ class StrategyA {
         return;
       }
 
-      // 시뮬 실행 — 라우팅 + 레이턴시 + 슬리피지 시뮬
+      // 시뮬 실행 — 라우팅 + 레이턴시 + 슬리피지 시뮬 (taker 또는 maker)
       const simResult = await simExec.simulateExecution({
         market,
         side: "BUY",
@@ -662,6 +663,8 @@ class StrategyA {
         requestedPrice: price,
         exchange: "upbit",
         useOrderbook: true,
+        orderType: ORDER_TYPE,
+        makerWaitMs: 60_000,
       });
       if (simResult.reason === "rejected_simulated") {
         console.warn(`[StrategyA] sim 진입 rejected (${simResult.latencyMs}ms)`);
