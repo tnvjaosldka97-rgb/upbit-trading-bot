@@ -21,9 +21,14 @@ const { EventEmitter } = require("events");
 
 const POLL_INTERVAL_MS  = 30_000;          // 3거래소 동시 폴링 주기
 const MIN_NET_PROFIT    = 0.005;            // 0.5% 순이익(수수료 차감 후) 이상만
+const MAX_NET_PROFIT    = 0.05;             // 5% 초과는 데이터 이상 (sanity)
 const SUSTAIN_THRESHOLD = 30_000;          // 30초 이상 유지된 기회만 alert
 const MAX_CONCURRENT    = 8;                // 한 폴링 사이클당 동시 ticker 호출 한도
 const ALERT_DEDUP_MS    = 5 * 60_000;      // 같은 코인+페어 alert 5분 1회
+
+// 2거래소 가격 비율 sanity — 한쪽이 다른쪽의 50%~200% 범위 벗어나면 단위 오류
+const MIN_PRICE_RATIO = 0.5;
+const MAX_PRICE_RATIO = 2.0;
 
 // 거래소별 maker/taker 평균 수수료 (편도)
 const FEES = {
@@ -35,12 +40,27 @@ const FEES = {
 /**
  * 두 거래소 (buy@A, sell@B) 가정 시 net profit 계산
  *   net = (sell - buy) / buy - feeA(buy) - feeB(sell)
+ *
+ * Sanity:
+ *   - 가격 0/음수 → -1
+ *   - 두 가격 비율 0.5~2.0 벗어남 → -1 (단위 오류 의심)
+ *   - 차익 5% 초과 → -1 (실제로는 호가 거의 없거나 데이터 오류)
  */
 function netProfit(priceBuy, priceSell, exA, exB) {
   if (priceBuy <= 0 || priceSell <= 0) return -1;
+
+  // 가격 비율 sanity
+  const ratio = priceSell / priceBuy;
+  if (ratio < MIN_PRICE_RATIO || ratio > MAX_PRICE_RATIO) return -1;
+
   const gross  = (priceSell - priceBuy) / priceBuy;
   const feeSum = (FEES[exA] || 0) + (FEES[exB] || 0);
-  return gross - feeSum;
+  const net = gross - feeSum;
+
+  // 비정상적으로 큰 차익 차단
+  if (net > MAX_NET_PROFIT) return -1;
+
+  return net;
 }
 
 class StrategyC extends EventEmitter {
