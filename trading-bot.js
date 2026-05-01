@@ -47,6 +47,9 @@ const { CoinoneAdapter }            = require("./exchange-coinone");
 const { KorbitAdapter }             = require("./exchange-korbit");
 const { StrategyC }                 = require("./strategy-c");
 
+// Strategy Pairs — 통계적 차익
+const { StrategyPairs }             = require("./strategy-pairs");
+
 // 0.1% 퀀트 표준 인프라
 const { PerformanceTracker }        = require("./lib/performance");
 const { RotationEngine }            = require("./rotation-engine");
@@ -440,6 +443,12 @@ class TradingBot {
         notifier:  this.notifier,
       });
 
+      // Strategy Pairs — BTC/ETH/XRP/SOL/DOGE mean reversion (시장 중립 통계 차익)
+      this.strategyPairs = new StrategyPairs({
+        notifier:  this.notifier,
+        arbLogger: this.arbLogger,
+      });
+
       console.log("[TradingBot] arbitrage subsystem initialized (6 exchanges + StrategyC KRW3, public data)");
     } catch (e) {
       console.error("[TradingBot] arb init failed:", e.message, e.stack);
@@ -471,11 +480,18 @@ class TradingBot {
       await this.arb.start();
       await this.arbLogger.start();
 
-      // 3b) Strategy C (한국 3사 동일지역 차익) — 시장 중립
+      // 3b) Strategy C (한국 4사 동일지역 차익) — 시장 중립
       try {
         if (this.strategyC) await this.strategyC.start();
       } catch (e) {
         console.error("[TradingBot] StrategyC start failed:", e.message);
+      }
+
+      // 3c) Strategy Pairs (BTC/ETH/XRP mean reversion) — 시장 중립
+      try {
+        if (this.strategyPairs) await this.strategyPairs.start();
+      } catch (e) {
+        console.error("[TradingBot] StrategyPairs start failed:", e.message);
       }
 
       // 4) Sanity check: logger actually ready?
@@ -510,6 +526,7 @@ class TradingBot {
     try { this.arbMultiWs?.stop(); } catch {}
     try { this.arbUpbitWs?.disconnect(); } catch {}
     try { this.strategyC?.stop(); } catch {}
+    try { this.strategyPairs?.stop(); } catch {}
   }
 
   // ─── WebSocket Init (optional, ws package) ──────────
@@ -622,6 +639,12 @@ class TradingBot {
         if (url.pathname === "/api/strategy-c") {
           res.writeHead(200, { "Content-Type": "application/json" });
           res.end(JSON.stringify(this.strategyC?.getSummary() || { running: false, reason: "not initialized" }));
+          return;
+        }
+
+        if (url.pathname === "/api/strategy-pairs") {
+          res.writeHead(200, { "Content-Type": "application/json" });
+          res.end(JSON.stringify(this.strategyPairs?.getSummary() || { running: false }));
           return;
         }
 
