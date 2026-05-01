@@ -56,6 +56,9 @@ const { StrategyFunding }           = require("./strategy-funding");
 // On-chain Whale Tracker
 const { WhaleTracker }              = require("./whale-tracker");
 
+// Strategy D — 한국 sentiment NLP
+const { StrategyD }                 = require("./strategy-d");
+
 // ML Alpha 자가 발견
 const { MLAlpha }                   = require("./lib/ml-alpha");
 
@@ -473,6 +476,12 @@ class TradingBot {
         arbLogger: this.arbLogger,
       });
 
+      // Strategy D — 한국 sentiment 모니터
+      this.strategyD = new StrategyD({
+        notifier:  this.notifier,
+        arbLogger: this.arbLogger,
+      });
+
       // ML Alpha 자가 발견 (logistic regression)
       this.mlAlpha = new MLAlpha({});
       // 매일 자정 자동 재학습 (Rotation engine과 함께)
@@ -543,6 +552,13 @@ class TradingBot {
         console.error("[TradingBot] WhaleTracker start failed:", e.message);
       }
 
+      // 3f) Strategy D — 한국 sentiment 모니터
+      try {
+        if (this.strategyD) await this.strategyD.start();
+      } catch (e) {
+        console.error("[TradingBot] StrategyD start failed:", e.message);
+      }
+
       // 4) Sanity check: logger actually ready?
       if (this.arbLogger._ready) {
         console.log("[TradingBot] ArbDataLogger ready — DB persistence active");
@@ -578,6 +594,7 @@ class TradingBot {
     try { this.strategyPairs?.stop(); } catch {}
     try { this.strategyFunding?.stop(); } catch {}
     try { this.whaleTracker?.stop(); } catch {}
+    try { this.strategyD?.stop(); } catch {}
     try { if (this._mlIntervalId) clearInterval(this._mlIntervalId); } catch {}
     try { this.mlAlpha?.close(); } catch {}
   }
@@ -710,6 +727,12 @@ class TradingBot {
         if (url.pathname === "/api/whale-tracker") {
           res.writeHead(200, { "Content-Type": "application/json" });
           res.end(JSON.stringify(this.whaleTracker?.getSummary() || { running: false }));
+          return;
+        }
+
+        if (url.pathname === "/api/strategy-d") {
+          res.writeHead(200, { "Content-Type": "application/json" });
+          res.end(JSON.stringify(this.strategyD?.getSummary() || { running: false }));
           return;
         }
 
