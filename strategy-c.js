@@ -74,6 +74,8 @@ class StrategyC extends EventEmitter {
       startedAt: null,
       lastCycleMs: null,
     };
+    // Top 알파 코인 추적 (어느 코인이 가장 자주 차익 기회 만드는지)
+    this._coinStats = new Map(); // coin → { count, avgNet, maxNet, lastSeen }
   }
 
   // ── Lifecycle ──────────────────────────────────────────
@@ -265,6 +267,14 @@ class StrategyC extends EventEmitter {
   _handleSustainedOpportunity(opp) {
     this._stats.alerted++;
 
+    // Coin alpha tracking
+    const cs = this._coinStats.get(opp.coin) || { count: 0, sumNet: 0, maxNet: 0, lastSeen: 0 };
+    cs.count++;
+    cs.sumNet += opp.netProfitPct;
+    cs.maxNet = Math.max(cs.maxNet, opp.netProfitPct);
+    cs.lastSeen = Date.now();
+    this._coinStats.set(opp.coin, cs);
+
     const msg =
       `💎 [StrategyC] 차익 기회 (${(opp.sustainedMs / 1000).toFixed(0)}초 지속) — ` +
       `${opp.coin} ${opp.buyExchange.toUpperCase()}→${opp.sellExchange.toUpperCase()} ` +
@@ -309,6 +319,18 @@ class StrategyC extends EventEmitter {
   // ── 외부 조회 ────────────────────────────────────────
 
   getSummary() {
+    // Top 알파 코인 (count 순 상위 20개)
+    const topCoins = [...this._coinStats.entries()]
+      .map(([coin, s]) => ({
+        coin,
+        count: s.count,
+        avgNetPct: +(s.sumNet / s.count).toFixed(3),
+        maxNetPct: +s.maxNet.toFixed(3),
+        lastSeenAgo: Math.round((Date.now() - s.lastSeen) / 60_000) + "분",
+      }))
+      .sort((a, b) => b.count - a.count)
+      .slice(0, 20);
+
     return {
       running:    this._running,
       coins:      this._commonCoins.length,
@@ -317,6 +339,7 @@ class StrategyC extends EventEmitter {
         ? +((Date.now() - this._stats.startedAt) / 3_600_000).toFixed(2)
         : 0,
       activeOpportunities: this._sustainTrack.size,
+      topAlphaCoins: topCoins,
     };
   }
 }

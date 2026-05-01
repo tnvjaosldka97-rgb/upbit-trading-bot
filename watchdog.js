@@ -34,12 +34,16 @@ class Watchdog {
 
   start() {
     this._intervalId = setInterval(() => this._tick(), 30_000);
+    // 60초마다 자체 heartbeat — 거래 0건이어도 봇이 살아있으면 OK
+    this._selfHeartbeat = setInterval(() => this.heartbeat(), 60_000);
     console.log("[Watchdog] 시작 — 30초 주기 모니터");
   }
 
   stop() {
     if (this._intervalId) clearInterval(this._intervalId);
+    if (this._selfHeartbeat) clearInterval(this._selfHeartbeat);
     this._intervalId = null;
+    this._selfHeartbeat = null;
   }
 
   // 외부에서 호출 (각 이벤트 시점)
