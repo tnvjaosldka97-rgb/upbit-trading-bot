@@ -13,6 +13,7 @@
 
 const { safeFetch } = require("./exchange-adapter");
 const CFG = require("./config");
+const simExec = require("./lib/sim-execution");
 const UPBIT_API = "https://api.upbit.com";
 
 const SCAN_INTERVAL_MS     = CFG.B_SCAN_INTERVAL_MS;
@@ -303,22 +304,50 @@ class StrategyB {
       openedAt:    Date.now(),
     };
 
-    this.sim.cash -= budget;
+    // 시뮬 라우팅 — 신규상장은 슬리피지 더 큼 (호가 얕음) → useOrderbook=true 필수
+    const simResult = await simExec.simulateExecution({
+      market,
+      side: "BUY",
+      requestedQty: budget / price,
+      requestedPrice: price,
+      exchange: "upbit",
+      useOrderbook: true,
+    });
+    if (simResult.reason === "rejected_simulated") {
+      console.warn(`[StrategyB] sim rejected ${market}`);
+      return;
+    }
+    const simPrice  = simResult.avgPrice  || price;
+    const simQty    = simResult.executedQty || (budget / price);
+    const simBudget = simQty * simPrice;
+
+    pos.entryPrice = simPrice;
+    pos.quantity   = simQty;
+    pos.budget     = simBudget;
+    pos.targetPrice = simPrice * (1 + TARGET_RATE);
+    pos.stopPrice   = simPrice * (1 + STOP_RATE);
+    pos.peakPrice   = simPrice;
+    pos.partialDone = simResult.partial || false;
+    pos.slippagePct = simResult.slippagePct;
+    pos.latencyMs   = simResult.latencyMs;
+
+    this.sim.cash -= simBudget;
     this.sim.positions.set(market, pos);
     this._updateDetection(market, "entered");
 
     console.log(
-      `[StrategyB] ENTERED -- ${market} @${price.toLocaleString()} ` +
-      `budget:${budget.toLocaleString()} target:+${(TARGET_RATE * 100)}% ` +
-      `stop:${(STOP_RATE * 100)}%`
+      `[StrategyB] ENTERED -- ${market} @${simPrice.toLocaleString()} ` +
+      `budget:${simBudget.toLocaleString()} ` +
+      `(slip:${simResult.slippagePct.toFixed(3)}% lat:${simResult.latencyMs}ms${simResult.partial ? " PARTIAL" : ""}) ` +
+      `target:+${(TARGET_RATE * 100)}% stop:${(STOP_RATE * 100)}%`
     );
 
     this.tradeLogger?.logBuy({
       strategy: "B",
       market,
-      price,
-      quantity: pos.quantity,
-      budget,
+      price: simPrice,
+      quantity: simQty,
+      budget: simBudget,
       qualityScore: signal.score || null,
       qualityFlags: signal.flags || null,
       dryRun: true,
