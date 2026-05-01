@@ -55,6 +55,11 @@ const { AutoBacktest }              = require("./auto-backtest");
 const { Watchdog }                  = require("./watchdog");
 const { SimulationValidator }       = require("./simulation-validator");
 
+// 매수/매도 무결성 인프라
+const { OrderRouter }               = require("./order-router");
+const { PositionLedger }            = require("./position-ledger");
+const { PositionWatchdog }          = require("./position-watchdog");
+
 // ─── Config ───────────────────────────────────────────
 
 const INITIAL_KRW = Number(process.env.INITIAL_CAPITAL || 100_000);
@@ -129,6 +134,23 @@ class TradingBot {
       notifier: this.notifier,
       bot:      this,
     });
+
+    // ── 매수/매도 무결성 (Order routing) ─────────
+    this.orderRouter = new OrderRouter({
+      orderService: this.orderService,
+      notifier:     this.notifier,
+    });
+    this.positionLedger = new PositionLedger({});
+    this.positionWatchdog = new PositionWatchdog({
+      ledger:       this.positionLedger,
+      orderRouter:  this.orderRouter,
+      orderService: this.orderService,
+      notifier:     this.notifier,
+    });
+
+    // Reconciler에 새 모듈 연결
+    this.reconciler.orderRouter = this.orderRouter;
+    this.reconciler.ledger = this.positionLedger;
 
     // ── Multi-factor signal engines ───────────────
     this.mds           = new MarketDataService();
@@ -268,6 +290,12 @@ class TradingBot {
 
     // ── Watchdog (봇 뻘짓 감지) ───────────────────────
     this.watchdog.start();
+
+    // ── Position Watchdog (단방향 노출 감지) ──────────
+    this.positionWatchdog.start();
+
+    // ── Reconciler 매분 자동 동기화 ──────────────────
+    this.reconciler.startPeriodic(60_000);
 
     // ── Simulation Validator (DRY_RUN일 때만 — LIVE 전환 자동 판정) ──
     if (DRY_RUN) {
@@ -648,6 +676,35 @@ class TradingBot {
         if (url.pathname === "/api/health-deep") {
           res.writeHead(200, { "Content-Type": "application/json" });
           res.end(JSON.stringify(this._buildDeepHealth()));
+          return;
+        }
+
+        if (url.pathname === "/api/orders") {
+          const limit = Number(url.searchParams.get("limit")) || 50;
+          res.writeHead(200, { "Content-Type": "application/json" });
+          res.end(JSON.stringify({
+            summary: this.orderRouter?.getSummary() || { ready: false },
+            recent:  this.orderRouter?.getRecentOrders(limit) || [],
+            open:    this.orderRouter?.getOpenOrders() || [],
+          }));
+          return;
+        }
+
+        if (url.pathname === "/api/positions") {
+          const limit = Number(url.searchParams.get("limit")) || 50;
+          res.writeHead(200, { "Content-Type": "application/json" });
+          res.end(JSON.stringify({
+            summary: this.positionLedger?.getSummary() || { ready: false },
+            active:  this.positionLedger?.getActivePositions() || [],
+            recent:  this.positionLedger?.getRecent(limit) || [],
+            unhedged: this.positionLedger?.getUnhedgedPositions(5) || [],
+          }));
+          return;
+        }
+
+        if (url.pathname === "/api/position-watchdog") {
+          res.writeHead(200, { "Content-Type": "application/json" });
+          res.end(JSON.stringify(this.positionWatchdog?.getSummary() || {}));
           return;
         }
 
@@ -1262,6 +1319,10 @@ ${(stratB.detections || []).slice(0, 10).map(d =>
     try { this.autoBacktest?.close(); } catch {}
     try { this.watchdog?.stop(); } catch {}
     try { this.simValidator?.stop(); } catch {}
+    try { this.positionWatchdog?.stop(); } catch {}
+    try { this.reconciler?.stopPeriodic(); } catch {}
+    try { this.orderRouter?.close(); } catch {}
+    try { this.positionLedger?.close(); } catch {}
     try { this.perfTracker?.close(); } catch {}
     try { this.riskManager?.close(); } catch {}
     try { this.reconciler?.close(); } catch {}

@@ -28,12 +28,16 @@ try { Database = require("better-sqlite3"); } catch { Database = null; }
 
 class Reconciler {
   constructor(opts = {}) {
-    this.orderService = opts.orderService || null; // UpbitOrderService 인스턴스 (Private API용)
+    this.orderService = opts.orderService || null;
+    this.orderRouter  = opts.orderRouter  || null;
+    this.ledger       = opts.ledger       || null;
     this.tradesDbPath = opts.tradesDbPath || "./trades.db";
     this.notifier     = opts.notifier || null;
 
     this.tradesDb = null;
     this._ready = false;
+    this._intervalId = null;
+    this._lastReconcileAt = null;
 
     if (!Database) return;
     try {
@@ -41,6 +45,48 @@ class Reconciler {
       this._ready = true;
     } catch (e) {
       console.warn(`[Reconciler] init: ${e.message}`);
+    }
+  }
+
+  /**
+   * 매분 자동 reconciliation 시작
+   */
+  startPeriodic(intervalMs = 60_000) {
+    this._intervalId = setInterval(() => {
+      this._periodicReconcile().catch(e =>
+        console.error("[Reconciler] periodic:", e.message)
+      );
+    }, intervalMs);
+    console.log(`[Reconciler] 주기 동기화 시작 — ${intervalMs / 1000}s 간격`);
+  }
+
+  stopPeriodic() {
+    if (this._intervalId) clearInterval(this._intervalId);
+    this._intervalId = null;
+  }
+
+  async _periodicReconcile() {
+    if (!this.orderService?.getSummary().hasApiKeys) return;
+    this._lastReconcileAt = Date.now();
+
+    // 1) Upbit 미체결 주문 vs OrderRouter DB 비교
+    if (this.orderRouter) {
+      try {
+        const upbitOpen = await this._fetchOpenOrders();
+        const dbOpen    = this.orderRouter.getOpenOrders();
+
+        // Upbit엔 없는데 DB는 SUBMITTED → 체결 또는 취소된 것 → 마킹 (재조회로 확정)
+        for (const dbOrder of dbOpen) {
+          if (!dbOrder.upbit_uuid) continue;
+          const stillOpen = upbitOpen.find(o => o.uuid === dbOrder.upbit_uuid);
+          if (!stillOpen && (dbOrder.state === "SUBMITTED" || dbOrder.state === "PARTIAL")) {
+            console.warn(`[Reconciler] 주문 ${dbOrder.upbit_uuid?.slice(0,8)} Upbit에 없음 — 체결/취소 추정 → 재확정 필요`);
+            // TODO: GET /v1/order?uuid=... 로 final state 조회 (다음 라운드)
+          }
+        }
+      } catch (e) {
+        // silent
+      }
     }
   }
 
@@ -254,7 +300,18 @@ class Reconciler {
     );
   }
 
+  getSummary() {
+    return {
+      ready: this._ready,
+      lastReconcileAt: this._lastReconcileAt,
+      lastReconcileAgoSec: this._lastReconcileAt
+        ? Math.round((Date.now() - this._lastReconcileAt) / 1000)
+        : null,
+    };
+  }
+
   close() {
+    if (this._intervalId) clearInterval(this._intervalId);
     try { this.tradesDb?.close(); } catch {}
   }
 }
