@@ -645,6 +645,12 @@ class TradingBot {
           return;
         }
 
+        if (url.pathname === "/api/health-deep") {
+          res.writeHead(200, { "Content-Type": "application/json" });
+          res.end(JSON.stringify(this._buildDeepHealth()));
+          return;
+        }
+
         if (url.pathname === "/api/kill") {
           // 응급 정지 — 신규 진입 즉시 차단
           const reason = url.searchParams.get("reason") || "manual_kill_switch";
@@ -949,6 +955,75 @@ ${(stratB.detections || []).slice(0, 10).map(d =>
       mode:              BOT_MODE,
       dryRun:            DRY_RUN,
       timestamp:         new Date().toISOString(),
+    };
+  }
+
+  _buildDeepHealth() {
+    const checks = {};
+    const reasons = {};
+
+    // 1. Strategy A
+    checks.strategyA = !!this.strategyA?._intervalId;
+    if (!checks.strategyA) reasons.strategyA = "interval not running";
+
+    // 2. Strategy B
+    checks.strategyB = !!this.strategyB?._scanId;
+    if (!checks.strategyB) reasons.strategyB = "scan not running";
+
+    // 3. Strategy C
+    const scSummary = this.strategyC?.getSummary();
+    checks.strategyC = scSummary?.running === true;
+    if (!checks.strategyC) reasons.strategyC = "not running";
+
+    // 4. Arbitrage
+    checks.arb = !!this.arb;
+    checks.arbLogger = this.arbLogger?._ready === true;
+    if (!checks.arbLogger) reasons.arbLogger = "DB not ready";
+
+    // 5. Performance
+    checks.performance = this.perfTracker?._ready === true;
+    if (!checks.performance) reasons.performance = "tracker DB not ready";
+
+    // 6. Watchdog
+    const wd = this.watchdog?.getSummary();
+    checks.watchdog = wd && !wd.halted && wd.heartbeatAgeSec < 300;
+    if (!checks.watchdog) reasons.watchdog = wd?.halted ? "halted" : `stale heartbeat ${wd?.heartbeatAgeSec}s`;
+
+    // 7. Risk
+    const risk = this.riskManager?.getSummary();
+    checks.risk = risk && risk.daily.realizedPnl > -risk.daily.lossLimitKrw;
+    if (!checks.risk) reasons.risk = "daily loss limit hit";
+
+    // 8. Order engine
+    checks.orderEngine = !this.orderService?.halted;
+    if (!checks.orderEngine) reasons.orderEngine = this.orderService?.haltReason || "halted";
+
+    // 9. WebSocket
+    const wsState = this.arbMultiWs?.getSummary?.();
+    const wsConnected = (wsState?.binance?.connected ? 1 : 0) +
+                        (wsState?.bybit?.connected ? 1 : 0) +
+                        (wsState?.okx?.connected ? 1 : 0) +
+                        (wsState?.gate?.connected ? 1 : 0);
+    checks.websocket = wsConnected >= 2;
+    if (!checks.websocket) reasons.websocket = `only ${wsConnected}/4 exchanges connected`;
+
+    // 10. Memory
+    const memMb = process.memoryUsage().rss / 1024 / 1024;
+    checks.memory = memMb < 800;
+    if (!checks.memory) reasons.memory = `${memMb.toFixed(0)}MB`;
+
+    const total = Object.keys(checks).length;
+    const passing = Object.values(checks).filter(Boolean).length;
+    const overall = passing === total ? "healthy" : passing >= total - 2 ? "degraded" : "unhealthy";
+
+    return {
+      overall,
+      passing: `${passing}/${total}`,
+      checks,
+      reasons,
+      memoryMb: Math.round(memMb),
+      uptime: this._getHealth(),
+      timestamp: new Date().toISOString(),
     };
   }
 

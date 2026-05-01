@@ -81,7 +81,7 @@ class TradeLogger {
       strategy, market, side: "BUY", price, quantity, budget,
       reason: null, pnl_rate: null, pnl_krw: null,
       quality_score: qualityScore ?? null,
-      quality_flags: qualityFlags ? qualityFlags.join(",") : null,
+      quality_flags: Array.isArray(qualityFlags) ? qualityFlags.join(",") : (qualityFlags ? String(qualityFlags) : null),
       partial: 0, trail: 0,
       dry_run: dryRun ? 1 : 0,
       created_at: new Date().toLocaleString("sv-SE"),
