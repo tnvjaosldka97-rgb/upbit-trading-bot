@@ -40,6 +40,7 @@ const FEES = {
   upbit:   0.0005,   // 0.05%
   bithumb: 0.0004,   // 0.04%
   coinone: 0.0010,   // 0.10%
+  korbit:  0.0015,   // 0.15%
 };
 
 /**
@@ -74,6 +75,7 @@ class StrategyC extends EventEmitter {
    * @param {Object} opts.upbit    UpbitAdapter — getMarkets/getTicker 구현
    * @param {Object} opts.bithumb  BithumbAdapter
    * @param {Object} opts.coinone  CoinoneAdapter
+   * @param {Object} opts.korbit   KorbitAdapter (한국 4사 확장)
    * @param {Object} opts.arbLogger ArbDataLogger 인스턴스 (optional, 기록용)
    * @param {Object} opts.notifier TelegramNotifier 인스턴스 (optional, 알림용)
    */
@@ -82,6 +84,7 @@ class StrategyC extends EventEmitter {
     this.upbit    = opts.upbit    || null;
     this.bithumb  = opts.bithumb  || null;
     this.coinone  = opts.coinone  || null;
+    this.korbit   = opts.korbit   || null;
     this.arbLogger = opts.arbLogger || null;
     this.notifier = opts.notifier || null;
 
@@ -108,11 +111,12 @@ class StrategyC extends EventEmitter {
   async start() {
     if (this._running) return;
     if (!this.upbit || !this.bithumb || !this.coinone) {
-      console.warn("[StrategyC] 어댑터 미주입 — 시작 실패");
+      console.warn("[StrategyC] 핵심 어댑터(Upbit/Bithumb/Coinone) 미주입 — 시작 실패");
       return;
     }
 
-    console.log("[StrategyC] 한국 3사 동일지역 차익 모니터 시작");
+    const exchangeCount = 3 + (this.korbit ? 1 : 0);
+    console.log(`[StrategyC] 한국 ${exchangeCount}사 동일지역 차익 모니터 시작${this.korbit ? " (+Korbit)" : ""}`);
     this._stats.startedAt = Date.now();
 
     // 1) 공통 코인 디스커버리
@@ -149,31 +153,37 @@ class StrategyC extends EventEmitter {
   // ── 공통 코인 발견 ──────────────────────────────────────
 
   async _discoverCommonCoins() {
-    const [upbitMarkets, bithumbMarkets, coinoneMarkets] = await Promise.all([
+    const fetches = [
       this.upbit.getMarkets().catch(e => { console.warn("[StrategyC] upbit markets:", e.message); return []; }),
       this.bithumb.getMarkets().catch(e => { console.warn("[StrategyC] bithumb markets:", e.message); return []; }),
       this.coinone.getMarkets().catch(e => { console.warn("[StrategyC] coinone markets:", e.message); return []; }),
-    ]);
+    ];
+    if (this.korbit) {
+      fetches.push(this.korbit.getMarkets().catch(e => { console.warn("[StrategyC] korbit markets:", e.message); return []; }));
+    }
+    const results = await Promise.all(fetches);
 
-    const upbitSet = new Set(upbitMarkets
-      .filter(m => m.quote === "KRW")
-      .map(m => (m.base || "").toUpperCase())
-      .filter(Boolean));
-    const bithumbSet = new Set(bithumbMarkets
+    const toSet = (markets) => new Set(markets
       .filter(m => (m.quote || "KRW") === "KRW")
       .map(m => (m.base || "").toUpperCase())
       .filter(Boolean));
-    const coinoneSet = new Set(coinoneMarkets
-      .filter(m => m.quote === "KRW")
-      .map(m => (m.base || "").toUpperCase())
-      .filter(Boolean));
 
-    // 3개 모두 상장된 것만
-    const all3 = [...upbitSet].filter(c => bithumbSet.has(c) && coinoneSet.has(c));
+    const upbitSet   = toSet(results[0]);
+    const bithumbSet = toSet(results[1]);
+    const coinoneSet = toSet(results[2]);
 
-    // 스테이블/원화환산토큰 제외
+    // 핵심 3사 교집합 (이게 기본 풀)
+    let common = [...upbitSet].filter(c => bithumbSet.has(c) && coinoneSet.has(c));
+
+    // Korbit 있으면 어느 쪽이든 1개라도 더 상장돼있는 코인 추가 (4사 풀 확장)
+    if (this.korbit) {
+      const korbitSet = toSet(results[3]);
+      // 4사 모두 상장 + 3사 교집합 모두 포함하는 풀 (Korbit 페어는 페어 검사 시 짝 있을 때만)
+      this._korbitCoins = korbitSet;
+    }
+
     const STABLES = new Set(["USDT", "USDC", "DAI", "BUSD", "TUSD", "PYUSD"]);
-    this._commonCoins = all3.filter(c => !STABLES.has(c)).sort();
+    this._commonCoins = common.filter(c => !STABLES.has(c)).sort();
   }
 
   // ── 메인 사이클 ──────────────────────────────────────
@@ -182,8 +192,8 @@ class StrategyC extends EventEmitter {
     const t0 = Date.now();
     this._stats.cycles++;
 
-    // 모든 공통 코인의 3거래소 ticker 동시 조회
-    const tickers = new Map(); // coin → { upbit, bithumb, coinone }
+    // 모든 공통 코인의 3 또는 4거래소 ticker 동시 조회
+    const tickers = new Map(); // coin → { upbit, bithumb, coinone, korbit? }
 
     // 동시성 제어 (MAX_CONCURRENT)
     const queue = [...this._commonCoins];
@@ -191,16 +201,21 @@ class StrategyC extends EventEmitter {
       const batch = queue.splice(0, MAX_CONCURRENT);
       await Promise.all(batch.map(async coin => {
         try {
-          const [u, b, c] = await Promise.all([
+          const promises = [
             this.upbit.getTicker(coin).catch(() => null),
             this.bithumb.getTicker(coin).catch(() => null),
             this.coinone.getTicker(coin).catch(() => null),
-          ]);
-          if (u || b || c) {
+          ];
+          if (this.korbit && this._korbitCoins?.has(coin)) {
+            promises.push(this.korbit.getTicker(coin).catch(() => null));
+          }
+          const [u, b, c, k] = await Promise.all(promises);
+          if (u || b || c || k) {
             tickers.set(coin, {
               upbit:   u?.price || null,
               bithumb: b?.price || null,
               coinone: c?.price || null,
+              korbit:  k?.price || null,
             });
           }
         } catch {
@@ -209,11 +224,14 @@ class StrategyC extends EventEmitter {
       }));
     }
 
-    // 페어별 차익 검사 (3 choose 2 = 3 페어)
+    // 페어별 차익 검사 — 한국 4사 = 6 페어 (4 choose 2)
     const PAIRS = [
       ["upbit",   "bithumb"],
       ["upbit",   "coinone"],
+      ["upbit",   "korbit"],
       ["bithumb", "coinone"],
+      ["bithumb", "korbit"],
+      ["coinone", "korbit"],
     ];
     const opportunities = [];
 

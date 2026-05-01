@@ -42,8 +42,9 @@ const { ArbExecutor }               = require("./arb-executor");
 const { TradeLogger }               = require("./trade-logger");
 const { TelegramNotifier }          = require("./telegram-notifier");
 
-// Strategy C — 한국 3사 동일지역 차익 모니터
+// Strategy C — 한국 4사 동일지역 차익 모니터
 const { CoinoneAdapter }            = require("./exchange-coinone");
+const { KorbitAdapter }             = require("./exchange-korbit");
 const { StrategyC }                 = require("./strategy-c");
 
 // 0.1% 퀀트 표준 인프라
@@ -427,12 +428,14 @@ class TradingBot {
         });
       });
 
-      // Strategy C — 한국 3사 동일지역 차익 모니터 (시장 중립)
+      // Strategy C — 한국 4사 동일지역 차익 모니터 (시장 중립)
       const coinone = new CoinoneAdapter({});
+      const korbit  = new KorbitAdapter({});
       this.strategyC = new StrategyC({
         upbit:     restExchanges.upbit,
         bithumb:   restExchanges.bithumb,
         coinone,
+        korbit,
         arbLogger: this.arbLogger,
         notifier:  this.notifier,
       });
