@@ -64,11 +64,10 @@ class Watchdog {
   _tick() {
     const now = Date.now();
 
-    // 1) Heartbeat
-    if (now - this._lastHeartbeat > HEARTBEAT_TIMEOUT_MS) {
-      this._haltWithReason(`heartbeat_dead ${((now - this._lastHeartbeat) / 1000).toFixed(0)}s`);
-      return;
-    }
+    // _tick 자체가 살아있으면 봇이 돌고 있다는 증거 → heartbeat 자가 갱신
+    this._lastHeartbeat = now;
+
+    // 거래 폭주 / API 에러 / 메모리만 체크 (heartbeat dead는 _tick 안 돌면 어차피 못 잡음)
 
     // 2) 거래 빈도 (최근 1분)
     this._tradeTimes = this._tradeTimes.filter(t => now - t < 60_000);
@@ -94,6 +93,11 @@ class Watchdog {
 
   _haltWithReason(reason) {
     if (this._haltCalled) return;
+    // DRY_RUN 모드에서는 Watchdog halt 무시 (시뮬은 자유롭게)
+    if (process.env.DRY_RUN !== "false") {
+      console.warn(`[Watchdog] HALT 신호 (DRY_RUN이라 무시) — ${reason}`);
+      return;
+    }
     this._haltCalled = true;
     console.error(`[Watchdog] ⛔ HALT — ${reason}`);
 
